@@ -192,7 +192,8 @@ def _generate_files(
     elif google_cloud_project and google_cloud_region:
       lines.append("GOOGLE_GENAI_USE_VERTEXAI=1")
     if google_api_key:
-      lines.append(f"GOOGLE_API_KEY={google_api_key}")
+      # Do not store the Google API key in clear text; instruct the user instead.
+      lines.append("# Set GOOGLE_API_KEY in your environment before running.")
     if google_cloud_project:
       lines.append(f"GOOGLE_CLOUD_PROJECT={google_cloud_project}")
     if google_cloud_region:
