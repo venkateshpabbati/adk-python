@@ -131,8 +131,9 @@ class HotelBooker:
       cursor.execute(query, params)
       rows = cursor.fetchall()
       return [dict(row) for row in rows], None
-    except sqlite3.Error as e:
-      return None, f"Error getting available hotels: {e}"
+    except sqlite3.Error:
+      logging.exception("Database error while getting available hotels.")
+      return None, "An internal error occurred while retrieving available hotels."
 
   def book_a_room(
       self, conn, hotel_id, guest_name, check_in_date, check_out_date, num_rooms
@@ -259,5 +260,6 @@ class HotelBooker:
 
       bookings = [dict(row) for row in rows]
       return bookings if result_type == "list" else bookings[0], None
-    except sqlite3.Error as e:
-      return None, f"Error getting booking details: {e}"
+    except sqlite3.Error:
+      logging.exception("Database error while getting booking details.")
+      return None, "An internal error occurred while retrieving booking details."
