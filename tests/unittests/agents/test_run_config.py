@@ -15,8 +15,10 @@
 import sys
 from unittest.mock import ANY
 from unittest.mock import patch
+import warnings
 
 from google.adk.agents.run_config import RunConfig
+from google.genai import types
 import pytest
 
 
@@ -64,3 +66,66 @@ def test_audio_transcription_configs_are_not_shared_between_instances():
   assert (
       config1.input_audio_transcription is not config2.input_audio_transcription
   )
+
+
+def test_response_modalities_accepts_enum():
+  config = RunConfig(response_modalities=[types.Modality.AUDIO])
+  assert config.response_modalities == [types.Modality.AUDIO]
+  assert isinstance(config.response_modalities[0], types.Modality)
+
+
+def test_response_modalities_coerces_string_to_enum():
+  config = RunConfig(response_modalities=["AUDIO"])
+  assert config.response_modalities == [types.Modality.AUDIO]
+  assert isinstance(config.response_modalities[0], types.Modality)
+
+
+def test_response_modalities_coerces_lowercase_string_to_enum():
+  config = RunConfig(response_modalities=["audio"])
+  assert config.response_modalities == [types.Modality.AUDIO]
+  assert isinstance(config.response_modalities[0], types.Modality)
+
+
+def test_response_modalities_serialization_no_warning():
+  config = RunConfig(response_modalities=[types.Modality.AUDIO])
+  live_config = types.LiveConnectConfig()
+  live_config.response_modalities = config.response_modalities
+  with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter("always")
+    live_config.model_dump()
+    pydantic_warnings = [
+        x for x in w if "PydanticSerializationUnexpectedValue" in str(x.message)
+    ]
+    assert len(pydantic_warnings) == 0
+
+
+def test_avatar_config_initialization():
+  custom_avatar = types.CustomizedAvatar(
+      image_mime_type="image/jpeg", image_data=b"image_bytes"
+  )
+  avatar_config = types.AvatarConfig(
+      audio_bitrate_bps=128000,
+      video_bitrate_bps=1000000,
+      customized_avatar=custom_avatar,
+  )
+  run_config = RunConfig(avatar_config=avatar_config)
+
+  assert run_config.avatar_config == avatar_config
+  assert run_config.avatar_config.customized_avatar == custom_avatar
+  assert (
+      run_config.avatar_config.customized_avatar.image_mime_type == "image/jpeg"
+  )
+  assert run_config.avatar_config.customized_avatar.image_data == b"image_bytes"
+
+
+def test_avatar_config_with_name():
+  avatar_config = types.AvatarConfig(
+      audio_bitrate_bps=128000,
+      video_bitrate_bps=1000000,
+      avatar_name="test_avatar",
+  )
+  run_config = RunConfig(avatar_config=avatar_config)
+
+  assert run_config.avatar_config == avatar_config
+  assert run_config.avatar_config.avatar_name == "test_avatar"
+  assert run_config.avatar_config.customized_avatar is None

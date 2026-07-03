@@ -20,9 +20,10 @@ import asyncio
 import base64
 import binascii
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 import copy
-import functools
 import inspect
+import json
 import logging
 import threading
 from typing import Any
@@ -42,8 +43,8 @@ from ...auth.auth_tool import AuthConfig
 from ...auth.auth_tool import AuthToolArguments
 from ...events.event import Event
 from ...events.event_actions import EventActions
+from ...telemetry import _instrumentation
 from ...telemetry.tracing import trace_merged_tool_calls
-from ...telemetry.tracing import trace_tool_call
 from ...telemetry.tracing import tracer
 from ...tools.base_tool import BaseTool
 from ...tools.tool_confirmation import ToolConfirmation
@@ -66,6 +67,48 @@ logger = logging.getLogger('google_adk.' + __name__)
 # Key is max_workers, value is the executor.
 _TOOL_THREAD_POOLS: dict[int, ThreadPoolExecutor] = {}
 _TOOL_THREAD_POOL_LOCK = threading.Lock()
+
+
+def _detect_error_type_for_telemetry(
+    tool: BaseTool,
+    tool_context: ToolContext,
+    function_response: Any,
+) -> Optional[str]:
+  """Detects an error type from a tool response for telemetry purposes.
+
+  This does not modify the response. `_detect_error_in_response` is an optional
+  per-tool hook accessed via `getattr` to avoid adding a public API on
+  `BaseTool`. Any exception raised by the detector is logged and swallowed so
+  that telemetry logic never breaks tool execution.
+
+  Args:
+    tool: The tool whose response is being inspected.
+    tool_context: The tool context for the current invocation. Detection is
+      skipped when the tool is requesting auth or confirmation.
+    function_response: The raw response returned by the tool.
+
+  Returns:
+    The error type string reported by the tool's `_detect_error_in_response`
+    hook, or `None` if no error was detected, no hook is defined, or the hook
+    raised an exception.
+  """
+  try:
+    if (
+        tool_context.actions.requested_auth_configs
+        or tool_context.actions.requested_tool_confirmations
+    ):
+      return None
+    detector = getattr(tool, '_detect_error_in_response', None)
+    if detector is None:
+      return None
+    return detector(function_response)
+  except Exception:  # pylint: disable=broad-exception-caught
+    # Never let telemetry logic break tool execution.
+    logger.exception(
+        'Error while detecting error type for telemetry from tool %r.',
+        getattr(tool, 'name', tool),
+    )
+    return None
 
 
 def _is_live_request_queue_annotation(param: inspect.Parameter) -> bool:
@@ -140,13 +183,14 @@ async def _call_tool_in_thread_pool(
   """
   from ...tools.function_tool import FunctionTool
 
+  ctx = contextvars.copy_context()
   loop = asyncio.get_running_loop()
   executor = _get_tool_thread_pool(max_workers)
 
   if _is_sync_tool(tool):
-    # For sync FunctionTool, call the underlying function directly
-    def run_sync_tool():
-      if isinstance(tool, FunctionTool):
+    if isinstance(tool, FunctionTool):
+      # For sync FunctionTool, call the underlying function directly.
+      def run_sync_tool():
         args_to_call = tool._preprocess_args(args)
         signature = inspect.signature(tool.func)
         valid_params = {param for param in signature.parameters}
@@ -155,14 +199,25 @@ async def _call_tool_in_thread_pool(
         args_to_call = {
             k: v for k, v in args_to_call.items() if k in valid_params
         }
+        mandatory_args = tool._get_mandatory_args()
+        missing_mandatory_args = [
+            arg for arg in mandatory_args if arg not in args_to_call
+        ]
+        if missing_mandatory_args:
+          missing_mandatory_args_str = '\n'.join(missing_mandatory_args)
+          error_str = (
+              f'Invoking `{tool.name}()` failed as the following mandatory'
+              ' input parameters are not present:\n'
+              f'{missing_mandatory_args_str}\n'
+              'You could retry calling this tool, but it is IMPORTANT for you'
+              ' to provide all the mandatory parameters.'
+          )
+          return {'error': error_str}
         return tool.func(**args_to_call)
-      else:
-        # For other sync tool types, we can't easily run them in thread pool
-        return None
 
-    result = await loop.run_in_executor(executor, run_sync_tool)
-    if result is not None:
-      return result
+      return await loop.run_in_executor(
+          executor, lambda: ctx.run(run_sync_tool)
+      )
   else:
     # For async tools, run them in a new event loop in a background thread.
     # This helps when async functions contain blocking I/O (common user mistake)
@@ -171,9 +226,11 @@ async def _call_tool_in_thread_pool(
       # Create a new event loop for this thread
       return asyncio.run(tool.run_async(args=args, tool_context=tool_context))
 
-    return await loop.run_in_executor(executor, run_async_tool_in_new_loop)
+    return await loop.run_in_executor(
+        executor, lambda: ctx.run(run_async_tool_in_new_loop)
+    )
 
-  # Fall back to normal async execution for non-FunctionTool sync tools
+  # Fall back to normal async execution for non-FunctionTool sync tools.
   return await tool.run_async(args=args, tool_context=tool_context)
 
 
@@ -260,7 +317,7 @@ def build_auth_request_event(
         args=AuthToolArguments(
             function_call_id=function_call_id,
             auth_config=auth_config,
-        ).model_dump(exclude_none=True, by_alias=True),
+        ).model_dump(mode='json', exclude_none=True, by_alias=True),
     )
     long_running_tool_ids.add(request_euc_function_call.id)
     parts.append(types.Part(function_call=request_euc_function_call))
@@ -339,9 +396,7 @@ def generate_request_confirmation_event(
       invocation_id=invocation_context.invocation_id,
       author=invocation_context.agent.name,
       branch=invocation_context.branch,
-      content=types.Content(
-          parts=parts, role=function_response_event.content.role
-      ),
+      content=types.Content(parts=parts, role='model'),
       long_running_tool_ids=long_running_tool_ids,
   )
 
@@ -372,7 +427,6 @@ async def handle_function_call_list_async(
     tool_confirmation_dict: Optional[dict[str, ToolConfirmation]] = None,
 ) -> Optional[Event]:
   """Calls the functions and returns the function response event."""
-  from ...agents.llm_agent import LlmAgent
 
   agent = invocation_context.agent
 
@@ -401,7 +455,14 @@ async def handle_function_call_list_async(
   ]
 
   # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
+  try:
+    function_response_events = await asyncio.gather(*tasks)
+  except Exception:
+    for t in tasks:
+      if not t.done():
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    raise
 
   # Filter out None results
   function_response_events = [
@@ -423,6 +484,7 @@ async def handle_function_call_list_async(
       trace_merged_tool_calls(
           response_event_id=merged_event.id,
           function_response_event=merged_event,
+          invocation_context=invocation_context,
       )
   return merged_event
 
@@ -475,6 +537,7 @@ async def _execute_single_function_call_async(
   function_args = (
       copy.deepcopy(function_call.args) if function_call.args else {}
   )
+  detected_error_type: Optional[str] = None
 
   tool_context = _create_tool_context(
       invocation_context, function_call, tool_confirmation
@@ -498,7 +561,7 @@ async def _execute_single_function_call_async(
       raise tool_error
 
   async def _run_with_trace():
-    nonlocal function_args
+    nonlocal function_args, detected_error_type
 
     # Step 1: Check if plugin before_tool_callback overrides the function
     # response.
@@ -569,11 +632,19 @@ async def _execute_single_function_call_async(
     if altered_function_response is not None:
       function_response = altered_function_response
 
-    if tool.is_long_running:
-      # Allow long-running function to return None to not provide function
-      # response.
-      if not function_response:
-        return None
+    if (
+        tool.is_long_running or tool._defers_response
+    ) and not function_response:
+      # The tool either runs long (FR will arrive later via session
+      # injection) or defers its response by design (e.g., the LlmAgent
+      # wrapper for task delegation synthesizes the FR after the
+      # sub-agent completes).  Either way, skip the auto-FR build when
+      # the tool returned nothing.
+      return None
+
+    detected_error_type = _detect_error_type_for_telemetry(
+        tool, tool_context, function_response
+    )
 
     # Note: State deltas are not applied here - they are collected in
     # tool_context.actions.state_delta and applied later when the session
@@ -585,29 +656,19 @@ async def _execute_single_function_call_async(
     )
     return function_response_event
 
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
-    function_response_event = None
-    caught_error = None
-    try:
-      function_response_event = await _run_with_trace()
-      return function_response_event
-    except Exception as e:
-      caught_error = e
-      raise
-    finally:
-      trace_tool_call(
-          tool=tool,
-          args=function_args,
-          function_response_event=function_response_event,
-          error=caught_error,
-      )
+  async with _instrumentation.record_tool_execution(
+      tool, agent, function_args, invocation_context=invocation_context
+  ) as tel_ctx:
+    tel_ctx.function_response_event = await _run_with_trace()
+    tel_ctx.error_type = detected_error_type
+    return tel_ctx.function_response_event
 
 
 async def handle_function_calls_live(
     invocation_context: InvocationContext,
     function_call_event: Event,
     tools_dict: dict[str, BaseTool],
-) -> Event:
+) -> Event | None:
   """Calls the functions and returns the function response event."""
   from ...agents.llm_agent import LlmAgent
 
@@ -635,12 +696,22 @@ async def handle_function_calls_live(
   ]
 
   # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
+  try:
+    function_response_events = await asyncio.gather(*tasks)
+  except Exception:
+    for t in tasks:
+      if not t.done():
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    raise
 
   # Filter out None results
   function_response_events = [
       event for event in function_response_events if event is not None
   ]
+
+  for event in function_response_events:
+    event.live_session_id = function_call_event.live_session_id
 
   if not function_response_events:
     return None
@@ -656,6 +727,7 @@ async def handle_function_calls_live(
       trace_merged_tool_calls(
           response_event_id=merged_event.id,
           function_response_event=merged_event,
+          invocation_context=invocation_context,
       )
   return merged_event
 
@@ -708,6 +780,7 @@ async def _execute_single_function_call_live(
   function_args = (
       copy.deepcopy(function_call.args) if function_call.args else {}
   )
+  detected_error_type: Optional[str] = None
 
   tool_context = _create_tool_context(invocation_context, function_call)
 
@@ -728,7 +801,7 @@ async def _execute_single_function_call_live(
     raise tool_error
 
   async def _run_with_trace():
-    nonlocal function_args
+    nonlocal function_args, detected_error_type
 
     # Do not use "args" as the variable name, because it is a reserved keyword
     # in python debugger.
@@ -809,10 +882,17 @@ async def _execute_single_function_call_live(
     if altered_function_response is not None:
       function_response = altered_function_response
 
-    if tool.is_long_running:
-      # Allow async function to return None to not provide function response.
-      if not function_response:
-        return None
+    if (
+        tool.is_long_running or tool._defers_response
+    ) and not function_response:
+      # The tool either runs long (FR will arrive later via session
+      # injection) or defers its response by design.  Skip the auto-FR
+      # build when the tool returned nothing.
+      return None
+
+    detected_error_type = _detect_error_type_for_telemetry(
+        tool, tool_context, function_response
+    )
 
     # Note: State deltas are not applied here - they are collected in
     # tool_context.actions.state_delta and applied later when the session
@@ -824,22 +904,12 @@ async def _execute_single_function_call_live(
     )
     return function_response_event
 
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
-    function_response_event = None
-    caught_error = None
-    try:
-      function_response_event = await _run_with_trace()
-      return function_response_event
-    except Exception as e:
-      caught_error = e
-      raise
-    finally:
-      trace_tool_call(
-          tool=tool,
-          args=function_args,
-          function_response_event=function_response_event,
-          error=caught_error,
-      )
+  async with _instrumentation.record_tool_execution(
+      tool, agent, function_args, invocation_context=invocation_context
+  ) as tel_ctx:
+    tel_ctx.function_response_event = await _run_with_trace()
+    tel_ctx.error_type = detected_error_type
+    return tel_ctx.function_response_event
 
 
 async def _process_function_live_helper(
@@ -922,13 +992,8 @@ async def _process_function_live_helper(
             )
         ) as agen:
           async for result in agen:
-            updated_content = types.Content(
-                role='user',
-                parts=[
-                    types.Part.from_text(
-                        text=f'Function {tool.name} returned: {result}'
-                    )
-                ],
+            updated_content = _build_function_response_content(
+                tool, result, tool_context.function_call_id
             )
             invocation_context.live_request_queue.send_content(updated_content)
       except asyncio.CancelledError:
@@ -1117,6 +1182,9 @@ def __build_response_event(
     tool_context: ToolContext,
     invocation_context: InvocationContext,
 ) -> Event:
+  # Capture the raw result for display purposes before any normalization.
+  display_result = function_result
+
   # Specs requires the result to be a dict.
   if not isinstance(function_result, dict):
     function_result = {'result': function_result}
@@ -1127,17 +1195,31 @@ def __build_response_event(
         tool, function_result
     )
 
-  part_function_response = types.Part.from_function_response(
-      name=tool.name,
-      response=function_result,
-      parts=function_response_parts,
+  content = _build_function_response_content(
+      tool,
+      function_result,
+      tool_context.function_call_id,
+      function_response_parts,
   )
-  part_function_response.function_response.id = tool_context.function_call_id
 
-  content = types.Content(
-      role='user',
-      parts=[part_function_response],
-  )
+  # When summarization is skipped, ensure a displayable text part is added so
+  # the tool's output is not lost in UIs that don't render function responses.
+  # Control-flow tools (e.g. exit_loop) set skip_summarization but return no
+  # meaningful output; their None result is normalized to {'result': None}, so
+  # skip those to avoid emitting a noisy "null" text part.
+  has_displayable_result = display_result is not None and display_result != {
+      'result': None
+  }
+  if (
+      tool_context.actions.skip_summarization
+      and 'error' not in function_result
+      and has_displayable_result
+  ):
+    if isinstance(display_result, str):
+      result_text = display_result
+    else:
+      result_text = json.dumps(display_result, ensure_ascii=False, default=str)
+    content.parts.append(types.Part.from_text(text=result_text))
 
   function_response_event = Event(
       invocation_id=invocation_context.invocation_id,
@@ -1148,6 +1230,31 @@ def __build_response_event(
   )
 
   return function_response_event
+
+
+def _build_function_response_content(
+    tool: BaseTool,
+    function_result: object,
+    function_call_id: Optional[str],
+    function_response_parts: Optional[list[types.FunctionResponsePart]] = None,
+) -> types.Content:
+  """Builds the content carrying a tool result as a FunctionResponse."""
+  # Specs requires the result to be a dict.
+  if not isinstance(function_result, dict):
+    function_result = {'result': function_result}
+
+  part_function_response = types.Part.from_function_response(
+      name=tool.name,
+      response=function_result,
+      parts=function_response_parts,
+  )
+  part_function_response.function_response.id = function_call_id
+  if tool.response_scheduling is not None:
+    part_function_response.function_response.scheduling = (
+        tool.response_scheduling
+    )
+
+  return types.Content(role='user', parts=[part_function_response])
 
 
 def deep_merge_dicts(d1: dict, d2: dict) -> dict:
@@ -1207,6 +1314,7 @@ def merge_parallel_function_response_events(
       branch=base_event.branch,
       content=types.Content(role='user', parts=merged_parts),
       actions=merged_actions,  # Aggregated from all parallel events
+      live_session_id=base_event.live_session_id,
   )
 
   # Use the base_event as the timestamp

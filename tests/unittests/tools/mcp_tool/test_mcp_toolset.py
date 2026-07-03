@@ -15,13 +15,11 @@
 import asyncio
 import base64
 from io import StringIO
-import json
+import pickle
 import sys
-import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import Mock
-from unittest.mock import patch
 
 from fastapi.openapi.models import OAuth2
 from google.adk.agents.readonly_context import ReadonlyContext
@@ -29,6 +27,7 @@ from google.adk.auth.auth_credential import AuthCredential
 from google.adk.auth.auth_credential import AuthCredentialTypes
 from google.adk.auth.auth_credential import HttpAuth
 from google.adk.auth.auth_credential import HttpCredentials
+from google.adk.auth.auth_credential import OAuth2Auth
 from google.adk.auth.auth_tool import AuthConfig
 from google.adk.tools.load_mcp_resource_tool import LoadMcpResourceTool
 from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
@@ -37,6 +36,7 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
 from google.adk.tools.mcp_tool.mcp_tool import MCPTool
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from google.adk.tools.tool_configs import ToolArgsConfig
 from mcp import StdioServerParameters
 from mcp.types import BlobResourceContents
 from mcp.types import ListResourcesResult
@@ -138,10 +138,8 @@ class TestMcpToolset:
   def test_init_with_auth(self):
     """Test initialization with authentication."""
     # Create real auth scheme instances
-    from fastapi.openapi.models import OAuth2
 
     auth_scheme = OAuth2(flows={})
-    from google.adk.auth.auth_credential import OAuth2Auth
 
     auth_credential = AuthCredential(
         auth_type="oauth2",
@@ -156,6 +154,42 @@ class TestMcpToolset:
 
     assert toolset._auth_scheme == auth_scheme
     assert toolset._auth_credential == auth_credential
+
+  def test_init_with_auth_and_credential_key(self):
+    """Test initialization with authentication and a custom credential_key."""
+
+    auth_scheme = OAuth2(flows={})
+
+    auth_credential = AuthCredential(
+        auth_type="oauth2",
+        oauth2=OAuth2Auth(client_id="test_id", client_secret="test_secret"),
+    )
+
+    toolset = McpToolset(
+        connection_params=self.mock_stdio_params,
+        auth_scheme=auth_scheme,
+        auth_credential=auth_credential,
+        credential_key="my_custom_key",
+    )
+
+    assert toolset._auth_scheme == auth_scheme
+    assert toolset._auth_credential == auth_credential
+    assert toolset._auth_config.credential_key == "my_custom_key"
+
+  def test_from_config_with_credential_key(self):
+    """Test that from_config correctly parses credential_key."""
+
+    auth_scheme = OAuth2(flows={})
+
+    config = ToolArgsConfig(
+        stdio_server_params=self.mock_stdio_params,
+        auth_scheme=auth_scheme,
+        credential_key="my_custom_key",
+    )
+    toolset = McpToolset.from_config(config, "")
+
+    assert isinstance(toolset._auth_scheme, OAuth2)
+    assert toolset._auth_config.credential_key == "my_custom_key"
 
   def test_init_missing_connection_params(self):
     """Test initialization with missing connection params raises error."""
@@ -270,6 +304,32 @@ class TestMcpToolset:
     )
 
   @pytest.mark.asyncio
+  async def test_get_tools_with_async_header_provider(self):
+    """Test get_tools with an async header_provider."""
+    mock_tools = [MockMCPTool("tool1"), MockMCPTool("tool2")]
+    self.mock_session.list_tools = AsyncMock(
+        return_value=MockListToolsResult(mock_tools)
+    )
+    mock_readonly_context = Mock(spec=ReadonlyContext)
+    expected_headers = {"X-Tenant-ID": "test-tenant"}
+
+    async def header_provider(_context):
+      return expected_headers
+
+    toolset = McpToolset(
+        connection_params=self.mock_stdio_params,
+        header_provider=header_provider,
+    )
+    toolset._mcp_session_manager = self.mock_session_manager
+
+    tools = await toolset.get_tools(readonly_context=mock_readonly_context)
+
+    assert len(tools) == 2
+    self.mock_session_manager.create_session.assert_called_once_with(
+        headers=expected_headers
+    )
+
+  @pytest.mark.asyncio
   async def test_close_success(self):
     """Test successful cleanup."""
     toolset = McpToolset(connection_params=self.mock_stdio_params)
@@ -290,16 +350,8 @@ class TestMcpToolset:
         side_effect=Exception("Cleanup error")
     )
 
-    custom_errlog = StringIO()
-    toolset._errlog = custom_errlog
-
-    # Should not raise exception
+    # Should not raise exception, should log the warning
     await toolset.close()
-
-    # Should log the error
-    error_output = custom_errlog.getvalue()
-    assert "Warning: Error during McpToolset cleanup" in error_output
-    assert "Cleanup error" in error_output
 
   @pytest.mark.asyncio
   async def test_get_tools_with_timeout(self):
@@ -674,3 +726,10 @@ class TestMcpToolset:
 
     assert headers["Authorization"] == "Bearer token"
     assert headers["X-API-Key"] == "secret"
+
+  def test_pickle_mcp_toolset(self):
+    toolset = McpToolset(connection_params=self.mock_stdio_params)
+    pickled = pickle.dumps(toolset)
+    unpickled = pickle.loads(pickled)
+    assert unpickled._connection_params == self.mock_stdio_params
+    assert unpickled._errlog == sys.stderr

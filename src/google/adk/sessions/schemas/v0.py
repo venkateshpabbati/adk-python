@@ -29,6 +29,7 @@ from __future__ import annotations
 from datetime import datetime
 from datetime import timezone
 import json
+import logging
 import pickle
 from typing import Any
 from typing import Optional
@@ -60,6 +61,32 @@ from .shared import DEFAULT_MAX_KEY_LENGTH
 from .shared import DEFAULT_MAX_VARCHAR_LENGTH
 from .shared import DynamicJSON
 from .shared import PreciseTimestamp
+
+logger = logging.getLogger("google_adk." + __name__)
+
+_TRUNCATION_SUFFIX = "...[truncated]"
+
+
+def _truncate_str(value: Optional[str], max_length: int) -> Optional[str]:
+  """Truncates a string to fit within *max_length* characters.
+
+  Old databases may still carry ``VARCHAR(N)`` columns that were never
+  ALTERed after ADK upgraded the schema definition to ``TEXT``.  Truncating
+  before the INSERT prevents a ``StringDataRightTruncationError`` crash.
+  """
+  if value is not None and len(value) > max_length:
+    truncated = value[: max_length - len(_TRUNCATION_SUFFIX)] + (
+        _TRUNCATION_SUFFIX
+    )
+    logger.warning(
+        "Truncated value from %d to %d characters to fit database"
+        " column constraint. Run the appropriate ALTER TABLE command"
+        " or migrate to the v1 schema to store full-length values.",
+        len(value),
+        max_length,
+    )
+    return truncated
+  return value
 
 
 class DynamicPickleType(TypeDecorator):
@@ -145,12 +172,22 @@ class StorageSession(Base):
         and sqlalchemy_session.bind
         and sqlalchemy_session.bind.dialect.name == "sqlite"
     )
-    return self.get_update_timestamp(is_sqlite=is_sqlite)
+    is_postgresql = bool(
+        sqlalchemy_session
+        and sqlalchemy_session.bind
+        and sqlalchemy_session.bind.dialect.name == "postgresql"
+    )
+    return self.get_update_timestamp(
+        is_sqlite=is_sqlite, is_postgresql=is_postgresql
+    )
 
-  def get_update_timestamp(self, is_sqlite: bool) -> float:
+  def get_update_timestamp(
+      self, is_sqlite: bool = False, is_postgresql: bool = False
+  ) -> float:
     """Returns the time zone aware update timestamp."""
-    if is_sqlite:
-      # SQLite does not support timezone. SQLAlchemy returns a naive datetime
+    del is_sqlite, is_postgresql  # Unused.
+    if self.update_time.tzinfo is None:
+      # SQLite and PostgreSQL do not support timezone. SQLAlchemy returns a naive datetime
       # object without timezone information. We need to convert it to UTC
       # manually.
       return self.update_time.replace(tzinfo=timezone.utc).timestamp()
@@ -168,6 +205,7 @@ class StorageSession(Base):
       state: dict[str, Any] | None = None,
       events: list[Event] | None = None,
       is_sqlite: bool = False,
+      is_postgresql: bool = False,
   ) -> Session:
     """Converts the storage session to a session object."""
     if state is None:
@@ -181,7 +219,9 @@ class StorageSession(Base):
         id=self.id,
         state=state,
         events=events,
-        last_update_time=self.get_update_timestamp(is_sqlite=is_sqlite),
+        last_update_time=self.get_update_timestamp(
+            is_sqlite=is_sqlite, is_postgresql=is_postgresql
+        ),
     )
     session._storage_update_marker = self.get_update_marker()
     return session
@@ -298,7 +338,9 @@ class StorageEvent(Base):
         partial=event.partial,
         turn_complete=event.turn_complete,
         error_code=event.error_code,
-        error_message=event.error_message,
+        error_message=_truncate_str(
+            event.error_message, DEFAULT_MAX_VARCHAR_LENGTH
+        ),
         interrupted=event.interrupted,
     )
     if event.content:

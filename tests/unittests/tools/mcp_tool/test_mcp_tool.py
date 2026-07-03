@@ -19,6 +19,7 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from google.adk.agents.context import Context
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.auth.auth_credential import AuthCredential
 from google.adk.auth.auth_credential import AuthCredentialTypes
 from google.adk.auth.auth_credential import HttpAuth
@@ -27,7 +28,9 @@ from google.adk.auth.auth_credential import OAuth2Auth
 from google.adk.auth.auth_credential import ServiceAccount
 from google.adk.features import FeatureName
 from google.adk.features._feature_registry import temporary_feature_override
+from google.adk.sessions.session import Session
 from google.adk.tools.mcp_tool import mcp_tool
+from google.adk.tools.mcp_tool.mcp_session_manager import _http_debug_var
 from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from google.adk.tools.mcp_tool.mcp_tool import MCPTool
 from google.adk.tools.tool_context import ToolContext
@@ -63,65 +66,23 @@ class MockMCPTool:
     self.outputSchema = outputSchema
 
 
-class TestMCPTool:
-  """Test suite for MCPTool class."""
+class TestMCPToolLegacy:
+  """Legacy tests for MCPTool."""
+
+  @pytest.fixture(autouse=True)
+  def disable_feature_flag(self):
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, False
+    ):
+      yield
 
   def setup_method(self):
-    """Set up test fixtures."""
     self.mock_mcp_tool = MockMCPTool()
     self.mock_session_manager = Mock(spec=MCPSessionManager)
     self.mock_session = AsyncMock()
     self.mock_session_manager.create_session = AsyncMock(
         return_value=self.mock_session
     )
-
-  def test_init_basic(self):
-    """Test basic initialization without auth."""
-    tool = MCPTool(
-        mcp_tool=self.mock_mcp_tool,
-        mcp_session_manager=self.mock_session_manager,
-    )
-
-    assert tool.name == "test_tool"
-    assert tool.description == "Test tool description"
-    assert tool._mcp_tool == self.mock_mcp_tool
-    assert tool._mcp_session_manager == self.mock_session_manager
-
-  def test_init_with_auth(self):
-    """Test initialization with authentication."""
-    # Create real auth scheme instances instead of mocks
-    from fastapi.openapi.models import OAuth2
-
-    auth_scheme = OAuth2(flows={})
-    auth_credential = AuthCredential(
-        auth_type=AuthCredentialTypes.OAUTH2,
-        oauth2=OAuth2Auth(client_id="test_id", client_secret="test_secret"),
-    )
-
-    tool = MCPTool(
-        mcp_tool=self.mock_mcp_tool,
-        mcp_session_manager=self.mock_session_manager,
-        auth_scheme=auth_scheme,
-        auth_credential=auth_credential,
-    )
-
-    # The auth config is stored in the parent class _credentials_manager
-    assert tool._credentials_manager is not None
-    assert tool._credentials_manager._auth_config.auth_scheme == auth_scheme
-    assert (
-        tool._credentials_manager._auth_config.raw_auth_credential
-        == auth_credential
-    )
-
-  def test_init_with_empty_description(self):
-    """Test initialization with empty description."""
-    mock_tool = MockMCPTool(description=None)
-    tool = MCPTool(
-        mcp_tool=mock_tool,
-        mcp_session_manager=self.mock_session_manager,
-    )
-
-    assert tool.description == ""
 
   def test_get_declaration(self):
     """Test function declaration generation."""
@@ -136,6 +97,25 @@ class TestMCPTool:
     assert declaration.name == "test_tool"
     assert declaration.description == "Test tool description"
     assert declaration.parameters is not None
+
+
+class TestMCPToolWithJsonSchema:
+  """Tests for MCPTool with JSON_SCHEMA_FOR_FUNC_DECL enabled."""
+
+  @pytest.fixture(autouse=True)
+  def enable_feature_flag(self):
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, True
+    ):
+      yield
+
+  def setup_method(self):
+    self.mock_mcp_tool = MockMCPTool()
+    self.mock_session_manager = Mock(spec=MCPSessionManager)
+    self.mock_session = AsyncMock()
+    self.mock_session_manager.create_session = AsyncMock(
+        return_value=self.mock_session
+    )
 
   def test_get_declaration_with_json_schema_for_func_decl_enabled(self):
     """Test function declaration generation with json schema for func decl enabled."""
@@ -201,6 +181,67 @@ class TestMCPTool:
 
     assert declaration.response is None
     assert not declaration.response_json_schema
+
+
+class TestMCPTool:
+  """Test suite for MCPTool class."""
+
+  def setup_method(self):
+    """Set up test fixtures."""
+    self.mock_mcp_tool = MockMCPTool()
+    self.mock_session_manager = Mock(spec=MCPSessionManager)
+    self.mock_session = AsyncMock()
+    self.mock_session_manager.create_session = AsyncMock(
+        return_value=self.mock_session
+    )
+
+  def test_init_basic(self):
+    """Test basic initialization without auth."""
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    assert tool.name == "test_tool"
+    assert tool.description == "Test tool description"
+    assert tool._mcp_tool == self.mock_mcp_tool
+    assert tool._mcp_session_manager == self.mock_session_manager
+
+  def test_init_with_auth(self):
+    """Test initialization with authentication."""
+    # Create real auth scheme instances instead of mocks
+    from fastapi.openapi.models import OAuth2
+
+    auth_scheme = OAuth2(flows={})
+    auth_credential = AuthCredential(
+        auth_type=AuthCredentialTypes.OAUTH2,
+        oauth2=OAuth2Auth(client_id="test_id", client_secret="test_secret"),
+    )
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+        auth_scheme=auth_scheme,
+        auth_credential=auth_credential,
+    )
+
+    # The auth config is stored in the parent class _credentials_manager
+    assert tool._credentials_manager is not None
+    assert tool._credentials_manager._auth_config.auth_scheme == auth_scheme
+    assert (
+        tool._credentials_manager._auth_config.raw_auth_credential
+        == auth_credential
+    )
+
+  def test_init_with_empty_description(self):
+    """Test initialization with empty description."""
+    mock_tool = MockMCPTool(description=None)
+    tool = MCPTool(
+        mcp_tool=mock_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    assert tool.description == ""
 
   @pytest.mark.asyncio
   async def test_run_async_impl_no_auth(self):
@@ -913,6 +954,41 @@ class TestMCPTool:
     )
 
   @pytest.mark.asyncio
+  async def test_run_async_impl_with_async_header_provider_no_auth(self):
+    """Test running tool with an async header_provider and no authentication."""
+    expected_headers = {"X-Tenant-ID": "test-tenant"}
+
+    async def header_provider(_context):
+      return expected_headers
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+        header_provider=header_provider,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="response text")]
+    )
+    self.mock_session.call_tool = AsyncMock(return_value=mcp_response)
+
+    tool_context = Mock(spec=ToolContext)
+    tool_context._invocation_context = Mock()
+    args = {"param1": "test_value"}
+
+    result = await tool._run_async_impl(
+        args=args, tool_context=tool_context, credential=None
+    )
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+    self.mock_session_manager.create_session.assert_called_once_with(
+        headers=expected_headers
+    )
+    self.mock_session.call_tool.assert_called_once_with(
+        "test_tool", arguments=args, progress_callback=None, meta=None
+    )
+
+  @pytest.mark.asyncio
   async def test_run_async_impl_with_header_provider_and_oauth2(self):
     """Test running tool with header_provider and OAuth2 auth."""
     dynamic_headers = {"X-Tenant-ID": "test-tenant"}
@@ -1166,3 +1242,437 @@ class TestMCPTool:
         mcp_session_manager=self.mock_session_manager,
     )
     assert tool2.mcp_app_resource_uri is None
+
+  @pytest.mark.asyncio
+  @patch(
+      "google.adk.tools.mcp_tool.mcp_tool.logger.isEnabledFor",
+      return_value=True,
+  )
+  async def test_run_async_captures_http_debug_info(self, mock_is_enabled):
+    """Test that run_async captures HTTP debug info into context.custom_metadata."""
+    from google.adk.tools.mcp_tool.mcp_session_manager import _http_debug_var
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+
+    async def mock_call_tool(*args, **kwargs):
+      debug_list = _http_debug_var.get(None)
+      if debug_list is not None:
+        debug_list.append(
+            {"url": "https://example.com/api", "status_code": 200}
+        )
+      return mcp_response
+
+    self.mock_session.call_tool = mock_call_tool
+
+    tool_context = Mock(spec=ToolContext)
+    metadata_dict = {}
+    tool_context.custom_metadata = metadata_dict
+
+    args = {"param1": "test_value"}
+
+    result = await tool.run_async(args=args, tool_context=tool_context)
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+
+    assert "http_debug_info" in metadata_dict
+    debug_info = metadata_dict["http_debug_info"]
+    assert len(debug_info) == 1
+    assert debug_info[0]["url"] == "https://example.com/api"
+    assert debug_info[0]["status_code"] == 200
+
+  @pytest.mark.asyncio
+  @patch(
+      "google.adk.tools.mcp_tool.mcp_tool.logger.isEnabledFor",
+      return_value=False,
+  )
+  async def test_run_async_skips_http_debug_info_when_debug_disabled(
+      self, mock_is_enabled
+  ):
+    """Test that run_async does not capture HTTP debug info when debug logging is disabled."""
+    from google.adk.tools.mcp_tool.mcp_session_manager import _http_debug_var
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+
+    async def mock_call_tool(*args, **kwargs):
+      debug_list = _http_debug_var.get(None)
+      if debug_list is not None:
+        debug_list.append(
+            {"url": "https://example.com/api", "status_code": 200}
+        )
+      return mcp_response
+
+    self.mock_session.call_tool = mock_call_tool
+
+    tool_context = Mock(spec=ToolContext)
+    metadata_dict = {}
+    tool_context.custom_metadata = metadata_dict
+
+    args = {"param1": "test_value"}
+
+    result = await tool.run_async(args=args, tool_context=tool_context)
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+    assert "http_debug_info" not in metadata_dict
+
+  @pytest.mark.asyncio
+  @patch(
+      "google.adk.tools.mcp_tool.mcp_tool.logger.isEnabledFor",
+      return_value=True,
+  )
+  async def test_run_async_captures_http_debug_info_on_error(
+      self, mock_is_enabled
+  ):
+    """Test that run_async captures HTTP debug info even when the tool call fails/raises."""
+    from google.adk.tools.mcp_tool.mcp_session_manager import _http_debug_var
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    async def mock_call_tool(*args, **kwargs):
+      debug_list = _http_debug_var.get(None)
+      if debug_list is not None:
+        debug_list.append(
+            {"url": "https://example.com/api", "status_code": 500}
+        )
+      raise RuntimeError("Tool execution failed")
+
+    self.mock_session.call_tool = mock_call_tool
+
+    tool_context = Mock(spec=ToolContext)
+    metadata_dict = {}
+    tool_context.custom_metadata = metadata_dict
+
+    args = {"param1": "test_value"}
+
+    with pytest.raises(RuntimeError, match="Tool execution failed"):
+      # Under flag=False, the error bubbles up
+      with temporary_feature_override(
+          FeatureName._MCP_GRACEFUL_ERROR_HANDLING, False
+      ):
+        await tool.run_async(args=args, tool_context=tool_context)
+
+    assert "http_debug_info" in metadata_dict
+    debug_info = metadata_dict["http_debug_info"]
+    # Retries once on error, so we expect 2 debug entries
+    assert len(debug_info) == 2
+    assert debug_info[0]["url"] == "https://example.com/api"
+    assert debug_info[0]["status_code"] == 500
+    assert debug_info[1]["url"] == "https://example.com/api"
+    assert debug_info[1]["status_code"] == 500
+
+  @pytest.mark.asyncio
+  @patch(
+      "google.adk.tools.mcp_tool.mcp_tool.logger.isEnabledFor",
+      return_value=True,
+  )
+  async def test_run_async_captures_http_debug_info_on_graceful_error(
+      self, mock_is_enabled
+  ):
+    """Test that run_async captures HTTP debug info when tool call fails gracefully with McpError."""
+    from google.adk.tools.mcp_tool.mcp_session_manager import _http_debug_var
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    async def mock_call_tool(*args, **kwargs):
+      debug_list = _http_debug_var.get(None)
+      if debug_list is not None:
+        debug_list.append(
+            {"url": "https://example.com/api", "status_code": 403}
+        )
+      raise McpError(ErrorData(code=-32000, message="Forbidden"))
+
+    self.mock_session.call_tool = mock_call_tool
+
+    tool_context = Mock(spec=ToolContext)
+    metadata_dict = {}
+    tool_context.custom_metadata = metadata_dict
+
+    args = {"param1": "test_value"}
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, True
+    ):
+      result = await tool.run_async(args=args, tool_context=tool_context)
+
+    assert result == {"error": "MCP tool execution failed: Forbidden"}
+    assert "http_debug_info" in metadata_dict
+    debug_info = metadata_dict["http_debug_info"]
+    # Retries once on error, so we expect 2 debug entries
+    assert len(debug_info) == 2
+    assert debug_info[0]["url"] == "https://example.com/api"
+    assert debug_info[0]["status_code"] == 403
+    assert debug_info[1]["url"] == "https://example.com/api"
+    assert debug_info[1]["status_code"] == 403
+
+
+class TestMCPToolGracefulErrorHandling:
+  """Tests for the _MCP_GRACEFUL_ERROR_HANDLING feature flag.
+
+  These cover the behavior added by the re-landed fix for the 5-minute
+  hang when an MCP tool returns a JSON-RPC error or its underlying
+  transport crashes (e.g. AGW + Model Armor 403).
+  """
+
+  def setup_method(self):
+    """Set up test fixtures."""
+    self.mock_mcp_tool = MockMCPTool()
+    self.mock_session_manager = Mock(spec=MCPSessionManager)
+    self.mock_session = AsyncMock()
+    self.mock_session_manager.create_session = AsyncMock(
+        return_value=self.mock_session
+    )
+    # By default, no real SessionContext available — falls back to direct await.
+    self.mock_session_manager._get_session_context = Mock(return_value=None)
+
+  @pytest.mark.asyncio
+  async def test_run_async_returns_dict_on_mcp_error_when_flag_on(self):
+    """When the flag is on, McpError surfaces as `{"error": "..."}`."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    error_data = ErrorData(code=-32000, message="Client error '403 Forbidden'")
+    tool._run_async_impl = AsyncMock(side_effect=McpError(error_data))
+
+    tool_context = Mock(spec=ToolContext)
+    args = {"param1": "test_value"}
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, True
+    ):
+      result = await tool.run_async(args=args, tool_context=tool_context)
+
+    assert result == {
+        "error": "MCP tool execution failed: Client error '403 Forbidden'"
+    }
+
+  @pytest.mark.asyncio
+  async def test_run_async_returns_dict_on_generic_exception_when_flag_on(
+      self,
+  ):
+    """When the flag is on, unexpected exceptions become `{"error": "..."}`."""
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    tool._run_async_impl = AsyncMock(
+        side_effect=ConnectionError("Failed to create MCP session")
+    )
+
+    tool_context = Mock(spec=ToolContext)
+    args = {"param1": "test_value"}
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, True
+    ):
+      result = await tool.run_async(args=args, tool_context=tool_context)
+
+    assert result == {
+        "error": (
+            "Unexpected error during MCP tool execution: Failed to create"
+            " MCP session"
+        )
+    }
+
+  @pytest.mark.asyncio
+  async def test_run_async_propagates_mcp_error_when_flag_off(self):
+    """Regression guard: with the flag off, exceptions still bubble up.
+
+    This protects downstream consumers that haven't migrated yet from a
+    silent behavior change.
+    """
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    error_data = ErrorData(code=-32000, message="Client error '403 Forbidden'")
+    tool._run_async_impl = AsyncMock(side_effect=McpError(error_data))
+
+    tool_context = Mock(spec=ToolContext)
+    args = {"param1": "test_value"}
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, False
+    ):
+      with pytest.raises(McpError):
+        await tool.run_async(args=args, tool_context=tool_context)
+
+  @pytest.mark.asyncio
+  async def test_run_async_impl_uses_run_guarded_when_session_context_present(
+      self,
+  ):
+    """When _get_session_context returns a real SessionContext, use it.
+
+    This is what protects against the 5-minute hang on 403: `_run_guarded`
+    races the tool call against the background session task.
+    """
+    import asyncio
+
+    from google.adk.tools.mcp_tool.session_context import SessionContext
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+    self.mock_session.call_tool = Mock(
+        return_value=AsyncMock(return_value=mcp_response)()
+    )
+
+    # Real SessionContext stub: subclass to override _run_guarded so we
+    # don't need a live MCP server, but keep isinstance(SessionContext) True.
+    class StubSessionContext(SessionContext):
+
+      def __init__(self):
+        # Skip the parent __init__ — we don't need the underlying client.
+        self._run_guarded_called_with: list = []
+
+      async def _run_guarded(self, coro):
+        self._run_guarded_called_with.append(coro)
+        return await coro
+
+    stub = StubSessionContext()
+    self.mock_session_manager._get_session_context = Mock(return_value=stub)
+
+    tool_context = ToolContext(invocation_context=Mock())
+    tool_context.function_call_id = "test-call-id"
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, True
+    ):
+      result = await tool._run_async_impl(
+          args={"param1": "x"}, tool_context=tool_context, credential=None
+      )
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+    assert len(stub._run_guarded_called_with) == 1
+    # Verify the coro passed in was actually a coroutine (not a Mock).
+    assert asyncio.iscoroutine(stub._run_guarded_called_with[0])
+
+  @pytest.mark.asyncio
+  async def test_run_async_impl_falls_back_when_get_session_context_returns_none(
+      self,
+  ):
+    """If the session manager returns None, do a direct await (no _run_guarded).
+
+    Prevents AttributeError-style failures for callers that don't use
+    SessionContext (or for legacy session managers).
+    """
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+    self.mock_session.call_tool = AsyncMock(return_value=mcp_response)
+    self.mock_session_manager._get_session_context = Mock(return_value=None)
+
+    tool_context = ToolContext(invocation_context=Mock())
+    tool_context.function_call_id = "test-call-id"
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, True
+    ):
+      result = await tool._run_async_impl(
+          args={"param1": "x"}, tool_context=tool_context, credential=None
+      )
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+
+  @pytest.mark.asyncio
+  async def test_run_async_impl_falls_back_when_get_session_context_returns_mock(
+      self,
+  ):
+    """Backward-compat guard: a Mock from _get_session_context falls back too.
+
+    Many existing tests use Mock(spec=MCPSessionManager) which auto-returns
+    Mock() objects from any attribute access. Without the isinstance check,
+    we'd try to await a Mock and explode.
+    """
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+    self.mock_session.call_tool = AsyncMock(return_value=mcp_response)
+    # Auto-return a Mock instead of None (default Mock() behavior).
+    self.mock_session_manager._get_session_context = Mock(return_value=Mock())
+
+    tool_context = ToolContext(invocation_context=Mock())
+    tool_context.function_call_id = "test-call-id"
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, True
+    ):
+      result = await tool._run_async_impl(
+          args={"param1": "x"}, tool_context=tool_context, credential=None
+      )
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+
+  @pytest.mark.asyncio
+  async def test_run_async_impl_skips_run_guarded_when_flag_off(self):
+    """When the flag is off, the SessionContext is never consulted."""
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+    self.mock_session.call_tool = AsyncMock(return_value=mcp_response)
+
+    # Set up a tracker — should NEVER be called when the flag is off.
+    self.mock_session_manager._get_session_context = Mock(return_value=None)
+
+    tool_context = ToolContext(invocation_context=Mock())
+    tool_context.function_call_id = "test-call-id"
+
+    with temporary_feature_override(
+        FeatureName._MCP_GRACEFUL_ERROR_HANDLING, False
+    ):
+      result = await tool._run_async_impl(
+          args={"param1": "x"}, tool_context=tool_context, credential=None
+      )
+
+    assert result == mcp_response.model_dump(exclude_none=True, mode="json")
+    self.mock_session_manager._get_session_context.assert_not_called()

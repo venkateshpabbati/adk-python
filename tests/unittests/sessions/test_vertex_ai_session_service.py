@@ -28,12 +28,16 @@ from google.adk.auth.auth_tool import AuthConfig
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
 from google.adk.events.event_actions import EventCompaction
+from google.adk.models.cache_metadata import CacheMetadata
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.session import Session
+from google.adk.sessions.vertex_ai_session_service import _extract_short_session_id
+from google.adk.sessions.vertex_ai_session_service import _validate_session_id
 from google.adk.sessions.vertex_ai_session_service import VertexAiSessionService
 from google.api_core import exceptions as api_core_exceptions
 from google.genai import types as genai_types
 from google.genai.errors import ClientError
+import pydantic
 import pytest
 
 MOCK_SESSION_JSON_1 = {
@@ -91,6 +95,7 @@ MOCK_EVENT_JSON = [
             'branch': '',
             'long_running_tool_ids': ['tool1'],
         },
+        'raw_event': {},
     },
 ]
 MOCK_EVENT_JSON_2 = [
@@ -161,6 +166,96 @@ def _generate_mock_events_for_session_5(num_events):
 
 MANY_EVENTS_COUNT = 200
 MOCK_EVENTS_JSON_5 = _generate_mock_events_for_session_5(MANY_EVENTS_COUNT)
+
+MOCK_EVENT_WITH_OVERRIDE_JSON = [{
+    'name': (
+        'projects/test-project/locations/test-location/'
+        'reasoningEngines/123/sessions/override/events/1'
+    ),
+    'invocationId': 'override_invoke',
+    'author': 'user_with_override',
+    'timestamp': '2024-12-12T12:12:12.123456Z',
+    'content': {
+        'parts': [
+            {'text': 'top_level_content'},
+        ],
+    },
+    'actions': {
+        'transferToAgent': 'top_level_agent',
+    },
+    'eventMetadata': {
+        'partial': True,
+        'turnComplete': False,
+        'interrupted': False,
+        'branch': 'top_level_branch',
+    },
+    'errorCode': '111',
+    'errorMessage': 'top_level_error',
+    'rawEvent': {
+        'invocationId': 'wrong_invocation_id',
+        'author': 'wrong_author',
+        'content': {
+            'parts': [
+                {'text': 'raw_event_content'},
+            ],
+        },
+        'actions': {
+            'transferToAgent': 'raw_event_agent',
+        },
+        'partial': False,
+        'turnComplete': True,
+        'interrupted': True,
+        'branch': 'raw_event_branch',
+        'errorCode': '222',
+        'errorMessage': 'raw_event_error',
+    },
+}]
+
+MOCK_EVENT_WITH_OVERRIDE_JSON_2 = [{
+    'name': (
+        'projects/test-project/locations/test-location/'
+        'reasoningEngines/123/sessions/override/events/1'
+    ),
+    'invocationId': 'override_invoke',
+    'author': 'user_with_override',
+    'content': {},
+    'actions': {},
+    'timestamp': '2024-12-12T12:12:12.123456Z',
+    'rawEvent': {
+        'invocationId': 'wrong_invocation_id',
+        'author': 'wrong_author',
+        'content': {
+            'parts': [
+                {'text': 'raw_event_content'},
+            ],
+        },
+        'actions': {
+            'skipSummarization': None,
+            'stateDelta': {},
+            'artifactDelta': {},
+            'transferToAgent': 'raw_event_agent',
+            'escalate': None,
+            'requestedAuthConfigs': {},
+        },
+        'errorCode': '222',
+        'errorMessage': 'raw_event_error',
+        'partial': False,
+        'turnComplete': True,
+        'interrupted': True,
+        'branch': 'raw_event_branch',
+        'customMetadata': None,
+        'longRunningToolIds': None,
+    },
+}]
+
+MOCK_SESSION_WITH_OVERRIDE_JSON = {
+    'name': (
+        'projects/test-project/locations/test-location/'
+        'reasoningEngines/123/sessions/override'
+    ),
+    'update_time': '2024-12-12T12:12:12.123456Z',
+    'user_id': 'user_with_override',
+}
 
 MOCK_SESSION = Session(
     app_name='123',
@@ -249,6 +344,8 @@ def _convert_to_object(data):
           'artifact_delta',
           'custom_metadata',
           'requested_auth_configs',
+          'rawEvent',
+          'raw_event',
       ]:
         kwargs[key] = value
       else:
@@ -280,6 +377,7 @@ class MockAsyncClient:
     self.agent_engines.sessions.events.list.side_effect = self._list_events
     self.agent_engines.sessions.events.append.side_effect = self._append_event
     self.last_create_session_config: dict[str, Any] = {}
+    self.last_list_sessions_config: dict[str, Any] = {}
 
   async def __aenter__(self):
     """Enters the asynchronous context."""
@@ -296,8 +394,9 @@ class MockAsyncClient:
     raise api_core_exceptions.NotFound(f'Session not found: {session_id}')
 
   async def _list_sessions(self, name: str, config: dict[str, Any]):
+    self.last_list_sessions_config = config
     filter_val = config.get('filter', '')
-    user_id_match = re.search(r'user_id="([^"]+)"', filter_val)
+    user_id_match = re.search(r'user_id="((?:\\.|[^"])*)"', filter_val)
     if user_id_match:
       user_id = user_id_match.group(1)
       if user_id == 'user_with_pages':
@@ -630,6 +729,45 @@ async def test_get_and_delete_session():
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures('mock_get_api_client')
+async def test_delete_session_rejects_other_users_session():
+  """delete_session must not delete a session owned by a different user."""
+  session_service = mock_vertex_ai_session_service()
+
+  # session '1' belongs to 'user'; 'user2' must not be allowed to delete it.
+  with pytest.raises(ValueError) as excinfo:
+    await session_service.delete_session(
+        app_name='123', user_id='user2', session_id='1'
+    )
+  assert 'does not belong to user user2' in str(excinfo.value)
+
+  # Session must still exist.
+  assert (
+      await session_service.get_session(
+          app_name='123', user_id='user', session_id='1'
+      )
+      == MOCK_SESSION
+  )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_session_id_path_traversal_rejected():
+  """Session IDs containing path-traversal characters must be rejected."""
+  session_service = mock_vertex_ai_session_service()
+
+  for bad_id in ['..', '../foo', '..?force=true', 'a/b', '']:
+    with pytest.raises(ValueError):
+      await session_service.delete_session(
+          app_name='123', user_id='user', session_id=bad_id
+      )
+    with pytest.raises(ValueError):
+      await session_service.get_session(
+          app_name='123', user_id='user', session_id=bad_id
+      )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
 async def test_get_session_with_page_token():
   session_service = mock_vertex_ai_session_service()
 
@@ -681,6 +819,38 @@ async def test_get_session_keeps_events_newer_than_update_time(
       'Event timestamp should exceed session update_time to guard against'
       ' filtering.'
   )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+@pytest.mark.parametrize(
+    'mock_event_json',
+    [MOCK_EVENT_WITH_OVERRIDE_JSON, MOCK_EVENT_WITH_OVERRIDE_JSON_2],
+)
+async def test_get_session_from_raw_event(
+    mock_api_client_instance: MockAsyncClient,
+    mock_event_json,
+) -> None:
+  mock_api_client_instance.session_dict['6'] = MOCK_SESSION_WITH_OVERRIDE_JSON
+  mock_api_client_instance.event_dict['6'] = (
+      copy.deepcopy(mock_event_json),
+      None,
+  )
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user_with_override', session_id='6'
+  )
+  assert session is not None
+  assert len(session.events) == 1
+  event = session.events[0]
+  assert event.content.parts[0].text == 'raw_event_content'
+  assert event.actions.transfer_to_agent == 'raw_event_agent'
+  assert not event.partial
+  assert event.turn_complete
+  assert event.interrupted
+  assert event.branch == 'raw_event_branch'
+  assert event.error_code == '222'
+  assert event.error_message == 'raw_event_error'
 
 
 @pytest.mark.asyncio
@@ -752,6 +922,34 @@ async def test_list_sessions_all_users():
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures('mock_get_api_client')
+@pytest.mark.parametrize(
+    ('payload', 'expected_filter'),
+    [
+        (
+            'attacker" OR user_id!=""',
+            'user_id="attacker\\" OR user_id!=\\"\\""',
+        ),
+        ('\\', 'user_id="\\\\"'),
+        ('', 'user_id=""'),
+    ],
+)
+async def test_list_sessions_quotes_user_id_filter(
+    mock_api_client_instance, payload, expected_filter
+):
+  session_service = mock_vertex_ai_session_service()
+
+  sessions = await session_service.list_sessions(
+      app_name='123', user_id=payload
+  )
+
+  assert sessions.sessions == []
+  assert mock_api_client_instance.last_list_sessions_config == {
+      'filter': expected_filter
+  }
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
 async def test_create_session():
   session_service = mock_vertex_ai_session_service()
 
@@ -812,6 +1010,46 @@ async def test_create_session_with_custom_config(mock_api_client_instance):
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures('mock_get_api_client')
+async def test_create_session_with_ttl(mock_api_client_instance):
+  session_service = mock_vertex_ai_session_service()
+
+  ttl = '7200s'
+  await session_service.create_session(app_name='123', user_id='user', ttl=ttl)
+  assert mock_api_client_instance.last_create_session_config['ttl'] == ttl
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_create_session_with_ttl_and_expire_time_raises_value_error(
+    mock_api_client_instance,
+):
+  session_service = mock_vertex_ai_session_service()
+  with pytest.raises(
+      ValueError,
+      match="Cannot specify both 'ttl' and 'expire_time' simultaneously.",
+  ):
+    await session_service.create_session(
+        app_name='123',
+        user_id='user',
+        ttl='7200s',
+        expire_time='2025-12-12T12:12:12.123456Z',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_create_session_with_ttl_none_and_expire_time_none_does_not_raise(
+    mock_api_client_instance,
+):
+  session_service = mock_vertex_ai_session_service()
+  # None means "not set"; passing both as None must not raise.
+  await session_service.create_session(
+      app_name='123', user_id='user', ttl=None, expire_time=None
+  )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
 async def test_append_event():
   session_service = mock_vertex_ai_session_service()
   session_before_append = await session_service.get_session(
@@ -844,6 +1082,41 @@ async def test_append_event():
       branch='test_branch',
       custom_metadata={'custom': 'data'},
       long_running_tool_ids={'tool2'},
+      input_transcription=genai_types.Transcription(
+          text='test_input_transcription'
+      ),
+      output_transcription=genai_types.Transcription(
+          text='test_output_transcription'
+      ),
+      model_version='test_model_version',
+      avg_logprobs=0.5,
+      logprobs_result=genai_types.LogprobsResult(
+          chosen_candidates=[
+              genai_types.LogprobsResultCandidate(
+                  log_probability=0.5,
+                  token='test_token',
+                  token_id=0,
+              )
+          ]
+      ),
+      cache_metadata=CacheMetadata(
+          cache_name='test_cache_name',
+          expire_time=(
+              datetime.datetime.now(datetime.timezone.utc)
+              + datetime.timedelta(minutes=30)
+          ).timestamp(),
+          fingerprint='test_fingerprint',
+          invocations_used=1,
+          contents_count=1,
+      ),
+      citation_metadata=genai_types.CitationMetadata(
+          citations=[
+              genai_types.Citation(
+                  uri='http://test.com',
+                  title='test_title',
+              )
+          ]
+      ),
   )
 
   await session_service.append_event(session_before_append, event_to_append)
@@ -855,6 +1128,86 @@ async def test_append_event():
   assert len(retrieved_session.events) == 2
   event_to_append.id = retrieved_session.events[1].id
   assert retrieved_session.events[1] == event_to_append
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_append_event_strips_unsupported_part_metadata(
+    mock_api_client_instance: MockAsyncClient,
+) -> None:
+  """part_metadata must not reach the Sessions API (#6014).
+
+  ``Part.part_metadata`` is a Gemini Developer API-only field; the Vertex AI
+  Agent Engine Sessions ``appendEvent`` API rejects it with 400 INVALID_ARGUMENT
+  ("Unknown name \"part_metadata\""). It must be dropped from both the
+  ``content`` and ``raw_event`` payloads, while the part text is preserved.
+  """
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  event_to_append = Event(
+      invocation_id='inv_part_metadata',
+      author='user',
+      timestamp=1734005533.0,
+      content=genai_types.Content(
+          parts=[
+              genai_types.Part(
+                  text='hello', part_metadata={'source': 'portal'}
+              ),
+              genai_types.Part(text='world', part_metadata={'n': 1}),
+          ],
+      ),
+  )
+
+  await session_service.append_event(session, event_to_append)
+
+  appended = mock_api_client_instance.event_dict['1'][0][-1]
+  for part in appended['content']['parts']:
+    assert 'part_metadata' not in part
+    assert 'partMetadata' not in part
+  for part in appended['raw_event']['content']['parts']:
+    assert 'part_metadata' not in part
+    assert 'partMetadata' not in part
+  assert [p['text'] for p in appended['content']['parts']] == ['hello', 'world']
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_append_event_with_part_metadata_round_trips(
+    mock_api_client_instance: MockAsyncClient,
+) -> None:
+  """Reconstruction side of #6014: an event carrying part_metadata appends and
+  reads back without error. part_metadata is dropped (unsupported on Vertex),
+  but the session round-trips and the part text is preserved.
+  """
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  event_to_append = Event(
+      invocation_id='inv_part_metadata_rt',
+      author='user',
+      timestamp=1734005533.0,
+      content=genai_types.Content(
+          role='user',
+          parts=[
+              genai_types.Part(text='hello', part_metadata={'source': 'portal'})
+          ],
+      ),
+  )
+
+  await session_service.append_event(session, event_to_append)
+  retrieved = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+
+  appended = next(
+      e for e in retrieved.events if e.invocation_id == 'inv_part_metadata_rt'
+  )
+  assert appended.content is not None
+  assert appended.content.parts[0].text == 'hello'
+  assert appended.content.parts[0].part_metadata is None
 
 
 @pytest.mark.asyncio
@@ -1067,3 +1420,105 @@ async def test_append_event_with_usage_metadata_and_compaction():
   assert appended_event.custom_metadata == {'extra': 'info'}
   assert '_compaction' not in (appended_event.custom_metadata or {})
   assert '_usage_metadata' not in (appended_event.custom_metadata or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_append_event_fallback_for_older_sdk(mock_api_client_instance):
+  """Tests that append_event falls back to custom_metadata when SDK fails on raw_event."""
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  assert session is not None
+
+  compaction = EventCompaction(
+      start_timestamp=1000.0,
+      end_timestamp=2000.0,
+      compacted_content=genai_types.Content(
+          parts=[genai_types.Part(text='compacted summary')]
+      ),
+  )
+  event_to_append = Event(
+      invocation_id='fallback_invocation',
+      author='model',
+      timestamp=1734005534.0,
+      actions=EventActions(compaction=compaction),
+  )
+
+  mock_client = mock_api_client_instance
+
+  async def side_effect(name, author, invocation_id, timestamp, config):
+    if 'raw_event' in config:
+      # Trigger a real ValidationError since Pydantic V2 doesn't allow easy
+      # instantiation
+      class DummyModel(pydantic.BaseModel):
+        a: int
+
+      DummyModel(a='not an int')
+    return await mock_client._append_event(
+        name, author, invocation_id, timestamp, config
+    )
+
+  mock_client.agent_engines.sessions.events.append.side_effect = side_effect
+
+  await session_service.append_event(session, event_to_append)
+
+  # Verify that it was written and restored correctly via custom_metadata
+  retrieved_session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  appended_event = retrieved_session.events[-1]
+
+  assert appended_event.actions.compaction is not None
+  assert appended_event.actions.compaction.start_timestamp == 1000.0
+
+
+def test_extract_short_session_id_short_id():
+  assert _extract_short_session_id('123') == '123'
+  assert _extract_short_session_id('session-123_abc') == 'session-123_abc'
+
+
+def test_extract_short_session_id_strips_full_resource_name():
+  resource_name = 'projects/123/locations/us-east4/reasoningEngines/456/sessions/session-123'
+  assert _extract_short_session_id(resource_name) == 'session-123'
+  assert (
+      _extract_short_session_id(resource_name, expected_engine_id='456')
+      == 'session-123'
+  )
+
+
+def test_extract_short_session_id_mismatch():
+  resource_name = 'projects/123/locations/us-east4/reasoningEngines/wrong/sessions/session-123'
+  with pytest.raises(ValueError, match='Session resource name mismatch'):
+    _extract_short_session_id(resource_name, expected_engine_id='right')
+
+
+def test_validate_session_id_rejects_invalid_chars():
+  with pytest.raises(ValueError, match='Invalid session_id'):
+    _validate_session_id('invalid@id')
+  with pytest.raises(ValueError, match='Invalid session_id'):
+    _validate_session_id('invalid/id')
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_get_session_strips_full_resource_name(
+    mock_api_client_instance,
+):
+  session_service = mock_vertex_ai_session_service()
+  mock_api_client_instance.session_dict['session-123'] = {
+      'name': (
+          'projects/123/locations/us-east4/reasoningEngines/123/sessions/session-123'
+      ),
+      'update_time': '2023-01-01T00:00:00Z',
+      'user_id': 'user',
+  }
+  resource_name = 'projects/123/locations/us-east4/reasoningEngines/123/sessions/session-123'
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id=resource_name
+  )
+  assert session.id == 'session-123'
+  mock_api_client_instance.agent_engines.sessions.get.assert_called_once_with(
+      name='reasoningEngines/123/sessions/session-123'
+  )

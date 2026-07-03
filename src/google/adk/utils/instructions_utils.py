@@ -51,7 +51,7 @@ async def inject_session_state(
     )
 
   agent = Agent(
-      model="gemini-2.0-flash",
+      model="gemini-2.5-flash",
       name="agent",
       instruction=build_instruction,
   )
@@ -64,6 +64,12 @@ async def inject_session_state(
   Returns:
     The instruction template with values populated.
   """
+
+  # The substitution pattern requires a '{', so a template without one can
+  # never match. Return it as-is to avoid the regex scan on every LLM call,
+  # which is the common case for static instructions.
+  if '{' not in template:
+    return template
 
   invocation_context = readonly_context._invocation_context
 

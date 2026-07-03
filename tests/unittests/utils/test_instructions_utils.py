@@ -41,7 +41,7 @@ async def _create_test_readonly_context(
     session_id: str = "test_session_id",
 ) -> ReadonlyContext:
   agent = Agent(
-      model="gemini-2.0-flash",
+      model="gemini-2.5-flash",
       name="agent",
       instruction="test",
   )
@@ -70,6 +70,19 @@ async def test_inject_session_state():
       instruction_template, invocation_context
   )
   assert populated_instruction == "Hello Foo, you are in active state."
+
+
+@pytest.mark.asyncio
+async def test_inject_session_state_without_placeholders_returns_template():
+  instruction_template = "A static instruction with no placeholders."
+  invocation_context = await _create_test_readonly_context(
+      state={"user_name": "Foo"}
+  )
+
+  populated_instruction = await instructions_utils.inject_session_state(
+      instruction_template, invocation_context
+  )
+  assert populated_instruction == instruction_template
 
 
 @pytest.mark.asyncio

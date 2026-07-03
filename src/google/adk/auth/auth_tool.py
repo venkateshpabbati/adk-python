@@ -106,8 +106,11 @@ class AuthConfig(BaseModelWithConfig):
     if auth_scheme.model_extra:
       auth_scheme = auth_scheme.model_copy(deep=True)
       auth_scheme.model_extra.clear()
+
+    type_ = auth_scheme.type_
+    type_name = type_.name if type_ and hasattr(type_, "name") else str(type_)
     scheme_name = (
-        f"{auth_scheme.type_.name}_{_stable_model_digest(auth_scheme)}"
+        f"{type_name}_{_stable_model_digest(auth_scheme)}"
         if auth_scheme
         else ""
     )
@@ -118,14 +121,16 @@ class AuthConfig(BaseModelWithConfig):
       auth_credential.model_extra.clear()
     if auth_credential and auth_credential.oauth2:
       auth_credential = auth_credential.model_copy(deep=True)
-      auth_credential.oauth2.auth_uri = None
-      auth_credential.oauth2.state = None
-      auth_credential.oauth2.auth_response_uri = None
-      auth_credential.oauth2.auth_code = None
-      auth_credential.oauth2.access_token = None
-      auth_credential.oauth2.refresh_token = None
-      auth_credential.oauth2.expires_at = None
-      auth_credential.oauth2.expires_in = None
+      if auth_credential.oauth2:
+        auth_credential.oauth2.auth_uri = None
+        auth_credential.oauth2.state = None
+        auth_credential.oauth2.auth_response_uri = None
+        auth_credential.oauth2.auth_code = None
+        auth_credential.oauth2.access_token = None
+        auth_credential.oauth2.refresh_token = None
+        auth_credential.oauth2.expires_at = None
+        auth_credential.oauth2.expires_in = None
+        auth_credential.oauth2.redirect_uri = None
     credential_name = (
         f"{auth_credential.auth_type.value}_{_stable_model_digest(auth_credential)}"
         if auth_credential
