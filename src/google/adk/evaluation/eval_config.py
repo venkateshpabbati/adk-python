@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
+from pydantic import SerializeAsAny
 
 from ..agents.common_configs import CodeConfig
 from ..evaluation.eval_metrics import EvalMetric
@@ -104,7 +105,7 @@ class EvalConfig(BaseModel):
       populate_by_name=True,
   )
 
-  criteria: dict[str, Union[Threshold, BaseCriterion]] = Field(
+  criteria: dict[str, Union[Threshold, SerializeAsAny[BaseCriterion]]] = Field(
       default_factory=dict,
       description="""A dictionary that maps criterion to be used for a metric.
 
