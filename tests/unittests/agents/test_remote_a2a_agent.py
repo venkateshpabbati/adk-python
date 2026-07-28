@@ -3762,3 +3762,332 @@ class TestRemoteA2aAgentDeepcopy:
         copied_config.request_interceptors[0]
         is not config.request_interceptors[0]
     )
+
+
+class TestRemoteA2aAgentWorkflowOutput:
+  """Tests that RemoteA2aAgent surfaces a workflow-node output value.
+
+  Without ``_promote_response_to_output``, a ``RemoteA2aAgent`` used as
+  a Workflow node leaves ``ctx.output`` as None, which causes
+  downstream JoinNode aggregation to record ``None`` for that
+  predecessor.
+  """
+
+  # Node path stamped on this agent's events by ``BaseAgent._run_impl``.
+  _NODE_PATH = "wf/remote_agent@1"
+
+  def _make_agent(self) -> RemoteA2aAgent:
+    return RemoteA2aAgent(
+        name="remote_agent",
+        agent_card=create_test_agent_card(),
+    )
+
+  def test_promotes_text_content_to_output(self):
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text="Findings: ok")],
+        ),
+    )
+    event.node_info.path = self._NODE_PATH
+
+    assert agent._promote_response_to_output(event, self._NODE_PATH) is True
+    assert event.output == "Findings: ok"
+    assert event.node_info.message_as_output is True
+
+  def test_joins_multiple_text_parts(self):
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[
+                genai_types.Part(text="line1\n"),
+                genai_types.Part(text="line2"),
+            ],
+        ),
+    )
+    event.node_info.path = self._NODE_PATH
+
+    agent._promote_response_to_output(event, self._NODE_PATH)
+
+    assert event.output == "line1\nline2"
+
+  def test_skips_thought_parts(self):
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[
+                genai_types.Part(text="streaming update", thought=True),
+            ],
+        ),
+    )
+    event.node_info.path = self._NODE_PATH
+
+    agent._promote_response_to_output(event, self._NODE_PATH)
+
+    assert event.output is None
+    assert event.node_info.message_as_output is None
+
+  def test_skips_function_call_parts(self):
+    """input-required events carry a mock function call and no text."""
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[
+                genai_types.Part(
+                    function_call=genai_types.FunctionCall(
+                        id="fc1",
+                        name="mock_function_call_for_required_user_input",
+                        args={"input_required": "Please confirm"},
+                    )
+                ),
+            ],
+        ),
+    )
+    event.node_info.path = self._NODE_PATH
+
+    agent._promote_response_to_output(event, self._NODE_PATH)
+
+    assert event.output is None
+
+  def test_skips_partial_events(self):
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        partial=True,
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text="streaming...")],
+        ),
+    )
+    event.node_info.path = self._NODE_PATH
+
+    agent._promote_response_to_output(event, self._NODE_PATH)
+
+    assert event.output is None
+
+  def test_skips_events_from_other_node_path(self):
+    """Events whose node path differs are foreign, even if same-named.
+
+    Agent names can collide across a workflow hierarchy, so promotion
+    is gated on the node path rather than ``event.author``.
+    """
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text="Not mine")],
+        ),
+    )
+    event.node_info.path = "wf/other_branch/remote_agent@1"
+
+    assert agent._promote_response_to_output(event, self._NODE_PATH) is False
+    assert event.output is None
+
+  def test_preserves_existing_output(self):
+    agent = self._make_agent()
+    event = Event(
+        author="remote_agent",
+        output="preset",
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text="text")],
+        ),
+    )
+    event.node_info.path = self._NODE_PATH
+
+    agent._promote_response_to_output(event, self._NODE_PATH)
+
+    assert event.output == "preset"
+
+  def test_no_content_no_output(self):
+    agent = self._make_agent()
+    event = Event(author="remote_agent")
+    event.node_info.path = self._NODE_PATH
+
+    assert agent._promote_response_to_output(event, self._NODE_PATH) is False
+    assert event.output is None
+
+  def _make_text_event(
+      self, text: str = "reply", task_state: str | None = None
+  ) -> Event:
+    event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text=text)],
+        ),
+    )
+    if task_state is not None:
+      event.custom_metadata = {
+          A2A_METADATA_PREFIX + "response": {"status": {"state": task_state}}
+      }
+    return event
+
+  @pytest.mark.parametrize(
+      "state",
+      [
+          "submitted",
+          "working",
+          "input-required",
+          "auth-required",
+          "unknown",
+      ],
+  )
+  def test_skips_non_final_task_states(self, state):
+    """Streaming converters may leave non-final text un-thoughted.
+
+    The task-state check on ``custom_metadata['a2a:response']`` is the
+    guard that prevents ``ctx.output`` from being overwritten by an
+    intermediate event and then raising on the real final event.
+    """
+    agent = self._make_agent()
+    event = self._make_text_event(text="in-progress chunk", task_state=state)
+    event.node_info.path = self._NODE_PATH
+
+    assert agent._promote_response_to_output(event, self._NODE_PATH) is False
+    assert event.output is None
+
+  @pytest.mark.parametrize(
+      "state",
+      ["completed", "failed", "canceled", "rejected"],
+  )
+  def test_promotes_terminal_task_states(self, state):
+    agent = self._make_agent()
+    event = self._make_text_event(text="final answer", task_state=state)
+    event.node_info.path = self._NODE_PATH
+
+    assert agent._promote_response_to_output(event, self._NODE_PATH) is True
+    assert event.output == "final answer"
+
+  def test_promotes_when_response_metadata_absent(self):
+    """Non-Task A2A responses (plain Message) carry no task status."""
+    agent = self._make_agent()
+    event = self._make_text_event(text="message reply")
+    event.node_info.path = self._NODE_PATH
+
+    assert agent._promote_response_to_output(event, self._NODE_PATH) is True
+    assert event.output == "message reply"
+
+  @pytest.mark.asyncio
+  async def test_run_impl_promotes_only_first_terminal_event(self):
+    """Guards against ``ValueError: Output already set``.
+
+    When the v2 converter path emits a ``working`` text event followed
+    by a ``completed`` text event, the first must be passed through
+    untouched and only the terminal event promoted. After that, any
+    further promotable event must also be left alone.
+    """
+
+    working = self._make_text_event(
+        text="thinking out loud", task_state="working"
+    )
+    completed = self._make_text_event(
+        text="final answer", task_state="completed"
+    )
+    trailing = self._make_text_event(
+        text="ignored trailing artifact", task_state="completed"
+    )
+
+    class _StubRemoteAgent(RemoteA2aAgent):
+
+      async def _run_async_impl(self, ctx):
+        yield working
+        yield completed
+        yield trailing
+
+    agent = _StubRemoteAgent(
+        name="remote_agent",
+        agent_card=create_test_agent_card(),
+    )
+
+    from google.adk.apps.app import App
+    from google.adk.workflow._join_node import JoinNode
+    from google.adk.workflow._workflow import Workflow
+
+    from tests.unittests import testing_utils
+
+    workflow = Workflow(
+        name="wf",
+        edges=[("START", agent, JoinNode(name="join"))],
+    )
+    app_instance = App(name="t", root_agent=workflow)
+    runner = testing_utils.InMemoryRunner(app=app_instance)
+
+    events = await runner.run_async(testing_utils.get_user_content("start"))
+
+    # No "Output already set" raised, and the JoinNode aggregates the
+    # terminal event's text — not the working intermediate, not the
+    # trailing artifact.
+    join_outputs = [
+        e
+        for e in events
+        if isinstance(e, Event)
+        and e.output is not None
+        and "join" in (e.node_info.path or "")
+    ]
+    assert join_outputs
+    assert join_outputs[0].output == {"remote_agent": "final answer"}
+
+    assert working.output is None
+    assert completed.output == "final answer"
+    assert trailing.output is None
+
+  @pytest.mark.asyncio
+  async def test_run_impl_promotes_output_for_each_event(self):
+    """``_run_impl`` calls ``_promote_response_to_output`` per event.
+
+    Uses a subclass that overrides ``_run_async_impl`` to yield a
+    deterministic event, then drives ``_run_impl`` through the public
+    workflow node entry point.
+    """
+
+    yielded_event = Event(
+        author="remote_agent",
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text="agent reply")],
+        ),
+    )
+
+    class _StubRemoteAgent(RemoteA2aAgent):
+
+      async def _run_async_impl(self, ctx):
+        yield yielded_event
+
+    agent = _StubRemoteAgent(
+        name="remote_agent",
+        agent_card=create_test_agent_card(),
+    )
+
+    from google.adk.apps.app import App
+    from google.adk.workflow._join_node import JoinNode
+    from google.adk.workflow._workflow import Workflow
+
+    from tests.unittests import testing_utils
+
+    workflow = Workflow(
+        name="wf",
+        edges=[("START", agent, JoinNode(name="join"))],
+    )
+    app_instance = App(name="t", root_agent=workflow)
+    runner = testing_utils.InMemoryRunner(app=app_instance)
+    events = await runner.run_async(testing_utils.get_user_content("start"))
+
+    join_outputs = [
+        e
+        for e in events
+        if isinstance(e, Event)
+        and e.output is not None
+        and "join" in (e.node_info.path or "")
+    ]
+    assert join_outputs, "JoinNode should emit an aggregated output event"
+    assert join_outputs[0].output == {"remote_agent": "agent reply"}
