@@ -94,6 +94,35 @@ def _send_audio_to_live(
   live_request_queue.send_activity_end()
 
 
+async def _get_or_create_eval_session(
+    session_service: BaseSessionService,
+    initial_session: Optional[SessionInput],
+    fallback_session_id: Optional[str],
+) -> Session:
+  """Returns the session an eval case runs in."""
+  app_name = (
+      initial_session.app_name if initial_session else "EvaluationGenerator"
+  )
+  user_id = initial_session.user_id if initial_session else "test_user_id"
+  pinned_session_id = initial_session.session_id if initial_session else None
+
+  if pinned_session_id:
+    # A pinned id may name a session the caller prepared, so reuse it instead
+    # of replacing it; `initial_session.state` then applies only on create.
+    session = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=pinned_session_id
+    )
+    if session:
+      return session
+
+  return await session_service.create_session(
+      app_name=app_name,
+      user_id=user_id,
+      state=initial_session.state if initial_session else {},
+      session_id=pinned_session_id or fallback_session_id or str(uuid.uuid4()),
+  )
+
+
 class EvalCaseResponses(BaseModel):
   """Contains multiple responses associated with an EvalCase.
 
@@ -484,18 +513,12 @@ class EvaluationGenerator:
     if not memory_service:
       memory_service = InMemoryMemoryService()
 
-    app_name = (
-        initial_session.app_name if initial_session else "EvaluationGenerator"
+    session = await _get_or_create_eval_session(
+        session_service, initial_session, session_id
     )
-    user_id = initial_session.user_id if initial_session else "test_user_id"
-    session_id = session_id if session_id else str(uuid.uuid4())
-
-    session = await session_service.create_session(
-        app_name=app_name,
-        user_id=user_id,
-        state=initial_session.state if initial_session else {},
-        session_id=session_id,
-    )
+    app_name = session.app_name
+    user_id = session.user_id
+    session_id = session.id
 
     if not artifact_service:
       artifact_service = InMemoryArtifactService()
@@ -593,18 +616,12 @@ class EvaluationGenerator:
     if not memory_service:
       memory_service = InMemoryMemoryService()
 
-    app_name = (
-        initial_session.app_name if initial_session else "EvaluationGenerator"
+    session = await _get_or_create_eval_session(
+        session_service, initial_session, session_id
     )
-    user_id = initial_session.user_id if initial_session else "test_user_id"
-    session_id = session_id if session_id else str(uuid.uuid4())
-
-    _ = await session_service.create_session(
-        app_name=app_name,
-        user_id=user_id,
-        state=initial_session.state if initial_session else {},
-        session_id=session_id,
-    )
+    app_name = session.app_name
+    user_id = session.user_id
+    session_id = session.id
 
     if not artifact_service:
       artifact_service = InMemoryArtifactService()

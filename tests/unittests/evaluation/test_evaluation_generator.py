@@ -21,6 +21,7 @@ from google.adk.evaluation.app_details import AppDetails
 from google.adk.evaluation.conversation_scenarios import ConversationScenario
 from google.adk.evaluation.eval_case import EvalCase
 from google.adk.evaluation.eval_case import get_all_tool_calls
+from google.adk.evaluation.eval_case import SessionInput
 from google.adk.evaluation.eval_set import EvalSet
 from google.adk.evaluation.evaluation_generator import _LiveSession
 from google.adk.evaluation.evaluation_generator import _send_audio_to_live
@@ -34,6 +35,7 @@ from google.adk.evaluation.simulation.user_simulator import UserSimulator
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
 from google.adk.models.llm_request import LlmRequest
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
 import pytest
 
@@ -942,6 +944,76 @@ class TestGenerateInferencesFromRootAgent:
     mock_generate_inferences.assert_called_once()
     called_with_content = mock_generate_inferences.call_args.args[3]
     assert called_with_content.parts[0].text == "message 1"
+
+  @pytest.mark.asyncio
+  async def test_pinned_session_id_reused_across_runs_no_collision(
+      self, mocker, mock_runner
+  ):
+    """A reused (pinned) session_id does not collide on a rerun."""
+    session_service = InMemorySessionService()
+    mock_user_sim = mocker.MagicMock(spec=UserSimulator)
+    mock_user_sim.get_next_user_message = mocker.AsyncMock(
+        return_value=NextUserMessage(
+            status=UserSimulatorStatus.STOP_SIGNAL_DETECTED
+        )
+    )
+
+    # Two runs share one session_service, mirroring num_runs=2.
+    for _ in range(2):
+      await EvaluationGenerator._generate_inferences_from_root_agent(
+          root_agent=mocker.MagicMock(),
+          user_simulator=mock_user_sim,
+          initial_session=SessionInput(
+              app_name="test_app", user_id="u", session_id="fixed"
+          ),
+          session_service=session_service,
+      )
+
+    assert (
+        await session_service.get_session(
+            app_name="test_app", user_id="u", session_id="fixed"
+        )
+        is not None
+    )
+
+  @pytest.mark.asyncio
+  async def test_pinned_session_id_preserves_existing_session(
+      self, mocker, mock_runner
+  ):
+    """A session the caller prepared keeps its events and state."""
+    session_service = InMemorySessionService()
+    session = await session_service.create_session(
+        app_name="test_app",
+        user_id="u",
+        session_id="fixed",
+        state={"prepared_by": "caller"},
+    )
+    await session_service.append_event(
+        session, _build_event("user", [types.Part(text="earlier turn")], "inv0")
+    )
+    mock_user_sim = mocker.MagicMock(spec=UserSimulator)
+    mock_user_sim.get_next_user_message = mocker.AsyncMock(
+        return_value=NextUserMessage(
+            status=UserSimulatorStatus.STOP_SIGNAL_DETECTED
+        )
+    )
+
+    await EvaluationGenerator._generate_inferences_from_root_agent(
+        root_agent=mocker.MagicMock(),
+        user_simulator=mock_user_sim,
+        initial_session=SessionInput(
+            app_name="test_app", user_id="u", session_id="fixed", state={}
+        ),
+        session_service=session_service,
+    )
+
+    reloaded = await session_service.get_session(
+        app_name="test_app", user_id="u", session_id="fixed"
+    )
+    assert reloaded.state["prepared_by"] == "caller"
+    assert [e.content.parts[0].text for e in reloaded.events] == [
+        "earlier turn"
+    ]
 
   @pytest.mark.asyncio
   async def test_generates_inferences_with_user_simulator_live(
