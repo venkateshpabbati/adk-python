@@ -196,6 +196,9 @@ optional-dependencies.mcp = [
   "anyio>=4.9,<5",
   "mcp>=1.24,<2",
 ]
+optional-dependencies.oci = [
+  "oci>=2.126", # OCI Generative AI native SDK (OCIGenAILlm)
+]
 optional-dependencies.otel-gcp = [
   "opentelemetry-instrumentation-google-genai>=0.7b1,<1",
   "opentelemetry-instrumentation-grpc>=0.43b0,<1",
