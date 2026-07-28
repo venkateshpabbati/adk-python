@@ -80,6 +80,27 @@ class RequestInterceptor(BaseModel):
   """
 
 
+class A2aCardRequestConfig(BaseModel):
+  """Configuration for the HTTP request that fetches a remote agent card."""
+
+  headers: Optional[dict[str, str]] = None
+  """Extra HTTP headers to include in the request."""
+
+
+class CardRequestInterceptor(BaseModel):
+  """Interceptor for the remote agent card fetch request."""
+
+  before_request: Optional[
+      Callable[[InvocationContext], Awaitable[A2aCardRequestConfig]]
+  ] = None
+  """Async hook returning per-invocation config for the agent card request.
+
+  Called before fetching the card from an ``http(s)`` URL; its headers
+  (e.g. an auth token from session state) are sent with the request.
+  Ignored for static ``AgentCard`` or file-path sources.
+  """
+
+
 class A2aRemoteAgentConfig(BaseModel):
   """Configuration for A2A remote agents."""
 
@@ -109,6 +130,9 @@ class A2aRemoteAgentConfig(BaseModel):
   )
 
   request_interceptors: Optional[list[RequestInterceptor]] = None
+
+  card_request_interceptors: Optional[list[CardRequestInterceptor]] = None
+  """Interceptors that inject headers into the remote agent card fetch."""
 
   def __deepcopy__(self, memo):
     cls = self.__class__
