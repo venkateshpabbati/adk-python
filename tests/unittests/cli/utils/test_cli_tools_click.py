@@ -1635,3 +1635,339 @@ def test_cli_run_log_level(
   mock_log_to_tmp_folder.assert_called_once()
   kwargs = mock_log_to_tmp_folder.call_args[1]
   assert kwargs.get("level") == expected_logging_level
+
+
+@pytest.mark.unmute_click
+def test_telemetry_cli_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+  """Test adk telemetry commands."""
+  consent_store = {"val": None}
+
+  def mock_read():
+    return consent_store["val"]
+
+  def mock_write(val):
+    consent_store["val"] = val
+
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent", mock_read
+  )
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent", mock_write
+  )
+
+  runner = CliRunner()
+
+  # Test running without subcommand shows help
+  result = runner.invoke(cli_tools_click.main, ["telemetry"])
+  assert result.exit_code == 0
+  assert "Usage:" in result.output
+
+  # Test status subcommand
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "status"])
+  assert result.exit_code == 0
+  assert (
+      "Telemetry collection is not configured (defaults to OFF)"
+      in result.output
+  )
+
+  # Test enable
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "enable"])
+  assert result.exit_code == 0
+  assert "Telemetry collection has been enabled" in result.output
+  assert consent_store["val"] is True
+
+  # Test status is updated to enabled
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "status"])
+  assert result.exit_code == 0
+  assert "Telemetry collection is enabled" in result.output
+
+  # Test disable
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "disable"])
+  assert result.exit_code == 0
+  assert "Telemetry collection has been disabled" in result.output
+  assert consent_store["val"] is False
+
+  # Test status is disabled again
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "status"])
+  assert result.exit_code == 0
+  assert "Telemetry collection is disabled" in result.output
+
+
+@pytest.mark.unmute_click
+def test_telemetry_first_run_prompt_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Test that first-run CLI prompts user and opts-in on 'y'."""
+  agent_dir = tmp_path / "agent"
+  agent_dir.mkdir()
+  (agent_dir / "__init__.py").touch()
+  (agent_dir / "agent.py").touch()
+
+  monkeypatch.setattr(cli_tools_click.asyncio, "run", mock.Mock())
+
+  consent_store = {"val": None}
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: consent_store["val"],
+  )
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent",
+      lambda v: consent_store.update({"val": v}),
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  runner = CliRunner()
+  result = runner.invoke(
+      cli_tools_click.main, ["run", str(agent_dir)], input="y\n"
+  )
+  assert result.exit_code == 0
+  assert "Help improve the ADK" in result.output
+  assert "Enable telemetry? [Y/n]:" in result.output
+  assert consent_store["val"] is True
+
+
+@pytest.mark.unmute_click
+def test_telemetry_first_run_prompt_default_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Test that hitting Enter prompts opts-in by default."""
+  agent_dir = tmp_path / "agent"
+  agent_dir.mkdir()
+  (agent_dir / "__init__.py").touch()
+  (agent_dir / "agent.py").touch()
+
+  monkeypatch.setattr(cli_tools_click.asyncio, "run", mock.Mock())
+
+  consent_store = {"val": None}
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: consent_store["val"],
+  )
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent",
+      lambda v: consent_store.update({"val": v}),
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  runner = CliRunner()
+  result = runner.invoke(
+      cli_tools_click.main, ["run", str(agent_dir)], input="\n"
+  )
+  assert result.exit_code == 0
+  assert consent_store["val"] is True
+
+
+@pytest.mark.unmute_click
+def test_telemetry_first_run_prompt_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Test that user can opt-out by typing 'n'."""
+  agent_dir = tmp_path / "agent"
+  agent_dir.mkdir()
+  (agent_dir / "__init__.py").touch()
+  (agent_dir / "agent.py").touch()
+
+  monkeypatch.setattr(cli_tools_click.asyncio, "run", mock.Mock())
+
+  consent_store = {"val": None}
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: consent_store["val"],
+  )
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent",
+      lambda v: consent_store.update({"val": v}),
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  runner = CliRunner()
+  result = runner.invoke(
+      cli_tools_click.main, ["run", str(agent_dir)], input="n\n"
+  )
+  assert result.exit_code == 0
+  assert consent_store["val"] is False
+
+
+@pytest.mark.unmute_click
+def test_telemetry_no_prompt_if_already_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Test that no prompt is shown if configuration already exists."""
+  agent_dir = tmp_path / "agent"
+  agent_dir.mkdir()
+  (agent_dir / "__init__.py").touch()
+  (agent_dir / "agent.py").touch()
+
+  monkeypatch.setattr(cli_tools_click.asyncio, "run", mock.Mock())
+
+  consent_store = {"val": False}
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: consent_store["val"],
+  )
+  mock_write = mock.Mock()
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent", mock_write
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  mock_input = mock.Mock(return_value="y")
+  monkeypatch.setattr("builtins.input", mock_input)
+
+  runner = CliRunner()
+  result = runner.invoke(cli_tools_click.main, ["run", str(agent_dir)])
+  assert result.exit_code == 0
+  assert "Help improve the ADK" not in result.output
+  mock_input.assert_not_called()
+  mock_write.assert_not_called()
+
+
+@pytest.mark.unmute_click
+def test_telemetry_no_prompt_when_managing_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Test that running the telemetry command group itself does not prompt."""
+  consent_store = {"val": None}
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: consent_store["val"],
+  )
+  mock_write = mock.Mock()
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent", mock_write
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  mock_input = mock.Mock(return_value="y")
+  monkeypatch.setattr("builtins.input", mock_input)
+
+  runner = CliRunner()
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "status"])
+  assert result.exit_code == 0
+  assert "Help improve the ADK" not in result.output
+  mock_input.assert_not_called()
+  mock_write.assert_not_called()
+
+
+@pytest.mark.unmute_click
+@pytest.mark.parametrize(
+    "exception_to_raise",
+    [EOFError, KeyboardInterrupt],
+)
+def test_telemetry_first_run_prompt_interrupt_option_a(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exception_to_raise
+) -> None:
+  """Test that prompt handles standard interrupts gracefully, falling back to option A."""
+  agent_dir = tmp_path / "agent"
+  agent_dir.mkdir()
+  (agent_dir / "__init__.py").touch()
+  (agent_dir / "agent.py").touch()
+
+  monkeypatch.setattr(cli_tools_click.asyncio, "run", mock.Mock())
+
+  consent_store = {"val": None}
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: consent_store["val"],
+  )
+  mock_write = mock.Mock()
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent", mock_write
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  def raise_error(prompt):
+    raise exception_to_raise()
+
+  monkeypatch.setattr("builtins.input", raise_error)
+
+  runner = CliRunner()
+  result = runner.invoke(cli_tools_click.main, ["run", str(agent_dir)])
+  # Verify exit code remains 0 (no abrupt crash traceback)
+  assert result.exit_code == 0
+  # Verify consent preference doesn't get written/stored to disk
+  mock_write.assert_not_called()
+  assert consent_store["val"] is None
+
+
+@pytest.mark.unmute_click
+def test_telemetry_first_run_prompt_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """Test that prompt handles write exceptions gracefully."""
+  agent_dir = tmp_path / "agent"
+  agent_dir.mkdir()
+  (agent_dir / "__init__.py").touch()
+  (agent_dir / "agent.py").touch()
+
+  monkeypatch.setattr(cli_tools_click.asyncio, "run", mock.Mock())
+
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.read_telemetry_consent",
+      lambda: None,
+  )
+
+  def raise_error(val):
+    raise OSError("Failed filesystem write simulator")
+
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent",
+      raise_error,
+  )
+
+  monkeypatch.setattr(
+      "click.testing._NamedTextIOWrapper.isatty", lambda self: True
+  )
+
+  runner = CliRunner()
+  result = runner.invoke(
+      cli_tools_click.main, ["run", str(agent_dir)], input="y\n"
+  )
+  # Verify no abrupt crash tracebacks (exit code is 0)
+  assert result.exit_code == 0
+  assert "Error: Failed to save telemetry settings" in result.output
+
+
+@pytest.mark.unmute_click
+def test_telemetry_commands_write_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Test that enable and disable commands handle write exceptions gracefully."""
+
+  def raise_error(val):
+    raise OSError("Failed filesystem write simulator")
+
+  monkeypatch.setattr(
+      "google.adk.cli.cli_tools_click.write_telemetry_consent",
+      raise_error,
+  )
+
+  runner = CliRunner()
+
+  # Test enable command throws ClickException (exit code 1)
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "enable"])
+  assert result.exit_code == 1
+  assert "Error: Failed to enable telemetry" in result.output
+
+  # Test disable command throws ClickException (exit code 1)
+  result = runner.invoke(cli_tools_click.main, ["telemetry", "disable"])
+  assert result.exit_code == 1
+  assert "Error: Failed to disable telemetry" in result.output
