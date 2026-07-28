@@ -3742,10 +3742,12 @@ class TestLoopStateValidation:
   def _make_loop_state(self):
     """Creates a mock _LoopState with batch_processor and write_client."""
     state = mock.MagicMock()
-    state.batch_processor = mock.MagicMock(
-        spec=bigquery_agent_analytics_plugin.BatchProcessor
+    state.batch_processor = mock.create_autospec(
+        bigquery_agent_analytics_plugin.BatchProcessor,
+        instance=True,
+        spec_set=True,
     )
-    state.batch_processor.flush = mock.AsyncMock()
+    state.batch_processor.get_drop_stats.return_value = {}
     state.write_client = mock.MagicMock()
     return state
 
@@ -5766,6 +5768,9 @@ class TestHITLTracing:
     part = types.Part(function_call=fc)
     event.content = types.Content(role="model", parts=[part])
     event.actions = event_actions_lib.EventActions()
+    # Pydantic fields are not in the spec; without this, on_event_callback
+    # raises AttributeError and _safe_callback hides the truncation.
+    event.partial = None
     return event
 
   def _make_fr_event(self, fr_name, response=None):
@@ -5775,6 +5780,9 @@ class TestHITLTracing:
     part = types.Part(function_response=fr)
     event.content = types.Content(role="user", parts=[part])
     event.actions = event_actions_lib.EventActions()
+    # Pydantic fields are not in the spec; without this, on_event_callback
+    # raises AttributeError and _safe_callback hides the truncation.
+    event.partial = None
     return event
 
   @pytest.mark.asyncio
@@ -5835,12 +5843,17 @@ class TestHITLTracing:
       mock_write_client,
       invocation_context,
       dummy_arrow_schema,
+      caplog,
   ):
     event = self._make_fc_event("regular_tool", {"x": 1})
-    await bq_plugin_inst.on_event_callback(
-        invocation_context=invocation_context, event=event
-    )
+    with caplog.at_level(logging.ERROR):
+      await bq_plugin_inst.on_event_callback(
+          invocation_context=invocation_context, event=event
+      )
     await bq_plugin_inst.flush()
+    # _safe_callback swallows callback exceptions, so an empty row set does
+    # not by itself prove the callback ran; a truncated one emits none either.
+    assert "plugin error in on_event_callback" not in caplog.text
     # No HITL events should be emitted for non-HITL function calls.
     # on_event_callback only logs STATE_DELTA and HITL events; a regular
     # function call produces neither.
@@ -7976,11 +7989,16 @@ class TestMultiLoopShutdownDrainsOtherLoops:
         del timeout
         drain_thread_ids.append(threading.get_ident())
 
-      mock_other_bp = mock.MagicMock(
-          spec=bigquery_agent_analytics_plugin.BatchProcessor
+      # get_drop_stats() is synchronous; a blanket AsyncMock makes it return a
+      # coroutine, and the AttributeError shutdown() then swallows truncates the
+      # rest of its body.
+      mock_other_bp = mock.create_autospec(
+          bigquery_agent_analytics_plugin.BatchProcessor,
+          instance=True,
+          spec_set=True,
       )
       mock_other_bp.shutdown = record_shutdown
-      mock_other_bp.get_drop_stats = mock.MagicMock(return_value={})
+      mock_other_bp.get_drop_stats.return_value = {}
       mock_other_write_client = mock.MagicMock()
       mock_other_write_client.transport = mock.AsyncMock()
 
@@ -7997,6 +8015,10 @@ class TestMultiLoopShutdownDrainsOtherLoops:
       assert drain_thread_ids == [thread.ident]
       assert other_loop not in plugin._loop_state_by_loop
       mock_other_write_client.transport.close.assert_awaited()
+      # shutdown() swallows exceptions, so only its tail work proves the body
+      # ran past the drop-stat fold.
+      assert plugin._loop_state_by_loop == {}
+      assert plugin.client is None
     finally:
       other_loop.call_soon_threadsafe(other_loop.stop)
       thread.join(timeout=5)
@@ -10399,9 +10421,12 @@ class TestSafetyLifecycleHardening:
     plugin = bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin(
         PROJECT_ID, DATASET_ID, table_id=TABLE_ID
     )
-    processor = mock.MagicMock()
+    processor = mock.create_autospec(
+        bigquery_agent_analytics_plugin.BatchProcessor,
+        instance=True,
+        spec_set=True,
+    )
     processor.get_drop_stats.return_value = {"queue_full": 2}
-    processor.shutdown = mock.AsyncMock()
     state = mock.MagicMock()
     state.batch_processor = processor
     state.write_client = None
