@@ -2441,6 +2441,20 @@ def cli_migrate_session(
         " the version in the dev environment)"
     ),
 )
+@click.option(
+    "--extra_packages",
+    multiple=True,
+    type=str,
+    default=(),
+    help=(
+        "Optional. Additional local package paths (a file or directory) to"
+        " stage and deploy alongside the agent, and make importable in the"
+        " deployed image. Each entry is placed at `/app/<basename>` and `/app`"
+        " is added to PYTHONPATH, so a top-level name that matches an installed"
+        " dependency will shadow it at runtime; pick distinct names."
+        " Repeatable."
+    ),
+)
 @adk_services_options(default_use_local_storage=False)
 @click.argument(
     "agent",
@@ -2474,6 +2488,7 @@ def cli_deploy_agent_engine(
     memory_service_uri: str | None = None,
     session_service_uri: str | None = None,
     use_local_storage: bool = False,
+    extra_packages: tuple[str, ...] = (),
 ):
   """Deploys an agent to Agent Engine.
 
@@ -2520,6 +2535,7 @@ def cli_deploy_agent_engine(
         memory_service_uri=memory_service_uri,
         session_service_uri=session_service_uri,
         adk_version=adk_version,
+        extra_packages=list(extra_packages),
     )
   except Exception as e:
     click.secho(f"Deploy failed: {e}", fg="red", err=True)
