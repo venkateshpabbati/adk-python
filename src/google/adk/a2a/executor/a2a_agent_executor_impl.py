@@ -41,6 +41,7 @@ from ..converters.utils import _get_adk_metadata_key
 from ..experimental import a2a_experimental
 from .config import A2aAgentExecutorConfig
 from .executor_context import ExecutorContext
+from .utils import _enqueue_canceled_task_event
 from .utils import execute_after_agent_interceptors
 from .utils import execute_after_event_interceptors
 from .utils import execute_before_agent_interceptors
@@ -66,10 +67,11 @@ class _A2aAgentExecutor(AgentExecutor):
     self._config = config or A2aAgentExecutorConfig()
 
   @override
-  async def cancel(self, context: RequestContext, event_queue: EventQueue):
+  async def cancel(
+      self, context: RequestContext, event_queue: EventQueue
+  ) -> None:
     """Cancel the execution."""
-    # TODO: Implement proper cancellation logic if needed
-    raise NotImplementedError('Cancellation is not supported')
+    await _enqueue_canceled_task_event(context, event_queue)
 
   @override
   async def execute(

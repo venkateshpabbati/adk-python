@@ -40,6 +40,7 @@ from .a2a_agent_executor_impl import _A2aAgentExecutor as ExecutorImpl
 from .config import A2aAgentExecutorConfig
 from .executor_context import ExecutorContext
 from .task_result_aggregator import TaskResultAggregator
+from .utils import _enqueue_canceled_task_event
 from .utils import execute_after_agent_interceptors
 from .utils import execute_after_event_interceptors
 from .utils import execute_before_agent_interceptors
@@ -74,7 +75,7 @@ class A2aAgentExecutor(AgentExecutor):
     self._config = config or A2aAgentExecutorConfig()
     self._use_legacy = use_legacy
     self._force_new_version = force_new_version
-    self._executor_impl = None
+    self._executor_impl: ExecutorImpl | None = None
 
   async def _resolve_runner(self) -> Runner:
     """Resolve the runner, handling cases where it's a callable that returns a Runner."""
@@ -101,14 +102,11 @@ class A2aAgentExecutor(AgentExecutor):
     )
 
   @override
-  async def cancel(self, context: RequestContext, event_queue: EventQueue):
+  async def cancel(
+      self, context: RequestContext, event_queue: EventQueue
+  ) -> None:
     """Cancel the execution."""
-    if self._executor_impl:
-      await self._executor_impl.cancel(context, event_queue)
-      return
-
-    # TODO: Implement proper cancellation logic if needed
-    raise NotImplementedError('Cancellation is not supported')
+    await _enqueue_canceled_task_event(context, event_queue)
 
   @override
   async def execute(
