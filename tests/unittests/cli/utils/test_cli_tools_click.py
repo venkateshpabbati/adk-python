@@ -132,6 +132,68 @@ def test_cli_create_cmd_invokes_run_cmd(
   assert rec.calls, "cli_create.run_cmd must be called"
 
 
+def test_cli_telemetry_captures_subcommand_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """TelemetryGroup invoke should preserve subcommand context to record flags."""
+  monkeypatch.setattr("google.adk.cli.cli_create.run_cmd", lambda *a, **k: None)
+
+  # Mock telemetry consent to True so collector gets initialized
+  monkeypatch.setattr(
+      "google.adk.utils._telemetry_config.read_telemetry_consent",
+      lambda: True,
+  )
+
+  # Prevent rate limit checks during shutdown/execution
+  monkeypatch.setattr(
+      "google.adk.cli._telemetry._metrics_collector"
+      ".MetricsCollector._is_rate_limited",
+      lambda: True,
+  )
+
+  # Redirect metrics queue to temporary path
+  temp_queue = tmp_path / "telemetry_queue.jsonl"
+  monkeypatch.setattr(
+      "google.adk.cli._telemetry._constants.QUEUE_FILE",
+      str(temp_queue),
+  )
+
+  # Re-initialize singleton metrics collector instance
+  monkeypatch.setattr(
+      "google.adk.cli._telemetry._metrics_collector.MetricsCollector._instance",
+      None,
+  )
+
+  app_dir = tmp_path / "new_app"
+  runner = CliRunner()
+  result = runner.invoke(
+      cli_tools_click.main,
+      [
+          "create",
+          "--model",
+          "gemini-2.0",
+          "--api_key",
+          "dummy",
+          str(app_dir),
+      ],
+  )
+  assert result.exit_code == 0
+
+  # Check that context-reconstruction captured details correctly
+  assert temp_queue.exists()
+  with open(temp_queue, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    source = json.loads(event["source_extension_json"])
+    assert source["command_run"]["command"] == "create"
+    # Ensure options flags are captured properly
+    assert "--model" in source["command_run"]["flags"]
+    assert "--api_key" in source["command_run"]["flags"]
+    # Ensure sanitized positional placeholder is logged
+    assert "<app_name>" in source["command_run"]["flags"]
+
+
 # cli run
 @pytest.mark.parametrize(
     "cli_args,expected_session_uri,expected_artifact_uri,expected_memory_uri",

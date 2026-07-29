@@ -10915,25 +10915,26 @@ class TestSafetyLifecycleHardening:
       raise RuntimeError("setup boom")
 
     errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
 
     def run_in_fresh_loop():
       try:
-        with mock.patch.object(
-            plugin, "_lazy_setup", side_effect=failing_setup
-        ):
-          asyncio.run(plugin._ensure_started())
+        barrier.wait(timeout=5)
+        asyncio.run(plugin._ensure_started())
       except BaseException as e:  # noqa: BLE001
         errors.append(e)
 
-    threads = [
-        platform_thread.create_thread(run_in_fresh_loop) for _ in range(2)
-    ]
-    for t in threads:
-      t.start()
-    entered.wait(timeout=5)
-    release.set()
-    for t in threads:
-      t.join(timeout=10)
+    # Patch from this thread only to prevent race conditions on plugin's dictionary
+    with mock.patch.object(plugin, "_lazy_setup", side_effect=failing_setup):
+      threads = [
+          platform_thread.create_thread(run_in_fresh_loop) for _ in range(2)
+      ]
+      for t in threads:
+        t.start()
+      entered.wait(timeout=5)
+      release.set()
+      for t in threads:
+        t.join(timeout=10)
       assert not t.is_alive(), "thread failed to terminate"
 
     assert not errors  # _ensure_started never raises to callers
