@@ -39,6 +39,7 @@ import google.adk.runners as _runners_module
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.tool_context import ToolContext
+from google.adk.utils._schema_utils import validate_node_data
 from google.adk.utils.variant_utils import GoogleLLMVariant
 from google.genai import types
 from google.genai.types import Part
@@ -1783,103 +1784,49 @@ async def test_run_async_no_input_schema_passes_request_unchanged():
   assert content.parts[0].text == 'hello world'
 
 
-@mark.asyncio
-async def test_run_async_with_input_schema_wraps_in_natural_language():
-  """With input_schema, the message starts with a natural-language instruction."""
+class _RoundTripInput(BaseModel):
+  query: str
+  limit: int
 
-  class MyInput(BaseModel):
-    custom_input: str
 
-  content = await _run_agent_tool_and_capture_content(
-      args={'custom_input': 'test_value'},
-      input_schema=MyInput,
-  )
-
-  assert content is not None
-  assert len(content.parts) == 1
-  text = content.parts[0].text
-  # Must start with the natural-language prompt, not with raw JSON
-  assert text.startswith('Process the following structured request')
-  # Must contain the JSON payload after "Request:\n"
-  assert 'Request:\n' in text
-  json_part = text.split('Request:\n', 1)[1]
-  import json as _json
-
-  payload = _json.loads(json_part)
-  assert payload['custom_input'] == 'test_value'
-  # The full text must NOT be just the raw JSON blob
-  assert text != json_part
+class _RoundTripOutput(BaseModel):
+  result: str
 
 
 @mark.asyncio
-async def test_run_async_with_input_schema_text_not_raw_json():
-  """The content text must not be a bare JSON string when input_schema is set."""
-
-  class MyInput(BaseModel):
-    value: int
-
-  content = await _run_agent_tool_and_capture_content(
-      args={'value': 42},
-      input_schema=MyInput,
-  )
-
-  assert content is not None
-  text = content.parts[0].text
-  # A bare JSON blob would start with '{'; the wrapped version must not
-  assert not text.startswith(
-      '{'
-  ), 'Content text is raw JSON instead of a natural-language instruction'
-
-
-@mark.asyncio
-async def test_run_async_with_input_and_output_schema_passes_raw_json():
-  """With both input_schema AND output_schema, the raw JSON payload is passed
-  directly to the inner runner WITHOUT the ReAct wrapper prefix.
-
-  The wrapper ('Process the following structured request...') is only added
-  when input_schema is set and output_schema is NOT set (tool-calling mode).
-  When output_schema is also present the agent operates in single-shot
-  structured-output mode, so the runner receives the bare JSON string that the
-  inner agent can parse deterministically — adding the prose prefix would
-  corrupt the structured input.
-  """
-  import json as _json
-
-  class MyInput(BaseModel):
-    query: str
-    limit: int
-
-  class MyOutput(BaseModel):
-    result: str
-
+@pytest.mark.parametrize('output_schema', [None, _RoundTripOutput])
+async def test_run_async_with_input_schema_passes_bare_json(output_schema):
+  """With input_schema the message is the bare serialized payload."""
   content = await _run_agent_tool_and_capture_content(
       args={'query': 'hello', 'limit': 5},
-      input_schema=MyInput,
-      output_schema=MyOutput,
+      input_schema=_RoundTripInput,
+      output_schema=output_schema,
   )
 
   assert content is not None
   assert len(content.parts) == 1
-  text = content.parts[0].text
+  payload = json.loads(content.parts[0].text)
+  assert payload == {'query': 'hello', 'limit': 5}
 
-  # output_schema mode is single-shot; wrapper must not be applied
-  assert not text.startswith('Process'), (
-      'output_schema mode is single-shot; wrapper must not be applied,'
-      f' but text starts with: {text[:60]!r}'
+
+@mark.asyncio
+@pytest.mark.parametrize('output_schema', [None, _RoundTripOutput])
+async def test_run_async_input_schema_content_survives_node_validation(
+    output_schema,
+):
+  """The message AgentTool sends must validate against the same input_schema.
+
+  The node runtime re-validates the first user message against the inner
+  agent's input_schema, so anything AgentTool prepends to the payload breaks
+  the call before the agent runs. This drives the real validator rather than
+  the stubbed runner used above.
+  """
+  content = await _run_agent_tool_and_capture_content(
+      args={'query': 'hello', 'limit': 5},
+      input_schema=_RoundTripInput,
+      output_schema=output_schema,
   )
 
-  # The payload must be valid JSON
-  try:
-    payload = _json.loads(text)
-  except _json.JSONDecodeError as exc:
-    raise AssertionError(
-        f'Content text is not valid JSON in output_schema mode: {text!r}'
-    ) from exc
-
-  # The JSON must match the input args
-  assert (
-      payload['query'] == 'hello'
-  ), f"Expected query='hello', got {payload.get('query')!r}"
-  assert (
-      payload['limit'] == 5
-  ), f"Expected limit=5, got {payload.get('limit')!r}"
+  assert validate_node_data(
+      _RoundTripInput, content, preserve_content=False
+  ) == {'query': 'hello', 'limit': 5}
