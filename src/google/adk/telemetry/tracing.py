@@ -32,7 +32,6 @@ import logging
 from typing import Final
 from typing import TYPE_CHECKING
 
-from google.genai import errors as genai_errors
 from google.genai import types
 from google.genai.models import Models
 from opentelemetry import _logs
@@ -123,6 +122,8 @@ def resolve_error_type(error: BaseException) -> str:
   SDK collapses every 4xx into ``ClientError`` and every 5xx into
   ``ServerError``); finally the class name.
   """
+  from google.genai import errors as genai_errors
+
   custom_error_type = getattr(error, "error_type", None)
   if custom_error_type is not None:
     return str(custom_error_type)
@@ -530,10 +531,19 @@ def _build_llm_request_for_trace(llm_request: LlmRequest) -> dict[str, object]:
           exclude_none=True,
           exclude={
               "response_schema": True,
+              # `http_options` carries caller-supplied credentials: `headers`
+              # commonly holds an Authorization bearer token, and
+              # `extra_body` / `*client_args` are free-form passthroughs that
+              # can hold auth material too. None of it may reach an exported
+              # span attribute. The client fields are also unserializable.
               "http_options": {
                   "httpx_client": True,
                   "httpx_async_client": True,
                   "aiohttp_client": True,
+                  "headers": True,
+                  "extra_body": True,
+                  "client_args": True,
+                  "async_client_args": True,
               },
           },
           mode="json",
