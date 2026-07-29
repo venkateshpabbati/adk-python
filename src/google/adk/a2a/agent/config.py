@@ -134,9 +134,13 @@ class A2aRemoteAgentConfig(BaseModel):
   card_request_interceptors: Optional[list[CardRequestInterceptor]] = None
   """Interceptors that inject headers into the remote agent card fetch."""
 
-  def __deepcopy__(self, memo):
+  def __deepcopy__(
+      self, memo: dict[int, Any] | None = None
+  ) -> A2aRemoteAgentConfig:
+    if memo is None:
+      memo = {}
     cls = self.__class__
-    copied_values = {}
+    copied_values: dict[str, Any] = {}
     for k, v in self.__dict__.items():
       if not k.startswith('_'):
         if callable(v):

@@ -78,7 +78,7 @@ class _A2aAgentExecutor(AgentExecutor):
       self,
       context: RequestContext,
       event_queue: EventQueue,
-  ):
+  ) -> None:
     """Executes an A2A request and publishes updates to the event queue
 
     specified. It runs as following:
@@ -182,7 +182,7 @@ class _A2aAgentExecutor(AgentExecutor):
       event_queue: EventQueue,
       runner: Runner,
       run_request: AgentRunRequest,
-  ):
+  ) -> None:
     agents_artifact: dict[str, str] = {}
     error_event = None
     long_running_functions = LongRunningFunctions(
@@ -268,7 +268,7 @@ class _A2aAgentExecutor(AgentExecutor):
       self,
       run_request: AgentRunRequest,
       runner: Runner,
-  ):
+  ) -> None:
     session_id = run_request.session_id
     # create a new session if not exists
     user_id = run_request.user_id

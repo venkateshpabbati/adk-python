@@ -28,6 +28,7 @@ from a2a.types import Message
 from a2a.types import TaskArtifactUpdateEvent
 from google.adk.platform import uuid as platform_uuid
 from google.adk.runners import Runner
+from google.adk.sessions.session import Session
 from typing_extensions import override
 
 from .. import _compat
@@ -113,7 +114,7 @@ class A2aAgentExecutor(AgentExecutor):
       self,
       context: RequestContext,
       event_queue: EventQueue,
-  ):
+  ) -> None:
     """Executes an A2A request and publishes updates to the event queue
 
     specified. It runs as following:
@@ -178,7 +179,7 @@ class A2aAgentExecutor(AgentExecutor):
       self,
       context: RequestContext,
       event_queue: EventQueue,
-  ):
+  ) -> None:
     # Resolve the runner instance
     runner = await self._resolve_runner()
 
@@ -310,7 +311,7 @@ class A2aAgentExecutor(AgentExecutor):
       context: RequestContext,
       run_request: AgentRunRequest,
       runner: Runner,
-  ):
+  ) -> Session:
 
     session_id = run_request.session_id
     # create a new session if not exists
@@ -332,7 +333,7 @@ class A2aAgentExecutor(AgentExecutor):
 
     return session
 
-  def _check_new_version_extension(self, context: RequestContext):
+  def _check_new_version_extension(self, context: RequestContext) -> bool:
     """Check if the extension for the new version is requested and activate it."""
     if _NEW_A2A_ADK_INTEGRATION_EXTENSION in context.requested_extensions:
       _compat.add_activated_extension(

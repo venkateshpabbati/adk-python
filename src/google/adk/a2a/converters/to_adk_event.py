@@ -167,7 +167,7 @@ def _convert_a2a_parts_to_adk_parts(
           is True
       ):
         for part in parts:
-          if part.function_call:
+          if part.function_call and part.function_call.id is not None:
             long_running_function_ids.add(part.function_call.id)
 
       output_parts.extend(parts)
@@ -396,13 +396,14 @@ def _create_mock_function_call_for_required_user_input(
   for i in range(len(output_parts) - 1, -1, -1):
     prompt = _extract_user_input_prompt(output_parts[i])
     if prompt:
+      function_call_id = str(uuid.uuid4())
       function_call = genai_types.FunctionCall(
-          id=str(uuid.uuid4()),
+          id=function_call_id,
           name=function_name,
           args={args_key: prompt},
       )
       long_running_function_ids = set()
-      long_running_function_ids.add(function_call.id)
+      long_running_function_ids.add(function_call_id)
       output_parts[i] = genai_types.Part(function_call=function_call)
       break
   return output_parts, long_running_function_ids
@@ -461,7 +462,7 @@ def convert_a2a_task_to_event(
 
   try:
     event_actions = EventActions()
-    output_parts = []
+    output_parts: list[genai_types.Part] = []
     long_running_function_ids = set()
     metadata_fields: dict[str, Any] = {}
     status_message = _compat.normalize_message(a2a_task.status.message)
