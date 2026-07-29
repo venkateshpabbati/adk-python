@@ -258,6 +258,8 @@ def _extract_genai_metadata(
   if raw is None:
     return None
   parsed = _parse_adk_metadata_value(raw)
+  if model_class is dict:
+    return parsed if isinstance(parsed, dict) else None
   if not isinstance(parsed, dict) and model_class:
     return None
   if not model_class:
@@ -419,7 +421,7 @@ def _extract_all_metadata_fields(metadata: Any) -> dict[str, Any]:
           metadata_dict, "grounding_metadata", genai_types.GroundingMetadata
       ),
       "custom_metadata": _extract_genai_metadata(
-          metadata_dict, "custom_metadata", None
+          metadata_dict, "custom_metadata", dict
       ),
       "usage_metadata": _extract_genai_metadata(
           metadata_dict,

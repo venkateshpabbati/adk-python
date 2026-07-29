@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 import logging
 from typing import Any
 from typing import Dict
@@ -95,6 +96,14 @@ def _serialize_metadata_value(value: Any) -> str:
     except Exception as e:
       logger.warning("Failed to serialize metadata value: %s", e)
       return str(value)
+
+  if isinstance(value, (dict, list)):
+    try:
+      return json.dumps(value)
+    except Exception as e:
+      logger.warning("Failed to serialize collection to JSON: %s", e)
+      return str(value)
+
   return str(value)
 
 
