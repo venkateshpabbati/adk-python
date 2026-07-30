@@ -2384,7 +2384,7 @@ EXPECTED_METRICS_V2: dict[str, frozenset[MetricPoint]] = {
 # ``error.type`` across the duration metrics (see the metric constants below).
 #
 # ``google.genai`` collapses every 4xx into ``ClientError`` / 5xx into
-# ``ServerError``, so before b/534739207 every such failure reported
+# ``ServerError``, so historically every such failure reported
 # ``error.type=ClientError``. ADK now uses the provider's HTTP status code
 # (e.g. ``429``), falling back to the exception class name for non-API errors
 # (e.g. ``ValueError``).
@@ -2728,7 +2728,7 @@ ALL_CASES: list[FunctionalTestCase] = [
             metric_points=EXPECTED_METRICS_V2,
         ),
     ),
-    # Inference failures (b/534739207): the mock raises before responding, so
+    # Inference failures: the mock raises before responding, so
     # the scenario aborts and the failure surfaces on ``error.type``. A 429
     # surfaces its HTTP status code ``429`` (not a blanket ``ClientError``); a
     # plain ``ValueError`` falls back to the class name.

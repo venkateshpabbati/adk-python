@@ -308,8 +308,9 @@ class GeminiLlmConnection(BaseLlmConnection):
     last_grounding_metadata = None
     tool_call_metadata = None
     async with Aclosing(self._gemini_session.receive()) as agen:
-      # TODO(b/440101573): Reuse StreamingResponseAggregator to accumulate
-      # partial content and emit responses as needed.
+      # Pending cleanup: reuse StreamingResponseAggregator to accumulate
+      # partial content and emit responses as needed, once that aggregator
+      # handles the live-connection message shapes.
       async for message in agen:
         logger.debug('Got LLM Live message: %s', message)
         live_session_id = self._gemini_session.session_id

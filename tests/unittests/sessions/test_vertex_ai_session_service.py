@@ -1170,7 +1170,7 @@ async def test_append_event():
 async def test_append_event_strips_unsupported_part_metadata(
     mock_api_client_instance: MockAsyncClient,
 ) -> None:
-  """part_metadata must not reach the Sessions API (#6014).
+  """part_metadata must not reach the Sessions API.
 
   ``Part.part_metadata`` is a Gemini Developer API-only field; the Vertex AI
   Agent Engine Sessions ``appendEvent`` API rejects it with 400 INVALID_ARGUMENT
@@ -1212,7 +1212,7 @@ async def test_append_event_strips_unsupported_part_metadata(
 async def test_append_event_with_part_metadata_round_trips(
     mock_api_client_instance: MockAsyncClient,
 ) -> None:
-  """Reconstruction side of #6014: an event carrying part_metadata appends and
+  """Reconstruction side: an event carrying part_metadata appends and
   reads back without error. part_metadata is dropped (unsupported on Vertex),
   but the session round-trips and the part text is preserved.
   """

@@ -2014,7 +2014,7 @@ def test_database_session_service_visible_in_module_namespace():
   """DatabaseSessionService must be in dir() so Sphinx autodoc renders it.
 
   It is imported lazily via module __getattr__, so without an explicit
-  __dir__ it drops out of the generated API reference (issue #4331).
+  __dir__ it drops out of the generated API reference.
   """
   import google.adk.sessions as sessions_module
 
@@ -2131,7 +2131,7 @@ async def test_database_session_service_requires_one_argument():
 async def test_database_session_service_sqlite_file_timestamp_read_after_reopen(
     tmp_path,
 ):
-  """Regression test for #6352 (SQLite REAL-affinity timestamp reads)."""
+  """Regression test for SQLite REAL-affinity timestamp reads."""
   # SQLite REAL-affinity columns can end up storing raw Unix epoch floats
   # instead of the text format SQLAlchemy's DateTime type normally writes
   # (for example, if the row was written by a different code path than the

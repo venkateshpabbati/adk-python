@@ -1615,7 +1615,7 @@ class TestRemoteA2aAgentMessageHandling:
   ):
     """Test streaming A2A response handling when content/parts are missing.
 
-    This verifies the fix for issue #3769 where the code could raise when it
+    This verifies the fix for the case where the code could raise when it
     tried to read parts[0] without checking for empty/missing content.
     """
     mock_a2a_task = create_autospec(A2ATask, instance=True)
@@ -1898,7 +1898,7 @@ class TestRemoteA2aAgentMessageHandling:
 
 
 class TestRemoteA2aAgentStreamingArtifactChunks:
-  """Regression tests for chunked artifact streams (#6343)."""
+  """Regression tests for chunked artifact streams."""
 
   def setup_method(self):
     """Setup test fixtures."""

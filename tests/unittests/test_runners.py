@@ -1909,9 +1909,9 @@ class TestRunnerInferAgentOrigin:
   def test_infer_agent_origin_no_false_positive_for_direct_llm_agent(self):
     """Test that using LlmAgent directly doesn't trigger mismatch warning.
 
-    Regression test for GitHub issue #3143: Users who instantiate LlmAgent
-    directly and run from a directory that is a parent of the ADK installation
-    were getting false positive 'App name mismatch' warnings.
+    Regression test: users who instantiate LlmAgent directly and run from a
+    directory that is a parent of the ADK installation were getting false
+    positive 'App name mismatch' warnings.
 
     This also verifies that _infer_agent_origin returns None for ADK internal
     modules (google.adk.*).

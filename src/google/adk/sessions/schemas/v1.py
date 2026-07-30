@@ -17,8 +17,6 @@
 This module defines SQLAlchemy models for storing session and event data
 in a relational database with the "events" table using JSON
 serialization for Event data.
-
-See https://github.com/google/adk-python/discussions/3605 for more details.
 """
 
 from __future__ import annotations
