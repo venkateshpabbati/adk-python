@@ -818,6 +818,21 @@ async def test_get_session_with_num_recent_events_and_after_timestamp():
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures('mock_get_api_client')
+async def test_get_session_with_num_recent_events_zero_drops_all_events():
+  """num_recent_events=0 returns no events (0 != unset; events[-0:] keeps all)."""
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123',
+      user_id='user',
+      session_id='2',
+      config=GetSessionConfig(num_recent_events=0),
+  )
+  assert session is not None
+  assert not session.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
 async def test_get_session_keeps_events_newer_than_update_time(
     mock_api_client_instance: MockAsyncClient,
 ) -> None:
