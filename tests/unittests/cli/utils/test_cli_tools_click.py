@@ -90,16 +90,6 @@ def _mute_click(request, monkeypatch: pytest.MonkeyPatch) -> None:
   # monkeypatch.setattr(click, "secho", lambda *a, **k: None)
 
 
-# streaming mode choices
-def test_streaming_mode_choices_match_enum() -> None:
-  """The CLI choices are hardcoded to defer the runtime import; pin them."""
-  from google.adk.agents.run_config import StreamingMode
-
-  assert set(cli_tools_click._STREAMING_MODE_CHOICES) == {
-      str(mode.value) for mode in StreamingMode
-  }
-
-
 # validate_exclusive
 def test_validate_exclusive_allows_single() -> None:
   """Providing exactly one exclusive option should pass."""

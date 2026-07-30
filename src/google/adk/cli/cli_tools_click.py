@@ -37,6 +37,7 @@ import click
 from click.core import ParameterSource
 
 from .. import version
+from ..agents._streaming_mode import StreamingMode
 from ..features import FeatureName
 from ..features import override_feature_enabled
 from ..utils._telemetry_config import read_telemetry_consent
@@ -49,7 +50,6 @@ if TYPE_CHECKING:
   from fastapi import FastAPI
 
   from ..agents.llm_agent import LlmAgent
-  from ..agents.run_config import StreamingMode
 
 
 LOG_LEVELS = click.Choice(
@@ -57,7 +57,7 @@ LOG_LEVELS = click.Choice(
     case_sensitive=False,
 )
 
-_STREAMING_MODE_CHOICES = ("None", "sse", "bidi")
+_STREAMING_MODE_CHOICES = tuple(str(mode.value) for mode in StreamingMode)
 
 
 def _missing_eval_dependencies_message() -> str:
@@ -72,11 +72,9 @@ def _parse_streaming_mode(
     param: click.Parameter,
     value: str | None,
 ) -> StreamingMode | None:
-  """Converts a validated CLI value without importing the runtime for help."""
+  """Converts a validated CLI value to its streaming mode."""
   if value is None:
     return None
-
-  from ..agents.run_config import StreamingMode
 
   mode = next(
       (m for m in StreamingMode if str(m.value).lower() == value.lower()), None
