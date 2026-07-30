@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 from typing import AsyncGenerator
-from typing import Optional
 from typing import TYPE_CHECKING
 
 from google.genai import types
@@ -47,7 +46,7 @@ def _parse_tool_confirmation(response: dict[str, Any]) -> ToolConfirmation:
 
 def _get_original_function_call_args(
     function_call: types.FunctionCall,
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
   """Returns the raw ``originalFunctionCall`` payload of a confirmation call.
 
   Both the dedup pre-pass and ``_resolve_confirmation_targets`` read the
