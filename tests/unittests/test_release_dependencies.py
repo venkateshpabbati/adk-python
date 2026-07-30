@@ -25,6 +25,8 @@ regressions documented in the bare-install audit cannot silently re-emerge:
   undeclared ``pydantic_core``.
 * The LangGraph extras MUST exclude the releases that reconstruct unsafe
   objects while deserializing checkpoint data.
+* ``google-genai`` MUST exclude 2.11 and include 2.12.1, whose types module
+  defers the optional MCP server stack instead of importing it at Agent startup.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ except ImportError:
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 import pytest
 
 # Releases that can reconstruct unsafe objects while deserializing checkpoint
@@ -159,6 +162,23 @@ def test_langgraph_extras_exclude_unsafe_checkpoint_releases(
       f'The {extra!r} extra excludes {distribution} {first_safe}, the first '
       'release without the unsafe behavior.'
   )
+
+
+def test_main_deps_require_lazy_mcp_google_genai_release(
+    pyproject: dict,
+) -> None:
+  """The google-genai floor preserves its lazy optional-MCP boundary."""
+  requirements = [
+      Requirement(raw) for raw in pyproject['project']['dependencies']
+  ]
+  google_genai = next(
+      requirement
+      for requirement in requirements
+      if requirement.name == 'google-genai'
+  )
+
+  assert Version('2.11.0') not in google_genai.specifier
+  assert Version('2.12.1') in google_genai.specifier
 
 
 def test_environment_simulation_config_imports_validation_error_from_pydantic() -> (
