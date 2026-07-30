@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -112,7 +113,9 @@ class OAuth2CredentialRefresher(BaseCredentialRefresher):
           return auth_credential
 
         try:
-          tokens = client.refresh_token(
+          # authlib's client is synchronous; run it off the event loop.
+          tokens = await asyncio.to_thread(
+              client.refresh_token,
               url=token_endpoint,
               refresh_token=auth_credential.oauth2.refresh_token,
           )
