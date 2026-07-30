@@ -20,6 +20,7 @@ import importlib
 from typing import Any
 from typing import TYPE_CHECKING
 
+from ._capabilities import LlmCapabilities
 from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
@@ -47,6 +48,7 @@ __all__ = [
     'Gemma3Ollama',
     'LLMRegistry',
     'LiteLlm',
+    'LlmCapabilities',
 ]
 
 _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
