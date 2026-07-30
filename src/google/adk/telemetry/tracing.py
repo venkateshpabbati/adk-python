@@ -207,6 +207,12 @@ def trace_tool_call(
   # e.g. FunctionTool
   span.set_attribute(GEN_AI_TOOL_TYPE, tool.__class__.__name__)
 
+  if (
+      invocation_context is not None
+      and (agent := invocation_context.agent) is not None
+  ):
+    span.set_attribute(GEN_AI_AGENT_NAME, agent.name)
+
   if error is not None:
     span.set_attribute(ERROR_TYPE, resolve_error_type(error))
   elif error_type is not None:
