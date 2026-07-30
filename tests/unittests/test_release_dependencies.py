@@ -23,6 +23,8 @@ regressions documented in the bare-install audit cannot silently re-emerge:
 * ``ValidationError`` in ``environment_simulation_config`` MUST come from
   ``pydantic`` (which always installs alongside the package), NOT from the
   undeclared ``pydantic_core``.
+* The LangGraph extras MUST exclude the releases that reconstruct unsafe
+  objects while deserializing checkpoint data.
 """
 
 from __future__ import annotations
@@ -35,7 +37,17 @@ try:
 except ImportError:
   import tomli as tomllib
 
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 import pytest
+
+# Releases that can reconstruct unsafe objects while deserializing checkpoint
+# data, mapped to the first release of the same distribution without it.
+_UNSAFE_CHECKPOINT_RELEASES = {
+    'langgraph': (('0.2.60', '0.4.7', '1.0.9'), '1.0.10'),
+    'langgraph-checkpoint': (('2.1.0', '3.0.0', '4.0.0', '4.1.0'), '4.1.1'),
+}
 
 
 def _find_pyproject() -> Path:
@@ -89,6 +101,22 @@ def _requirement_names(requirements: list[str]) -> set[str]:
   return names
 
 
+def _requirement_specifier(
+    requirements: list[str], distribution: str
+) -> SpecifierSet | None:
+  """Returns the version specifier ``requirements`` declares for a dependency.
+
+  Returns ``None`` when the distribution is not declared at all, so callers can
+  tell "unconstrained" apart from "absent".
+  """
+  wanted = canonicalize_name(distribution)
+  for requirement in requirements:
+    parsed = Requirement(requirement)
+    if canonicalize_name(parsed.name) == wanted:
+      return parsed.specifier
+  return None
+
+
 def test_main_deps_include_packaging(pyproject: dict) -> None:
   """``packaging`` is imported unguarded by core ADK; it must be a main dep."""
   main_deps = _requirement_names(pyproject['project']['dependencies'])
@@ -98,6 +126,38 @@ def test_main_deps_include_packaging(pyproject: dict) -> None:
       'src/google/adk/cli/cli_deploy.py import it unguarded at module top '
       'level. Without this declaration, `pip install google-adk` is one '
       'transitive resolver change away from breaking on `import google.adk`.'
+  )
+
+
+@pytest.mark.parametrize('extra', ['extensions', 'test'])
+@pytest.mark.parametrize('distribution', sorted(_UNSAFE_CHECKPOINT_RELEASES))
+def test_langgraph_extras_exclude_unsafe_checkpoint_releases(
+    pyproject: dict, extra: str, distribution: str
+) -> None:
+  """Both LangGraph extras resolve past the unsafe-deserialization releases.
+
+  ``langgraph`` does not constrain ``langgraph-checkpoint`` tightly enough to
+  rule the unsafe releases out on its own, so each extra must declare both.
+  """
+  unsafe_versions, first_safe = _UNSAFE_CHECKPOINT_RELEASES[distribution]
+  specifier = _requirement_specifier(
+      pyproject['project']['optional-dependencies'][extra], distribution
+  )
+
+  assert specifier is not None, (
+      f'The {extra!r} extra must declare {distribution}; without it the '
+      'resolver is free to install a release that can reconstruct unsafe '
+      'objects from checkpoint data.'
+  )
+  admitted = [v for v in unsafe_versions if specifier.contains(v)]
+  assert not admitted, (
+      f'The {extra!r} extra admits {distribution} {admitted}, which can '
+      'reconstruct unsafe objects from checkpoint data. Require '
+      f'{distribution}>={first_safe}.'
+  )
+  assert specifier.contains(first_safe), (
+      f'The {extra!r} extra excludes {distribution} {first_safe}, the first '
+      'release without the unsafe behavior.'
   )
 
 
