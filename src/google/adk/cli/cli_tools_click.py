@@ -1961,6 +1961,10 @@ def cli_web(
   agent containing `agent.py`, `__init__.py`, or `root_agent.yaml`) or a path
   pointing directly to a single agent folder.
 
+  This server is intended for local development. Its endpoints are
+  unauthenticated, so run it on a trusted network only and do not expose it to
+  untrusted or public networks.
+
   Example:
 
     adk web --session_service_uri=[uri] --port=[port] path/to/agents_dir
@@ -2101,6 +2105,10 @@ def cli_api_server(
   AGENTS_DIR: The directory of agents (where each subdirectory is a single
   agent containing `agent.py`, `__init__.py`, or `root_agent.yaml`) or a path
   pointing directly to a single agent folder.
+
+  This server's endpoints are unauthenticated. Run it on a trusted network
+  only, and put it behind your own authentication and authorization layer
+  before exposing it to untrusted or public networks or serving multiple users.
 
   Example:
 
