@@ -233,11 +233,20 @@ class StorageEvent(Base):
 
   def to_event(self) -> Event:
     """Converts the StorageEvent to an Event."""
+    event_data = self.event_data or {}
+    # The stored payload already carries the event's exact epoch. Prefer it
+    # over the `timestamp` column: that column holds a naive local datetime, so
+    # rebuilding an epoch from it silently resolves an ambiguous local time
+    # (a daylight-saving fall-back repeats a whole hour) to the wrong instant,
+    # which shifts the event and reorders the conversation on read back.
+    timestamp = event_data.get("timestamp")
+    if timestamp is None:
+      timestamp = self.timestamp.timestamp()
     return Event.model_validate({
-        **self.event_data,
+        **event_data,
         "id": self.id,
         "invocation_id": self.invocation_id,
-        "timestamp": self.timestamp.timestamp(),
+        "timestamp": timestamp,
     })
 
 
