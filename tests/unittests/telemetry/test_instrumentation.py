@@ -85,33 +85,24 @@ def test_get_elapsed_s_span_non_int_end():
 
 
 @pytest.mark.asyncio
-async def test_record_agent_invocation_tolerates_minimal_context():
-  """Tolerates context-likes that lack session.
-
-  Test doubles, partial migrations, and external embedders can pass an
-  InvocationContext-like object with a `session` that has no `events`
-  attribute. The telemetry path must not raise AttributeError on the
-  metrics call in those cases.
-  """
+async def test_record_tool_execution_forwards_detected_error_type():
+  """A failure detected in the tool response reaches the duration metric."""
+  tool = mock.MagicMock()
+  tool.name = "sample_tool"
   agent = mock.MagicMock()
-  agent.name = "test_agent"
-  # Bare object without `session`.
-  bare_ctx = object()
+  agent.name = "sample_agent"
 
-  with (
-      mock.patch.object(
-          _instrumentation, "_record_agent_metrics"
-      ) as mock_record,
-      mock.patch.object(_instrumentation, "tracing") as mock_tracing,
-  ):
-    mock_tracing.tracer.start_as_current_span.return_value.__enter__.return_value = mock.MagicMock(
-        spec=trace.Span
-    )
-    async with _instrumentation.record_agent_invocation(bare_ctx, agent):
-      pass
+  with mock.patch.object(
+      _metrics, "record_tool_execution_duration"
+  ) as mock_record:
+    async with _instrumentation.record_tool_execution(
+        tool=tool,
+        agent=agent,
+        function_args={},
+        invocation_context=mock.MagicMock(),
+    ) as tel_ctx:
+      tel_ctx.error_type = "MCP_TOOL_ERROR"
 
   mock_record.assert_called_once()
-  call_args = mock_record.call_args
-  # positional: (agent_name, elapsed_s, events, caught_error)
-  assert call_args.args[0] == "test_agent"
-  assert call_args.args[2] == []  # events default
+  assert mock_record.call_args.kwargs["error"] is None
+  assert mock_record.call_args.kwargs["error_type"] == "MCP_TOOL_ERROR"

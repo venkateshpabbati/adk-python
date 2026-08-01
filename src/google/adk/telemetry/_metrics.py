@@ -27,7 +27,6 @@ from opentelemetry.semconv._incubating.metrics import gen_ai_metrics
 from opentelemetry.semconv.attributes import error_attributes
 
 if TYPE_CHECKING:
-  from google.adk.events.event import Event
   from google.adk.models.llm_request import LlmRequest
   from google.adk.models.llm_response import LlmResponse
   from opentelemetry.trace import Span
@@ -44,6 +43,7 @@ meter = metrics.get_meter(
     name="gcp.vertex.agent",
     version=version.__version__,
 )
+
 
 _agent_invocation_duration = meter.create_histogram(
     "gen_ai.invoke_agent.duration",
@@ -91,24 +91,6 @@ _tool_execution_duration = meter.create_histogram(
         81.92,
     ],
 )
-_agent_workflow_steps = meter.create_histogram(
-    "gen_ai.agent.workflow.steps",
-    unit="1",
-    description="Length of agentic workflow (# of events).",
-    explicit_bucket_boundaries_advisory=[
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-    ],
-)
 _client_operation_duration = (
     gen_ai_metrics.create_gen_ai_client_operation_duration(meter)
 )
@@ -118,6 +100,7 @@ _invoke_agent_inference_calls = meter.create_histogram(
     unit="1",
     description="Number of inference (model) calls per agent invocation.",
     explicit_bucket_boundaries_advisory=[
+        0,
         1,
         2,
         3,
@@ -137,6 +120,7 @@ _invoke_agent_tool_calls = meter.create_histogram(
     unit="1",
     description="Number of tool calls per agent invocation.",
     explicit_bucket_boundaries_advisory=[
+        0,
         1,
         2,
         3,
@@ -161,7 +145,7 @@ def record_agent_invocation_duration(
   """Records the duration of the agent invocation."""
   attrs = {gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name}
   if error is not None:
-    attrs[error_attributes.ERROR_TYPE] = type(error).__name__
+    attrs[error_attributes.ERROR_TYPE] = tracing.resolve_error_type(error)
   _agent_invocation_duration.record(elapsed_s, attributes=attrs)
 
 
@@ -180,7 +164,7 @@ def record_workflow_invocation_duration(
   if nested:
     attrs["gen_ai.workflow.nested"] = True
   if error is not None:
-    attrs[error_attributes.ERROR_TYPE] = type(error).__name__
+    attrs[error_attributes.ERROR_TYPE] = tracing.resolve_error_type(error)
   if workflow_name:
     attrs["gen_ai.workflow.name"] = workflow_name
   _workflow_invocation_duration.record(elapsed_s, attributes=attrs)
@@ -198,28 +182,34 @@ def record_invoke_agent_tool_calls(agent_name: str, count: int) -> None:
   _invoke_agent_tool_calls.record(count, attributes=attrs)
 
 
-def record_agent_workflow_steps(agent_name: str, events: list[Event]):
-  """Records the number of steps in the agent workflow by counting the number of events."""
-  attrs = {gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name}
-  count = sum(1 for event in events if event.author == agent_name)
-  _agent_workflow_steps.record(count, attributes=attrs)
-
-
 def record_tool_execution_duration(
     tool_name: str,
     tool_type: str,
     agent_name: str,
     elapsed_s: float,
     error: Exception | None = None,
+    error_type: str | None = None,
 ):
-  """Records the duration of the tool execution."""
+  """Records the duration of the tool execution.
+
+  Args:
+    tool_name: Name of the tool that ran.
+    tool_type: Class name of the tool that ran.
+    agent_name: Name of the agent that ran the tool.
+    elapsed_s: Duration of the tool execution, in seconds.
+    error: The exception raised by the tool, if any.
+    error_type: An error type detected from a tool response that reported a
+      failure without raising. Ignored when `error` is also set.
+  """
   attrs = {
       gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name,
       gen_ai_attributes.GEN_AI_TOOL_NAME: tool_name,
       gen_ai_attributes.GEN_AI_TOOL_TYPE: tool_type,
   }
   if error is not None:
-    attrs[error_attributes.ERROR_TYPE] = type(error).__name__
+    attrs[error_attributes.ERROR_TYPE] = tracing.resolve_error_type(error)
+  elif error_type is not None:
+    attrs[error_attributes.ERROR_TYPE] = error_type
   _tool_execution_duration.record(elapsed_s, attributes=attrs)
 
 
@@ -235,7 +225,9 @@ def record_client_operation_duration(
   attrs = {
       gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name,
       gen_ai_attributes.GEN_AI_OPERATION_NAME: "generate_content",
-      gen_ai_attributes.GEN_AI_PROVIDER_NAME: _get_provider_name(),
+      gen_ai_attributes.GEN_AI_PROVIDER_NAME: _get_provider_name(
+          llm_request.model
+      ),
   }
   if llm_request.model:
     attrs[gen_ai_attributes.GEN_AI_REQUEST_MODEL] = llm_request.model
@@ -246,7 +238,7 @@ def record_client_operation_duration(
       attrs[gen_ai_attributes.GEN_AI_RESPONSE_MODEL] = response_model
 
   if error is not None:
-    attrs[error_attributes.ERROR_TYPE] = type(error).__name__
+    attrs[error_attributes.ERROR_TYPE] = tracing.resolve_error_type(error)
 
   _client_operation_duration.record(elapsed_s, attributes=attrs)
 
@@ -285,7 +277,9 @@ def record_client_token_usage(
   base_attrs = {
       gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name,
       gen_ai_attributes.GEN_AI_OPERATION_NAME: "generate_content",
-      gen_ai_attributes.GEN_AI_PROVIDER_NAME: _get_provider_name(),
+      gen_ai_attributes.GEN_AI_PROVIDER_NAME: _get_provider_name(
+          llm_request.model
+      ),
   }
   if llm_request.model:
     base_attrs[gen_ai_attributes.GEN_AI_REQUEST_MODEL] = llm_request.model
@@ -303,8 +297,8 @@ def record_client_token_usage(
     _client_token_usage.record(output_token_count, attributes=output_attrs)
 
 
-def _get_provider_name() -> str:
-  return tracing._guess_gemini_system_name()
+def _get_provider_name(model: str | None) -> str:
+  return tracing._resolve_gen_ai_system_name(model)
 
 
 def get_elapsed_s(

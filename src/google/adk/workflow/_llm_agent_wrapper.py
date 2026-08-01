@@ -18,18 +18,17 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
-import json
 from typing import Any
 from typing import Optional
 
 from google.genai import types
-from pydantic import BaseModel
 
 from ..agents.context import Context
 from ..agents.llm.task._finish_task_tool import FINISH_TASK_SUCCESS_RESULT
 from ..agents.llm.task._finish_task_tool import FINISH_TASK_TOOL_NAME as _FINISH_TASK_FC_NAME
 from ..events.event import Event
 from ..utils._schema_utils import validate_schema
+from ..utils.content_utils import to_user_content
 
 
 def _extract_finish_task_fc(event: Event) -> Optional[types.FunctionCall]:
@@ -138,11 +137,10 @@ async def _dispatch_task_fc(
   """Dispatch a task-delegation FC via ``ctx.run_node`` and return the output.
 
   ``run_id=fc.id`` makes the child run idempotent across resumes (same
-  FC always maps to the same scheduler-tracked child run).  Scope is
-  carried by ``isolation_scope`` (``override_isolation_scope=fc.id``); we
-  intentionally do NOT set a branch — task-mode and single_turn-mode
-  agents share the parent's branch and rely on isolation_scope for
-  scoping instead.
+  FC always maps to the same scheduler-tracked child run).  Each task
+  runs in a stable sub-branch so resumable LLM flow logic sees only the
+  task's own function calls.  ``isolation_scope`` remains keyed by the
+  FC id to keep task history scoped independently of branch ancestry.
   """
   target_agent = parent_agent.root_agent.find_agent(fc.name)
   if target_agent is None:
@@ -155,6 +153,7 @@ async def _dispatch_task_fc(
       wrapped_target,
       node_input=fc.args,
       run_id=fc.id,
+      use_sub_branch=True,
       override_isolation_scope=fc.id,
       raise_on_wait=True,
   )
@@ -183,21 +182,6 @@ def _synthesize_task_fr_event(fc: types.FunctionCall, output: Any) -> Event:
       author='user',
       content=types.Content(role='user', parts=[fr_part]),
   )
-
-
-def _node_input_to_content(node_input: Any) -> types.Content:
-  """Converts node_input to a user Content for the LLM agent."""
-  if isinstance(node_input, types.Content):
-    return types.Content(role='user', parts=node_input.parts)
-  if isinstance(node_input, str):
-    text = node_input
-  elif isinstance(node_input, BaseModel):
-    text = node_input.model_dump_json()
-  elif isinstance(node_input, (dict, list)):
-    text = json.dumps(node_input)
-  else:
-    text = str(node_input)
-  return types.Content(role='user', parts=[types.Part(text=text)])
 
 
 def prepare_llm_agent_context(agent: Any, ctx: Context) -> Context:
@@ -240,7 +224,7 @@ def prepare_llm_agent_input(agent: Any, ctx: Context, node_input: Any) -> None:
   """
   if node_input is None or agent.mode != 'single_turn':
     return
-  agent_input = _node_input_to_content(node_input)
+  agent_input = to_user_content(node_input)
   user_event = Event(author='user', message=agent_input)
   if user_event.content is not None:
     user_event.content.role = 'user'
@@ -324,7 +308,7 @@ async def run_llm_agent_as_node(
   # case).  For delegated tasks, the FC takes precedence and this
   # override is unused.
   if agent.mode == 'task' and node_input is not None:
-    update['user_content'] = _node_input_to_content(node_input)
+    update['user_content'] = to_user_content(node_input)
   ic = ic.model_copy(update=update)
 
   from ..agents.live_request_queue import LiveRequestQueue
@@ -394,10 +378,6 @@ async def run_llm_agent_as_node(
             break  # close this run_iter; outer loop re-enters
           if event.actions.transfer_to_agent:
             target_name = event.actions.transfer_to_agent
-            if target_name == agent.name:
-              raise ValueError(
-                  f"Agent '{target_name}' cannot transfer to itself."
-              )
 
             from ..agents.llm_agent import LlmAgent
 
@@ -449,6 +429,8 @@ async def run_llm_agent_as_node(
           event.output = pending_fc_args[wrapper_key]
         else:
           event.output = pending_fc_args
+        if getattr(agent, 'output_key', None) and event.output is not None:
+          ctx.actions.state_delta[agent.output_key] = event.output
         yield event
         return
 

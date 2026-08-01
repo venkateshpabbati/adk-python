@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from datetime import timezone
 import inspect
 import logging
 from typing import Awaitable
@@ -24,17 +22,13 @@ from typing import Optional
 import uuid
 
 from a2a.server.agent_execution import AgentExecutor
-from a2a.server.agent_execution.context import RequestContext
+from a2a.server.agent_execution import RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.types import Message
-from a2a.types import Role
 from a2a.types import Task
-from a2a.types import TaskState
-from a2a.types import TaskStatus
-from a2a.types import TaskStatusUpdateEvent
-from a2a.types import TextPart
 from typing_extensions import override
 
+from .. import _compat
 from ...runners import Runner
 from ...sessions import base_session_service
 from ...utils.context_utils import Aclosing
@@ -47,6 +41,7 @@ from ..converters.utils import _get_adk_metadata_key
 from ..experimental import a2a_experimental
 from .config import A2aAgentExecutorConfig
 from .executor_context import ExecutorContext
+from .utils import _enqueue_canceled_task_event
 from .utils import execute_after_agent_interceptors
 from .utils import execute_after_event_interceptors
 from .utils import execute_before_agent_interceptors
@@ -72,17 +67,18 @@ class _A2aAgentExecutor(AgentExecutor):
     self._config = config or A2aAgentExecutorConfig()
 
   @override
-  async def cancel(self, context: RequestContext, event_queue: EventQueue):
+  async def cancel(
+      self, context: RequestContext, event_queue: EventQueue
+  ) -> None:
     """Cancel the execution."""
-    # TODO: Implement proper cancellation logic if needed
-    raise NotImplementedError('Cancellation is not supported')
+    await _enqueue_canceled_task_event(context, event_queue)
 
   @override
   async def execute(
       self,
       context: RequestContext,
       event_queue: EventQueue,
-  ):
+  ) -> None:
     """Executes an A2A request and publishes updates to the event queue
 
     specified. It runs as following:
@@ -119,10 +115,7 @@ class _A2aAgentExecutor(AgentExecutor):
         await event_queue.enqueue_event(
             Task(
                 id=context.task_id,
-                status=TaskStatus(
-                    state=TaskState.submitted,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ),
+                status=_compat.make_task_status(_compat.TS_SUBMITTED),
                 context_id=context.context_id,
                 history=[context.message],
                 metadata=self._get_invocation_metadata(executor_context),
@@ -133,20 +126,18 @@ class _A2aAgentExecutor(AgentExecutor):
         # request for input.
         missing_user_input_event = handle_user_input(context)
         if missing_user_input_event:
-          missing_user_input_event.metadata = self._get_invocation_metadata(
-              executor_context
+          _compat.set_event_metadata(
+              missing_user_input_event,
+              self._get_invocation_metadata(executor_context),
           )
           await event_queue.enqueue_event(missing_user_input_event)
           return
 
       await event_queue.enqueue_event(
-          TaskStatusUpdateEvent(
+          _compat.make_task_status_update_event(
               task_id=context.task_id,
-              status=TaskStatus(
-                  state=TaskState.working,
-                  timestamp=datetime.now(timezone.utc).isoformat(),
-              ),
               context_id=context.context_id,
+              status=_compat.make_task_status(_compat.TS_WORKING),
               final=False,
               metadata=self._get_invocation_metadata(executor_context),
           )
@@ -165,18 +156,17 @@ class _A2aAgentExecutor(AgentExecutor):
       # Publish failure event
       try:
         await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
+            _compat.make_task_status_update_event(
                 task_id=context.task_id,
-                status=TaskStatus(
-                    state=TaskState.failed,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
+                context_id=context.context_id,
+                status=_compat.make_task_status(
+                    _compat.TS_FAILED,
                     message=Message(
                         message_id=str(uuid.uuid4()),
-                        role=Role.agent,
-                        parts=[TextPart(text=str(e))],
+                        role=_compat.ROLE_AGENT,
+                        parts=[_compat.make_text_part(str(e))],
                     ),
                 ),
-                context_id=context.context_id,
                 final=True,
             )
         )
@@ -192,7 +182,7 @@ class _A2aAgentExecutor(AgentExecutor):
       event_queue: EventQueue,
       runner: Runner,
       run_request: AgentRunRequest,
-  ):
+  ) -> None:
     agents_artifact: dict[str, str] = {}
     error_event = None
     long_running_functions = LongRunningFunctions(
@@ -218,7 +208,9 @@ class _A2aAgentExecutor(AgentExecutor):
             context.context_id,
             self._config.gen_ai_part_converter,
         ):
-          a2a_event.metadata = self._get_invocation_metadata(executor_context)
+          _compat.set_event_metadata(
+              a2a_event, self._get_invocation_metadata(executor_context)
+          )
           a2a_events = await execute_after_event_interceptors(
               a2a_event,
               executor_context,
@@ -237,17 +229,16 @@ class _A2aAgentExecutor(AgentExecutor):
           )
       )
     else:
-      final_event = TaskStatusUpdateEvent(
+      final_event = _compat.make_task_status_update_event(
           task_id=context.task_id,
-          status=TaskStatus(
-              state=TaskState.completed,
-              timestamp=datetime.now(timezone.utc).isoformat(),
-          ),
           context_id=context.context_id,
+          status=_compat.make_task_status(_compat.TS_COMPLETED),
           final=True,
       )
 
-    final_event.metadata = self._get_invocation_metadata(executor_context)
+    _compat.set_event_metadata(
+        final_event, self._get_invocation_metadata(executor_context)
+    )
     final_event = await execute_after_agent_interceptors(
         executor_context, final_event, self._config.execute_interceptors
     )
@@ -277,7 +268,7 @@ class _A2aAgentExecutor(AgentExecutor):
       self,
       run_request: AgentRunRequest,
       runner: Runner,
-  ):
+  ) -> None:
     session_id = run_request.session_id
     # create a new session if not exists
     user_id = run_request.user_id

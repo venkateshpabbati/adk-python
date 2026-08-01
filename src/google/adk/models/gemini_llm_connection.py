@@ -29,7 +29,12 @@ from .llm_response import LlmResponse
 
 logger = logging.getLogger('google_adk.' + __name__)
 
-RealtimeInput = Union[types.Blob, types.ActivityStart, types.ActivityEnd]
+RealtimeInput = Union[
+    types.Blob,
+    types.ActivityStart,
+    types.ActivityEnd,
+    types.LiveClientRealtimeInput,
+]
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -57,7 +62,7 @@ class GeminiLlmConnection(BaseLlmConnection):
         model_name_utils.is_gemini_3_5_live_translate(model_version)
     )
 
-  async def send_history(self, history: list[types.Content]):
+  async def send_history(self, history: list[types.Content]) -> None:
     """Sends the conversation history to the gemini model.
 
     You call this method right after setting up the model connection.
@@ -94,7 +99,7 @@ class GeminiLlmConnection(BaseLlmConnection):
     else:
       logger.info('no content is sent')
 
-  async def send_content(self, content: types.Content):
+  async def send_content(self, content: types.Content) -> None:
     """Sends a user content to the gemini model.
 
     The model will respond immediately upon receiving the content.
@@ -103,6 +108,18 @@ class GeminiLlmConnection(BaseLlmConnection):
 
     Args:
       content: The content to send to the model.
+    """
+    await self._send_content(content)
+
+  async def _send_content(
+      self, content: types.Content, *, partial: bool = False
+  ) -> None:
+    """Sends content, optionally as a partial (non-turn-completing) update.
+
+    Args:
+      content: The content to send to the model.
+      partial: Whether this content is a partial turn update that does not
+        complete the model turn.
     """
     assert content.parts
     if content.parts[0].function_response:
@@ -115,7 +132,8 @@ class GeminiLlmConnection(BaseLlmConnection):
     else:
       logger.debug('Sending LLM new content %s', content)
       if (
-          self._is_gemini_3_x_live
+          not partial
+          and self._is_gemini_3_x_live
           and len(content.parts) == 1
           and content.parts[0].text
       ):
@@ -127,11 +145,11 @@ class GeminiLlmConnection(BaseLlmConnection):
         await self._gemini_session.send(
             input=types.LiveClientContent(
                 turns=[content],
-                turn_complete=True,
+                turn_complete=not partial,
             )
         )
 
-  async def send_realtime(self, input: RealtimeInput):
+  async def send_realtime(self, input: RealtimeInput) -> None:
     """Sends a chunk of audio or a frame of video to the model in realtime.
 
     Args:
@@ -160,6 +178,12 @@ class GeminiLlmConnection(BaseLlmConnection):
     elif isinstance(input, types.ActivityEnd):
       logger.debug('Sending LLM activity end signal.')
       await self._gemini_session.send_realtime_input(activity_end=input)
+    elif isinstance(input, types.LiveClientRealtimeInput):
+      if input.audio_stream_end:
+        logger.debug('Sending LLM audio stream end signal.')
+        await self._gemini_session.send_realtime_input(audio_stream_end=True)
+      else:
+        logger.warning('Unary LiveClientRealtimeInput not fully supported yet.')
     else:
       raise ValueError('Unsupported input type: %s' % type(input))
 
@@ -212,7 +236,7 @@ class GeminiLlmConnection(BaseLlmConnection):
       is_thought: bool = False,
       grounding_metadata: types.GroundingMetadata | None = None,
       interrupted: bool = False,
-  ):
+  ) -> LlmResponse:
     """Builds a full text response.
 
     The text should not be partial and the returned LlmResponse is not
@@ -280,12 +304,13 @@ class GeminiLlmConnection(BaseLlmConnection):
 
     text = ''
     is_thought = False
-    tool_call_parts = []
+    tool_call_parts: list[types.Part] = []
     last_grounding_metadata = None
     tool_call_metadata = None
     async with Aclosing(self._gemini_session.receive()) as agen:
-      # TODO(b/440101573): Reuse StreamingResponseAggregator to accumulate
-      # partial content and emit responses as needed.
+      # Pending cleanup: reuse StreamingResponseAggregator to accumulate
+      # partial content and emit responses as needed, once that aggregator
+      # handles the live-connection message shapes.
       async for message in agen:
         logger.debug('Got LLM Live message: %s', message)
         live_session_id = self._gemini_session.session_id
@@ -589,6 +614,13 @@ class GeminiLlmConnection(BaseLlmConnection):
                   live_session_id=live_session_id,
               )
           )
+        if message.voice_activity:
+          logger.debug('Received voice activity: %s', message.voice_activity)
+          yield LlmResponse(
+              voice_activity=message.voice_activity,
+              model_version=self._model_version,
+              live_session_id=live_session_id,
+          )
         if message.go_away:
           logger.debug('Received GoAway message: %s', message.go_away)
           yield LlmResponse(
@@ -605,7 +637,7 @@ class GeminiLlmConnection(BaseLlmConnection):
             live_session_id=self._gemini_session.session_id,
         )
 
-  async def close(self):
+  async def close(self) -> None:
     """Closes the llm server connection."""
 
     await self._gemini_session.close()

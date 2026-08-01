@@ -162,10 +162,15 @@ class SpanDigest:
   In addition to the span's own name + attributes + child spans, each
   digest also carries the ``LogDigest`` records that were emitted while
   the span was the active span (matched by ``log_record.span_id``).
+
+  ``status`` is the span's ``StatusCode`` name, so a tree that expects a
+  span to be marked failed says so explicitly. It defaults to ``UNSET``,
+  which is what a span that nothing marked carries.
   """
 
   name: str
   attributes: dict[str, AttributeValue]
+  status: str = "UNSET"
   children: list[SpanDigest] = field(default_factory=list)
   logs: list[LogDigest] = field(default_factory=list)
 
@@ -187,7 +192,11 @@ class SpanDigest:
         determinized_attributes[attr_key] = _normalize(json.loads(attr_val))
       else:
         determinized_attributes[attr_key] = _normalize(attr_val)
-    return cls(name=span.name, attributes=determinized_attributes)
+    return cls(
+        name=span.name,
+        attributes=determinized_attributes,
+        status=span.status.status_code.name,
+    )
 
   @classmethod
   def build(
@@ -313,11 +322,6 @@ _PATCHED_HISTOGRAMS: tuple[HistogramSpec, ...] = (
         module=_metrics,
         attr="_tool_execution_duration",
         metric_name="gen_ai.execute_tool.duration",
-    ),
-    HistogramSpec(
-        module=_metrics,
-        attr="_agent_workflow_steps",
-        metric_name="gen_ai.agent.workflow.steps",
     ),
     HistogramSpec(
         module=_metrics,
@@ -504,6 +508,10 @@ TOOL_RESULT = f"{TOOL_RESULT_PREFIX}{TOOL_ARGS['arg1']}"
 # The node scenario uses a workflow node whose output drives the agent's
 # input. The workflow itself wraps the same agent.
 WORKFLOW_NAME = "my_workflow"
+# The root workflow invokes a nested workflow whose sole node produces the
+# input for the agent. The nested workflow exercises the `gen_ai.workflow.nested`
+# span attribute + metric dimension (only nested workflows carry it).
+NESTED_WORKFLOW_NAME = "my_nested_workflow"
 NODE_NAME = "some_node"
 NODE_RESULT = "some result"
 NODE_USER_ID = "some_user"
@@ -517,15 +525,28 @@ def _make_llm_response(part: Part) -> LlmResponse:
   )
 
 
-def build_test_agent(*, failing: bool = False) -> Agent:
-  """Builds the canonical 1-tool, 2-LLM-turn agent."""
+def build_test_agent(
+    *, failing: bool = False, model_exception: Exception | None = None
+) -> Agent:
+  """Builds the canonical 1-tool, 2-LLM-turn agent.
+
+  If ``model_exception`` is provided, the mock model raises it instead of
+  returning any response, exercising the inference-failure telemetry path.
+  """
+  # When the model is meant to raise, leave the responses empty so the mock
+  # never yields; otherwise it returns the canonical 2-turn conversation.
   mock_model = MockModel.create(
-      responses=[
-          _make_llm_response(
-              Part.from_function_call(name=TOOL_NAME, args=TOOL_ARGS)
-          ),
-          _make_llm_response(Part.from_text(text=FINAL_TEXT)),
-      ]
+      responses=(
+          []
+          if model_exception is not None
+          else [
+              _make_llm_response(
+                  Part.from_function_call(name=TOOL_NAME, args=TOOL_ARGS)
+              ),
+              _make_llm_response(Part.from_text(text=FINAL_TEXT)),
+          ]
+      ),
+      error=model_exception,
   )
 
   def some_tool(arg1: str) -> str:
@@ -544,21 +565,35 @@ def build_test_agent(*, failing: bool = False) -> Agent:
   )
 
 
-def build_test_runner(*, failing: bool = False) -> TestInMemoryRunner:
+def build_test_runner(
+    *, failing: bool = False, model_exception: Exception | None = None
+) -> TestInMemoryRunner:
   """Builds a runner around the canonical agent (no workflow wrapper)."""
-  return TestInMemoryRunner(node=build_test_agent(failing=failing))
+  return TestInMemoryRunner(
+      node=build_test_agent(failing=failing, model_exception=model_exception)
+  )
 
 
-def build_test_workflow(*, failing: bool = False) -> Workflow:
-  """Builds the canonical Workflow wrapping the agent + a trivial node."""
-  test_agent = build_test_agent(failing=failing)
+def build_test_workflow(
+    *, failing: bool = False, model_exception: Exception | None = None
+) -> Workflow:
+  """Builds the canonical Workflow: a nested workflow feeding the agent."""
+  test_agent = build_test_agent(
+      failing=failing, model_exception=model_exception
+  )
 
   async def some_node(ctx, node_input):
     return NODE_RESULT
 
+  # Trivial workflow to test o11y of nested workflows
+  nested_workflow = Workflow(
+      name=NESTED_WORKFLOW_NAME,
+      edges=[(START, some_node)],
+  )
+
   return Workflow(
       name=WORKFLOW_NAME,
-      edges=[(START, some_node, test_agent)],
+      edges=[(START, nested_workflow, test_agent)],
   )
 
 
@@ -618,6 +653,12 @@ class FunctionalTestCase:
   capture_content: str | None
   schema_version: Literal[1, 2]
   expected: TelemetryDigest
+  # When set, the mock model raises this instead of responding, and the
+  # scenario is expected to propagate it (inference-failure telemetry path).
+  model_exception: Exception | None = None
+  # When true, the tool raises instead of returning, and the scenario is
+  # expected to propagate it (tool-failure telemetry path).
+  tool_fails: bool = False
 
   def apply_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
     """Applies the per-case env vars for semconv + content capture.

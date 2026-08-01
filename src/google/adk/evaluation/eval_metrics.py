@@ -25,13 +25,15 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
+from pydantic import PrivateAttr
+from pydantic import SerializeAsAny
 from pydantic.json_schema import SkipJsonSchema
 from typing_extensions import TypeAlias
 
 from .common import EvalBaseModel
 from .eval_case import Invocation
-from .eval_rubrics import Rubric
-from .eval_rubrics import RubricScore
+from .eval_rubrics import Rubric as Rubric
+from .eval_rubrics import RubricScore as RubricScore
 
 
 class EvalStatus(Enum):
@@ -290,7 +292,7 @@ class EvalMetric(EvalBaseModel):
       ),
   )
 
-  criterion: Optional[BaseCriterion] = Field(
+  criterion: Optional[SerializeAsAny[BaseCriterion]] = Field(
       default=None, description="""Evaluation criterion used by the metric."""
   )
 
@@ -298,6 +300,11 @@ class EvalMetric(EvalBaseModel):
       default=None,
       description="""Path to custom function, if this is a custom metric.""",
   )
+
+  # The path declared for this metric in the eval config it was built from.
+  # Private, so that a metric parsed from an inbound payload cannot carry one:
+  # the public field above is settable by whoever built that payload.
+  _config_custom_function_path: Optional[str] = PrivateAttr(default=None)
 
 
 class EvalMetricResultDetails(EvalBaseModel):

@@ -23,11 +23,11 @@ from typing import Callable
 from typing import Optional
 from typing import Union
 
-from a2a.client.middleware import ClientCallContext
 from a2a.server.events import Event as A2AEvent
 from a2a.types import Message as A2AMessage
 from pydantic import BaseModel
 
+from .. import _compat
 from ...a2a.converters.part_converter import A2APartToGenAIPartConverter
 from ...a2a.converters.part_converter import convert_a2a_part_to_genai_part
 from ...a2a.converters.to_adk_event import A2AArtifactUpdateToEventConverter
@@ -46,7 +46,7 @@ class ParametersConfig(BaseModel):
   """Configuration for the parameters passed to the A2A send_message request."""
 
   request_metadata: Optional[dict[str, Any]] = None
-  client_call_context: Optional[ClientCallContext] = None
+  client_call_context: Optional[_compat.ClientCallContext] = None
   # TODO: Add support for requested_extension and
   # message_send_configuration once they are supported by the A2A client.
   #
@@ -80,6 +80,27 @@ class RequestInterceptor(BaseModel):
   """
 
 
+class A2aCardRequestConfig(BaseModel):
+  """Configuration for the HTTP request that fetches a remote agent card."""
+
+  headers: Optional[dict[str, str]] = None
+  """Extra HTTP headers to include in the request."""
+
+
+class CardRequestInterceptor(BaseModel):
+  """Interceptor for the remote agent card fetch request."""
+
+  before_request: Optional[
+      Callable[[InvocationContext], Awaitable[A2aCardRequestConfig]]
+  ] = None
+  """Async hook returning per-invocation config for the agent card request.
+
+  Called before fetching the card from an ``http(s)`` URL; its headers
+  (e.g. an auth token from session state) are sent with the request.
+  Ignored for static ``AgentCard`` or file-path sources.
+  """
+
+
 class A2aRemoteAgentConfig(BaseModel):
   """Configuration for A2A remote agents."""
 
@@ -110,9 +131,16 @@ class A2aRemoteAgentConfig(BaseModel):
 
   request_interceptors: Optional[list[RequestInterceptor]] = None
 
-  def __deepcopy__(self, memo):
+  card_request_interceptors: Optional[list[CardRequestInterceptor]] = None
+  """Interceptors that inject headers into the remote agent card fetch."""
+
+  def __deepcopy__(
+      self, memo: dict[int, Any] | None = None
+  ) -> A2aRemoteAgentConfig:
+    if memo is None:
+      memo = {}
     cls = self.__class__
-    copied_values = {}
+    copied_values: dict[str, Any] = {}
     for k, v in self.__dict__.items():
       if not k.startswith('_'):
         if callable(v):

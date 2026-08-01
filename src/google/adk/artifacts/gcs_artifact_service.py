@@ -167,6 +167,8 @@ class GcsArtifactService(BaseArtifactService):
       session_id: Optional[str] = None,
   ) -> str:
     """Constructs the blob name prefix in GCS for a given artifact."""
+    artifact_util.validate_path_segment(app_name, "app_name")
+    artifact_util.validate_path_segment(user_id, "user_id")
     if self._file_has_user_namespace(filename):
       return f"{app_name}/{user_id}/user/{filename}"
 
@@ -174,6 +176,7 @@ class GcsArtifactService(BaseArtifactService):
       raise InputValidationError(
           "Session ID must be provided for session-scoped artifacts."
       )
+    artifact_util.validate_path_segment(session_id, "session_id")
     return f"{app_name}/{user_id}/{session_id}/{filename}"
 
   def _get_blob_name(
@@ -252,10 +255,17 @@ class GcsArtifactService(BaseArtifactService):
       if not file_uri:
         raise InputValidationError("Artifact file_data must have a file_uri.")
       if artifact_util.is_artifact_ref(artifact):
-        if not artifact_util.parse_artifact_uri(file_uri):
+        parsed_uri = artifact_util.parse_artifact_uri(file_uri)
+        if not parsed_uri:
           raise InputValidationError(
               f"Invalid artifact reference URI: {file_uri}"
           )
+        artifact_util.validate_artifact_reference_scope(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            parsed_uri=parsed_uri,
+        )
       # Store the URI and mime_type (if any) as blob metadata; no content to upload.
       metadata = {
           **(blob.metadata or {}),
@@ -315,6 +325,12 @@ class GcsArtifactService(BaseArtifactService):
           raise InputValidationError(
               f"Invalid artifact reference URI: {file_uri}"
           )
+        artifact_util.validate_artifact_reference_scope(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            parsed_uri=parsed_uri,
+        )
         return self._load_artifact(
             app_name=parsed_uri.app_name,
             user_id=parsed_uri.user_id,
@@ -355,6 +371,10 @@ class GcsArtifactService(BaseArtifactService):
   def _list_artifact_keys(
       self, app_name: str, user_id: str, session_id: Optional[str]
   ) -> list[str]:
+    artifact_util.validate_path_segment(app_name, "app_name")
+    artifact_util.validate_path_segment(user_id, "user_id")
+    if session_id is not None:
+      artifact_util.validate_path_segment(session_id, "session_id")
     filenames = set()
 
     if session_id:
@@ -425,15 +445,25 @@ class GcsArtifactService(BaseArtifactService):
 
     Returns:
         A list of version numbers (integers) available for the specified
-        artifact.
+        artifact, in ascending order.
         Returns an empty list if no versions are found.
     """
     prefix = self._get_blob_prefix(app_name, user_id, filename, session_id)
     blobs = self.storage_client.list_blobs(self.bucket, prefix=f"{prefix}/")
     versions = []
     for blob in blobs:
-      *_, version = blob.name.split("/")
-      versions.append(int(version))
+      try:
+        version = int(blob.name.split("/")[-1])
+      except ValueError:
+        logger.warning(
+            "Skipping blob %s because it does not end with a version number.",
+            blob.name,
+        )
+        continue
+
+      versions.append(version)
+
+    versions.sort()
     return versions
 
   def _get_artifact_version_sync(

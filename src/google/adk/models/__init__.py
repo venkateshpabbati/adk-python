@@ -17,14 +17,17 @@
 from __future__ import annotations
 
 import importlib
+from typing import Any
 from typing import TYPE_CHECKING
 
+from ._capabilities import LlmCapabilities
 from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
 from .registry import LLMRegistry
 
 if TYPE_CHECKING:
+  from google.adk.integrations.oci._oci_genai_llm import OCIGenAILlm
   from google.adk.labs.openai import OpenAILlm
 
   from .anthropic_llm import AnthropicGenerateContentConfig
@@ -45,6 +48,7 @@ __all__ = [
     'Gemma3Ollama',
     'LLMRegistry',
     'LiteLlm',
+    'LlmCapabilities',
 ]
 
 _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
@@ -62,11 +66,11 @@ _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
     ),
     # Gemma 3 only (function-calling workarounds). Gemma 4+ resolves to Gemini.
     'Gemma': ([r'gemma-.*'], 'gemma_llm'),
-    'ApigeeLlm': ([r'.*-apigee$'], 'apigee_llm'),
+    'ApigeeLlm': ([r'apigee\/.*'], 'apigee_llm'),
     'Claude': ([r'claude-3-.*', r'claude-.*-4.*'], 'anthropic_llm'),
     'Gemma3Ollama': ([r'ollama/gemma3.*'], 'gemma_llm'),
     'OpenAILlm': (
-        [r'gpt-.*', r'o1-.*', r'o3-.*'],
+        [r'gpt-.*', r'o\d+-.*'],
         'google.adk.labs.openai',
     ),
     'LiteLlm': (
@@ -90,6 +94,18 @@ _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
         ],
         'lite_llm',
     ),
+    'OCIGenAILlm': (
+        [
+            r'meta\.llama-.*',
+            r'google\.gemini-.*',
+            r'google\.gemma-.*',
+            r'xai\.grok-.*',
+            r'mistralai\.mistral-.*',
+            r'mistralai\.mixtral-.*',
+            r'nvidia\..*',
+        ],
+        'google.adk.integrations.oci._oci_genai_llm',
+    ),
 }
 
 for _name, (_patterns, _module) in _LAZY_PROVIDERS.items():
@@ -104,7 +120,7 @@ _OTHER_LAZY_IMPORTS: dict[str, str] = {
 }
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
   if name in _LAZY_PROVIDERS:
     module_name = _LAZY_PROVIDERS[name][1]
   elif name in _OTHER_LAZY_IMPORTS:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import importlib
 import json
 import logging
@@ -21,6 +22,7 @@ import os
 from os import path
 import statistics
 from typing import Any
+from typing import cast
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -32,6 +34,8 @@ from pydantic import BaseModel
 from pydantic import ValidationError
 
 from ..agents.base_agent import BaseAgent
+from ..apps.app import App
+from ..artifacts.base_artifact_service import BaseArtifactService
 from ..utils.context_utils import Aclosing
 from .constants import MISSING_EVAL_DEPENDENCIES_MESSAGE
 from .eval_case import get_all_tool_calls
@@ -40,6 +44,7 @@ from .eval_case import Invocation
 from .eval_config import EvalConfig
 from .eval_config import get_eval_metrics_from_config
 from .eval_config import get_evaluation_criteria_or_default
+from .eval_config import LiveModelConfig
 from .eval_metrics import BaseCriterion
 from .eval_metrics import EvalMetric
 from .eval_metrics import EvalMetricResult
@@ -77,9 +82,9 @@ REFERENCE_COLUMN = "reference"
 EXPECTED_TOOL_USE_COLUMN = "expected_tool_use"
 
 
-def load_json(file_path: str) -> Union[Dict, List]:
+def load_json(file_path: str) -> Union[Dict[str, Any], List[Any]]:
   with open(file_path, "r") as f:
-    return json.load(f)
+    return cast(Union[Dict[str, Any], List[Any]], json.load(f))
 
 
 class _EvalMetricResultWithInvocation(BaseModel):
@@ -113,7 +118,8 @@ class AgentEvaluator:
       num_runs: int = NUM_RUNS,
       agent_name: Optional[str] = None,
       print_detailed_results: bool = True,
-  ):
+      artifact_service: Optional[BaseArtifactService] = None,
+  ) -> None:
     """Evaluates an agent using the given EvalSet.
 
     Args:
@@ -130,6 +136,10 @@ class AgentEvaluator:
         than root agent. If left empty or none, then root agent is evaluated.
       print_detailed_results: Whether to print detailed results for each metric
         evaluation.
+      artifact_service: The artifact service used to load artifacts during eval.
+        Pre-load artifacts here and pin each eval case to a session id (via
+        `SessionInput.session_id`) to make them reachable. Defaults to an
+        in-memory service.
     """
     if criteria:
       logger.warning(
@@ -145,7 +155,7 @@ class AgentEvaluator:
     if eval_config is None:
       raise ValueError("`eval_config` is required.")
 
-    agent_for_eval = await AgentEvaluator._get_agent_for_eval(
+    agent_for_eval, app = await AgentEvaluator._get_agent_for_eval(
         module_name=agent_module, agent_name=agent_name
     )
     eval_metrics = get_eval_metrics_from_config(eval_config)
@@ -153,6 +163,7 @@ class AgentEvaluator:
     user_simulator_provider = UserSimulatorProvider(
         user_simulator_config=eval_config.user_simulator_config
     )
+    live_model_config = eval_config.live_model_config
 
     # Step 1: Perform evals, basically inferencing and evaluation of metrics
     eval_results_by_eval_id = await AgentEvaluator._get_eval_results_by_eval_id(
@@ -161,6 +172,9 @@ class AgentEvaluator:
         eval_metrics=eval_metrics,
         num_runs=num_runs,
         user_simulator_provider=user_simulator_provider,
+        live_model_config=live_model_config,
+        artifact_service=artifact_service,
+        app=app,
     )
 
     # Step 2: Post-process the results!
@@ -200,7 +214,8 @@ class AgentEvaluator:
       agent_name: Optional[str] = None,
       initial_session_file: Optional[str] = None,
       print_detailed_results: bool = True,
-  ):
+      artifact_service: Optional[BaseArtifactService] = None,
+  ) -> None:
     """Evaluates an Agent given eval data.
 
     Args:
@@ -218,6 +233,10 @@ class AgentEvaluator:
         needed by all the evals in the eval dataset.
       print_detailed_results: Whether to print detailed results for each metric
         evaluation.
+      artifact_service: The artifact service used to load artifacts during eval.
+        Pre-load artifacts here and pin each eval case to a session id (via
+        `SessionInput.session_id`) to make them reachable. Defaults to an
+        in-memory service.
     """
     test_files = []
     if isinstance(eval_dataset_file_path_or_dir, str) and os.path.isdir(
@@ -245,6 +264,7 @@ class AgentEvaluator:
           num_runs=num_runs,
           agent_name=agent_name,
           print_detailed_results=print_detailed_results,
+          artifact_service=artifact_service,
       )
 
   @staticmethod
@@ -252,7 +272,7 @@ class AgentEvaluator:
       old_eval_data_file: str,
       new_eval_data_file: str,
       initial_session_file: Optional[str] = None,
-  ):
+  ) -> None:
     """A utility for migrating eval data to new schema backed by EvalSet."""
     if not old_eval_data_file or not new_eval_data_file:
       raise ValueError(
@@ -320,8 +340,10 @@ class AgentEvaluator:
     )
 
   @staticmethod
-  def _get_initial_session(initial_session_file: Optional[str] = None):
-    initial_session = {}
+  def _get_initial_session(
+      initial_session_file: Optional[str] = None,
+  ) -> dict[str, Any]:
+    initial_session: dict[str, Any] = {}
     if initial_session_file:
       with open(initial_session_file, "r") as f:
         initial_session = json.loads(f.read())
@@ -329,9 +351,14 @@ class AgentEvaluator:
 
   @staticmethod
   def _load_dataset(
-      input_data: Union[str, List[str], List[Dict], List[List[Dict]]],
-  ) -> List[List[Dict]]:
-    def load_json_file(file_path: str) -> List[Dict]:
+      input_data: Union[
+          str,
+          List[str],
+          List[Dict[str, Any]],
+          List[List[Dict[str, Any]]],
+      ],
+  ) -> List[List[Dict[str, Any]]]:
+    def load_json_file(file_path: str) -> List[Dict[str, Any]]:
       data = load_json(file_path)
       if not isinstance(data, list) or not all(
           isinstance(d, dict) for d in data
@@ -353,12 +380,15 @@ class AgentEvaluator:
         raise ValueError(f"Input path {input_data} is invalid.")
     elif isinstance(input_data, list):
       if all(isinstance(i, str) and os.path.isfile(i) for i in input_data):
-        return [load_json_file(i) for i in input_data]
+        return [load_json_file(cast(str, i)) for i in input_data]
       raise TypeError("Input list must contain valid file paths.")
     raise TypeError("Invalid input type for dataset loading.")
 
   @staticmethod
-  def _validate_input(eval_dataset, criteria):
+  def _validate_input(
+      eval_dataset: list[list[dict[str, Any]]],
+      criteria: Mapping[str, object],
+  ) -> None:
     """Validates that the evaluation criteria align with the provided dataset.
 
     For efficiency, we only use first row to validate input.
@@ -418,7 +448,7 @@ class AgentEvaluator:
       overall_score: Optional[float],
       metric_name: str,
       threshold: float,
-  ):
+  ) -> None:
     try:
       from pandas import pandas as pd
       from tabulate import tabulate
@@ -484,7 +514,16 @@ class AgentEvaluator:
   @staticmethod
   async def _get_agent_for_eval(
       module_name: str, agent_name: Optional[str] = None
-  ) -> BaseAgent:
+  ) -> tuple[BaseAgent, Optional[App]]:
+    """Returns the (agent_for_eval, app) pair for the given module.
+
+    If the module exposes an `App` instance via `agent.app`, that App is
+    returned alongside the agent to evaluate, so `app.plugins`, context-cache,
+    and resumability configs participate in the eval run. Otherwise `app` is
+    None and only the bare agent is returned. When `agent_name` is provided,
+    the returned agent is the corresponding sub-agent, but the App (if any) is
+    still surfaced so its application-wide configuration is honored.
+    """
     module_path = f"{module_name}"
     agent_module = importlib.import_module(module_path)
 
@@ -510,12 +549,16 @@ class AgentEvaluator:
           " get_agent_async method."
       )
 
+    app = getattr(agent_module_with_agent, "app", None)
+    if not isinstance(app, App):
+      app = None
+
     agent_for_eval = root_agent
     if agent_name:
       agent_for_eval = root_agent.find_agent(agent_name)
       assert agent_for_eval, f"Sub-Agent `{agent_name}` not found."
 
-    return agent_for_eval
+    return agent_for_eval, app
 
   @staticmethod
   def _get_eval_sets_manager(
@@ -542,6 +585,9 @@ class AgentEvaluator:
       eval_metrics: list[EvalMetric],
       num_runs: int,
       user_simulator_provider: UserSimulatorProvider,
+      live_model_config: Optional[LiveModelConfig] = None,
+      artifact_service: Optional[BaseArtifactService] = None,
+      app: Optional[App] = None,
   ) -> dict[str, list[EvalCaseResult]]:
     """Returns EvalCaseResults grouped by eval case id.
 
@@ -566,13 +612,23 @@ class AgentEvaluator:
             app_name=app_name, eval_set=eval_set
         ),
         user_simulator_provider=user_simulator_provider,
+        artifact_service=artifact_service,
+        app=app,
     )
+
+    if live_model_config:
+      inference_config = InferenceConfig(
+          use_live=True,
+          live_timeout_seconds=live_model_config.timeout_seconds,
+      )
+    else:
+      inference_config = InferenceConfig(use_live=False)
 
     inference_requests = [
         InferenceRequest(
             app_name=app_name,
             eval_set_id=eval_set.eval_set_id,
-            inference_config=InferenceConfig(),
+            inference_config=inference_config,
         )
     ] * num_runs  # Repeat inference request num_runs times.
 
