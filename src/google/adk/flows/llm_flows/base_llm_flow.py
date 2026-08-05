@@ -591,10 +591,15 @@ class BaseLlmFlow(ABC):
     llm_request.model = agent.canonical_live_model.model
 
     llm = self.__get_llm(invocation_context)
+    # Only log non-sensitive request metadata. The full request carries the
+    # user conversation and http_options.headers, which may hold credentials.
     logger.debug(
-        'Establishing live connection for agent: %s with llm request: %s',
+        'Establishing live connection for agent: %s, model: %s, contents: %s,'
+        ' response modalities: %s',
         agent.name,
-        llm_request,
+        llm_request.model,
+        len(llm_request.contents),
+        llm_request.live_connect_config.response_modalities,
     )
 
     attempt = 1
