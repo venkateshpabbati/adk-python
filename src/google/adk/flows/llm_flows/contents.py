@@ -189,6 +189,67 @@ def _rearrange_events_for_async_function_responses_in_history(
   return result_events
 
 
+def _drop_orphaned_function_responses(
+    events: list[Event],
+) -> list[Event]:
+  """Drops function_response parts that have no matching function_call.
+
+  An orphan can reach this point when the producer of the call is gone, for
+  example a session edited by hand or a history stitched together from more
+  than one source. Left in place, the same orphan behaves differently
+  depending on where it sits: mid-history it is quietly discarded, while as
+  the trailing event it aborts the whole request. Pruning it here makes the
+  outcome the same wherever it appears, and keeps unpaired results from being
+  forwarded to providers that reject them.
+
+  Responses without an id are left alone: ids are stripped on the way out for
+  some model families, so a missing id does not imply a missing call.
+
+  Args:
+    events: The events being assembled into request contents.
+
+  Returns:
+    The events with orphaned function_response parts removed.
+  """
+  call_ids = set()
+  for event in events:
+    for function_call in event.get_function_calls():
+      if function_call.id:
+        call_ids.add(function_call.id)
+
+  orphaned_ids: list[str] = []
+  result_events: list[Event] = []
+  for event in events:
+    parts = event.content.parts if event.content else None
+    if not parts or not event.get_function_responses():
+      result_events.append(event)
+      continue
+
+    kept_parts: list[types.Part] = []
+    for part in parts:
+      response = part.function_response
+      if response and response.id and response.id not in call_ids:
+        orphaned_ids.append(response.id)
+        continue
+      kept_parts.append(part)
+
+    if not kept_parts:
+      continue
+    if len(kept_parts) != len(parts):
+      event = event.model_copy(deep=True)
+      if event.content:
+        event.content.parts = kept_parts
+    result_events.append(event)
+
+  if orphaned_ids:
+    logger.warning(
+        'Dropping function responses with no matching function call: %s',
+        orphaned_ids,
+    )
+
+  return result_events
+
+
 def _rearrange_events_for_latest_function_response(
     events: list[Event],
 ) -> list[Event]:
@@ -841,6 +902,7 @@ def _get_contents(
       filtered_events.append(event)
 
   # Rearrange events for proper function call/response pairing
+  filtered_events = _drop_orphaned_function_responses(filtered_events)
   result_events = _rearrange_events_for_latest_function_response(
       filtered_events
   )
