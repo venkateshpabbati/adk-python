@@ -133,12 +133,12 @@ def _is_live_request_queue_annotation(param: inspect.Parameter) -> bool:
 
 def _normalize_tool_result(function_result: object) -> dict[str, Any]:
   """Normalizes a dynamic tool result to the documented callback shape."""
-  if isinstance(function_result, dict) and all(
-      isinstance(key, str) for key in function_result
-  ):
-    # The key check above establishes the only invariant not represented by
-    # ``isinstance(result, dict)``. Values are intentionally dynamic because
-    # user-defined tools may return any JSON-serializable value.
+  if isinstance(function_result, dict):
+    # Keys are deliberately not checked. A tool returning a dict with
+    # non-string keys was always passed through unchanged; rejecting it here
+    # would silently rewrap it as {'result': ...} and change what the model
+    # sees. Values are dynamic because user-defined tools may return any
+    # JSON-serializable value.
     return cast(dict[str, Any], function_result)
   return {'result': function_result}
 
