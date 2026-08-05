@@ -293,18 +293,28 @@ def _is_part_invisible(
   A part is invisible if:
   - It has no meaningful content (text, inline_data, file_data, function_call,
     function_response, executable_code, or code_execution_result), OR
-  - It is marked as a thought AND does not contain function_call or
-    function_response
+  - It is marked as a thought AND does not contain function_call,
+    function_response or thought_signature
 
   Function calls and responses are never invisible, even if marked as thought,
   because they represent actions that need to be executed or results that need
   to be processed.
+
+  A part carrying a thought signature is never invisible either. The signature
+  is opaque state the model expects back verbatim, and it commonly arrives on
+  a part that holds nothing else, which would otherwise read as empty.
 
   Args:
     p: The part to check.
   """
   # Function calls and responses are never invisible, even if marked as thought
   if p.function_call or p.function_response:
+    return False
+
+  # A thought signature is opaque state the model hands back for us to return
+  # verbatim on the next request. It routinely arrives on a part with no other
+  # content at all, so it has to be checked before the emptiness test below.
+  if p.thought_signature:
     return False
 
   return (p.thought and not include_thoughts) or not (
