@@ -757,12 +757,15 @@ class BaseLlmFlow(ABC):
                   async with Aclosing(agent_to_run.run_live(child_ctx)) as agen:
                     async for item in agen:
                       yield item
-                if (
-                    event.content
-                    and event.content.parts
-                    and event.content.parts[0].function_response
-                    and event.content.parts[0].function_response.name
-                    == 'task_completed'
+                # `task_completed` is an ordinary tool, so the model may call
+                # it alongside others. Their responses are merged into a single
+                # event in call order, so scan every response rather than only
+                # `parts[0]`. Unlike agent transfer there is no corresponding
+                # action to key off, since `task_completed` only signals
+                # completion through its function response.
+                if any(
+                    function_response.name == 'task_completed'
+                    for function_response in event.get_function_responses()
                 ):
                   # this is used for sequential agent to signal the end of the agent.
                   await asyncio.sleep(DEFAULT_TASK_COMPLETION_DELAY)
