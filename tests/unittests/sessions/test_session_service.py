@@ -45,6 +45,7 @@ from sqlalchemy import delete
 from sqlalchemy import select
 from sqlalchemy import text
 from sqlalchemy import update
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -2234,6 +2235,48 @@ async def test_database_session_service_requires_one_argument():
     DatabaseSessionService(
         db_url='sqlite+aiosqlite:///:memory:', db_engine=engine
     )
+
+
+@pytest.mark.parametrize(
+    'raised_error',
+    [
+        RuntimeError('boom'),
+        ArgumentError('bad argument'),
+        ImportError('no driver'),
+    ],
+)
+def test_database_session_service_engine_error_hides_password(raised_error):
+  """Engine creation errors must not put the DB password in the message."""
+  password = 'sup3r-s3cret'
+  db_url = f'postgresql+asyncpg://user:{password}@localhost:5432/db'
+
+  with mock.patch.object(
+      database_session_service,
+      'create_async_engine',
+      side_effect=raised_error,
+  ):
+    with pytest.raises(ValueError) as exc_info:
+      DatabaseSessionService(db_url)
+
+  message = str(exc_info.value)
+  assert password not in message
+  # The redacted URL is still there, so the error stays diagnosable.
+  assert 'postgresql+asyncpg://user:***@localhost:5432/db' in message
+
+
+def test_database_session_service_malformed_url_reports_usable_error():
+  """A URL too malformed to parse still yields a usable, leak-free error."""
+  # make_url() itself rejects this, so redaction cannot parse it either and
+  # must fall back to a placeholder rather than echoing the raw string.
+  db_url = 'definitely not a url sup3r-s3cret'
+
+  with pytest.raises(ValueError) as exc_info:
+    DatabaseSessionService(db_url)
+
+  message = str(exc_info.value)
+  assert 'sup3r-s3cret' not in message
+  assert 'Invalid database URL format or argument' in message
+  assert isinstance(exc_info.value.__cause__, ArgumentError)
 
 
 @pytest.mark.asyncio
