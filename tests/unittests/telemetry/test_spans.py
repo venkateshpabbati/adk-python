@@ -32,13 +32,17 @@ from google.adk.telemetry._experimental_semconv import _safe_json_serialize_no_w
 from google.adk.telemetry.tracing import _use_extra_generate_content_attributes
 from google.adk.telemetry.tracing import ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS
 from google.adk.telemetry.tracing import GCP_MCP_SERVER_DESTINATION_ID
+from google.adk.telemetry.tracing import GenerateContentSpan
+from google.adk.telemetry.tracing import resolve_error_type
 from google.adk.telemetry.tracing import safe_json_serialize
 from google.adk.telemetry.tracing import trace_agent_invocation
 from google.adk.telemetry.tracing import trace_call_llm
+from google.adk.telemetry.tracing import trace_generate_content_result
 from google.adk.telemetry.tracing import trace_inference_result
 from google.adk.telemetry.tracing import trace_merged_tool_calls
 from google.adk.telemetry.tracing import trace_send_data
 from google.adk.telemetry.tracing import trace_tool_call
+from google.adk.telemetry.tracing import use_generate_content_span
 from google.adk.telemetry.tracing import use_inference_span
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
@@ -2295,3 +2299,237 @@ def test_safe_json_serialize_non_serializable_fallback():
   """Objects that are neither JSON-native nor Pydantic fall back gracefully."""
   result = safe_json_serialize({'value': object()})
   assert '<not serializable>' in result
+
+
+# ---------------------------------------------------------------------------
+# resolve_error_type precedence.
+#
+# The three individual branches are exercised through ``trace_tool_call``
+# above; what is pinned here is which one wins when more than one applies.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_error_type_prefers_a_pre_classified_type_over_the_status():
+  """An ADK-classified type outranks the HTTP status: it is the higher
+
+  resolution label, and the status is only a fallback for SDK errors that
+  collapse every 4xx into one class.
+  """
+  error = genai_errors.ClientError(429, {'error': {'code': 429}})
+  error.error_type = 'QUOTA_EXHAUSTED'
+
+  assert resolve_error_type(error) == 'QUOTA_EXHAUSTED'
+
+
+def test_resolve_error_type_stringifies_a_non_string_classification():
+  """``error.type`` is a string span attribute, so a numeric classification
+
+  has to be coerced rather than handed to OTel as an int.
+  """
+  error = ToolExecutionError(message='boom')
+  error.error_type = 500
+
+  assert resolve_error_type(error) == '500'
+
+
+# ---------------------------------------------------------------------------
+# GenerateContentSpan.
+# ---------------------------------------------------------------------------
+
+
+def test_generate_content_span_attribute_stores_are_per_instance(
+    mock_span_fixture,
+):
+  """Each inference call accumulates its own experimental-semconv attributes;
+
+  sharing the dicts across instances would leak one call's prompt/response
+  attributes onto the next.
+  """
+  first = GenerateContentSpan(mock_span_fixture)
+  second = GenerateContentSpan(mock_span_fixture)
+
+  first.operation_details_attributes['some_key'] = 'some_value'
+  first.operation_details_common_attributes['other_key'] = 'other_value'
+
+  assert first.span is mock_span_fixture
+  assert second.operation_details_attributes == {}
+  assert second.operation_details_common_attributes == {}
+
+
+# ---------------------------------------------------------------------------
+# The deprecated use_generate_content_span / trace_generate_content_result
+# pair, kept until callers move to use_inference_span /
+# trace_inference_result.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+@mock.patch('google.adk.telemetry.tracing.tracer')
+@mock.patch(
+    'google.adk.telemetry.tracing._guess_gemini_system_name',
+    return_value='test_system',
+)
+async def test_use_generate_content_span_yields_the_bare_span(
+    mock_guess_system_name,
+    mock_tracer,
+    mock_otel_logger,
+    monkeypatch,
+):
+  """The deprecated manager yields the raw OTel span rather than the
+
+  ``GenerateContentSpan`` its replacement yields, because its result helper
+  takes a plain span.
+  """
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._instrumented_with_opentelemetry_instrumentation_google_genai',
+      lambda: False,
+  )
+  agent = LlmAgent(name='test_agent', model='not-a-gemini-model')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(
+      model='some-model',
+      contents=[types.Content(role='user', parts=[types.Part(text='Hello')])],
+  )
+  model_response_event = mock.MagicMock()
+  model_response_event.id = 'event-123'
+
+  mock_span = (
+      mock_tracer.start_as_current_span.return_value.__enter__.return_value
+  )
+
+  with use_generate_content_span(
+      llm_request, invocation_context, model_response_event
+  ) as span:
+    assert span is mock_span
+
+  mock_tracer.start_as_current_span.assert_called_once_with(
+      'generate_content some-model'
+  )
+  mock_span.set_attribute.assert_any_call(GEN_AI_SYSTEM, 'test_system')
+  mock_span.set_attribute.assert_any_call(
+      GEN_AI_OPERATION_NAME, 'generate_content'
+  )
+  mock_span.set_attribute.assert_any_call(GEN_AI_REQUEST_MODEL, 'some-model')
+  mock_span.set_attributes.assert_any_call({
+      GEN_AI_AGENT_NAME: 'test_agent',
+      GEN_AI_CONVERSATION_ID: invocation_context.session.id,
+      'gcp.vertex.agent.event_id': 'event-123',
+      'gcp.vertex.agent.invocation_id': invocation_context.invocation_id,
+  })
+
+
+@pytest.mark.asyncio
+@mock.patch(
+    'google.adk.telemetry.tracing._use_extra_generate_content_attributes'
+)
+async def test_use_generate_content_span_delegates_to_the_genai_instrumentor(
+    mock_use_extra,
+    monkeypatch,
+):
+  """With the genai instrumentation library wrapping a Gemini call, the span
+
+  belongs to that library: nothing is yielded, and the ADK attributes are
+  only stashed on the context for the library to pick up.
+  """
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._instrumented_with_opentelemetry_instrumentation_google_genai',
+      lambda: True,
+  )
+  agent = LlmAgent(name='test_agent', model='gemini-1.5-pro')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(model='gemini-1.5-pro')
+  model_response_event = mock.MagicMock()
+  model_response_event.id = 'event-123'
+
+  with use_generate_content_span(
+      llm_request, invocation_context, model_response_event
+  ) as span:
+    assert span is None
+
+  mock_use_extra.assert_called_once()
+  (common_attributes,) = mock_use_extra.call_args.args
+  assert common_attributes == {
+      GEN_AI_AGENT_NAME: 'test_agent',
+      GEN_AI_CONVERSATION_ID: invocation_context.session.id,
+      'gcp.vertex.agent.event_id': 'event-123',
+      'gcp.vertex.agent.invocation_id': invocation_context.invocation_id,
+  }
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+@mock.patch(
+    'google.adk.telemetry.tracing._guess_gemini_system_name',
+    return_value='test_system',
+)
+def test_trace_generate_content_result_records_outcome_and_choice_log(
+    mock_guess_system_name,
+    mock_otel_logger,
+    mock_span_fixture,
+):
+  """The finish reason is lower-cased into a list (semconv allows several)
+
+  and the token usage lands on the span, alongside a choice log record.
+  """
+  llm_response = LlmResponse(
+      content=types.Content(role='model', parts=[types.Part(text='hi')]),
+      finish_reason=types.FinishReason.STOP,
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          prompt_token_count=10,
+          candidates_token_count=20,
+      ),
+  )
+
+  trace_generate_content_result(mock_span_fixture, llm_response)
+
+  mock_span_fixture.set_attribute.assert_called_once_with(
+      GEN_AI_RESPONSE_FINISH_REASONS, ['stop']
+  )
+  mock_span_fixture.set_attributes.assert_called_once_with({
+      GEN_AI_USAGE_INPUT_TOKENS: 10,
+      GEN_AI_USAGE_OUTPUT_TOKENS: 20,
+  })
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert log_record.event_name == 'gen_ai.choice'
+  assert log_record.attributes == {GEN_AI_SYSTEM: 'test_system'}
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_generate_content_result_skips_a_partial_response(
+    mock_otel_logger,
+    mock_span_fixture,
+):
+  """A partial streaming chunk is not the operation's result.
+
+  Recording it would emit a choice log per chunk and report a finish reason for
+  a call that has not finished.
+  """
+  llm_response = LlmResponse(
+      partial=True,
+      finish_reason=types.FinishReason.STOP,
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          prompt_token_count=10,
+          candidates_token_count=20,
+      ),
+  )
+
+  trace_generate_content_result(mock_span_fixture, llm_response)
+
+  mock_span_fixture.set_attribute.assert_not_called()
+  mock_span_fixture.set_attributes.assert_not_called()
+  mock_otel_logger.emit.assert_not_called()
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_generate_content_result_without_a_span_emits_nothing(
+    mock_otel_logger,
+):
+  """No span means the inference was not traced at all, so the choice log
+
+  would be an orphan; it must be suppressed too.
+  """
+  trace_generate_content_result(
+      None, LlmResponse(finish_reason=types.FinishReason.STOP)
+  )
+
+  mock_otel_logger.emit.assert_not_called()

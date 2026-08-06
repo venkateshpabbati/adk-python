@@ -2278,3 +2278,57 @@ def test_tool_call_doesnt_mutate_job_labels(tool_call):
     # Test job_labels remain unchanged after tool call
     assert settings.job_labels == original_labels
     assert "adk-bigquery-tool" not in settings.job_labels
+
+
+def test_get_execute_sql_blocked_mode_returns_the_read_only_tool():
+  """Read-only mode needs no customization, so the original tool is reused."""
+  settings = BigQueryToolConfig(write_mode=WriteMode.BLOCKED)
+  assert query_tool.get_execute_sql(settings) is query_tool.execute_sql
+
+
+def test_get_execute_sql_without_settings_returns_the_read_only_tool():
+  assert query_tool.get_execute_sql(None) is query_tool.execute_sql
+
+
+def test_get_execute_sql_protected_mode_swaps_in_the_protected_docstring():
+  # The docstring is what the model is shown as the tool contract, so each
+  # write mode has to advertise its own.
+  tool = query_tool.get_execute_sql(
+      BigQueryToolConfig(write_mode=WriteMode.PROTECTED)
+  )
+  assert tool.__doc__ == query_tool._execute_sql_protected_write_mode.__doc__
+  assert tool.__name__ == "execute_sql"
+
+
+def test_get_execute_sql_allowed_mode_swaps_in_the_write_docstring():
+  tool = query_tool.get_execute_sql(
+      BigQueryToolConfig(write_mode=WriteMode.ALLOWED)
+  )
+  assert tool.__doc__ == query_tool._execute_sql_write_mode.__doc__
+  assert tool.__name__ == "execute_sql"
+
+
+def test_get_execute_sql_does_not_mutate_the_shared_read_only_tool():
+  """Customizing one toolset must not rewrite the module-level function."""
+  query_tool.get_execute_sql(BigQueryToolConfig(write_mode=WriteMode.ALLOWED))
+
+  # The shared read-only tool must keep advertising read-only semantics to
+  # every other toolset that uses it.
+  assert (
+      query_tool.execute_sql.__doc__
+      != query_tool._execute_sql_write_mode.__doc__
+  )
+  assert (
+      query_tool.execute_sql.__doc__
+      != query_tool._execute_sql_protected_write_mode.__doc__
+  )
+
+
+def test_get_execute_sql_write_modes_get_distinct_docstrings():
+  protected = query_tool.get_execute_sql(
+      BigQueryToolConfig(write_mode=WriteMode.PROTECTED)
+  )
+  allowed = query_tool.get_execute_sql(
+      BigQueryToolConfig(write_mode=WriteMode.ALLOWED)
+  )
+  assert protected.__doc__ != allowed.__doc__

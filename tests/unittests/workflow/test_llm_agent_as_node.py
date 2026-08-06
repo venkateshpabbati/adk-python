@@ -1543,3 +1543,107 @@ async def test_drain_pending_tool_response_events_yields_confirmation_then_fr():
       == REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
   )
   assert drained[1].get_function_responses()[0].name == 'echo'
+
+
+# --- process_llm_agent_output ---
+
+
+def _output_model_event(*parts: types.Part, **kwargs: Any) -> Event:
+  return Event(
+      invocation_id='inv',
+      author='test_agent',
+      content=types.Content(role='model', parts=list(parts)),
+      **kwargs,
+  )
+
+
+def _bare_ctx() -> Context:
+  """A Context that only needs to carry actions for output processing."""
+  from unittest.mock import MagicMock
+
+  ctx = MagicMock(spec=Context)
+  ctx.actions = EventActions()
+  return ctx
+
+
+def test_process_llm_agent_output_drops_thought_parts_from_the_output():
+  """Thought parts are model reasoning, not part of the node's answer."""
+  from google.adk.workflow._llm_agent_wrapper import process_llm_agent_output
+
+  agent = _make_agent(output_key='answer')
+  ctx = _bare_ctx()
+  event = _output_model_event(
+      types.Part(text='thinking out loud', thought=True),
+      types.Part(text='the '),
+      types.Part(text='answer'),
+  )
+
+  process_llm_agent_output(agent, ctx, event)
+
+  assert event.output == 'the answer'
+  assert event.node_info.message_as_output is True
+  assert ctx.actions.state_delta == {'answer': 'the answer'}
+
+
+def test_process_llm_agent_output_skips_events_carrying_function_calls():
+  """A tool call is mid-turn work, not the agent's output."""
+  from google.adk.workflow._llm_agent_wrapper import process_llm_agent_output
+
+  agent = _make_agent(output_key='answer')
+  ctx = _bare_ctx()
+  event = _output_model_event(
+      types.Part(
+          function_call=types.FunctionCall(name='some_tool', args={}, id='fc-1')
+      )
+  )
+
+  process_llm_agent_output(agent, ctx, event)
+
+  assert event.output is None
+  assert not event.node_info.message_as_output
+  assert ctx.actions.state_delta == {}
+
+
+def test_process_llm_agent_output_skips_partial_events():
+  """Streaming chunks must not each be treated as the finished output."""
+  from google.adk.workflow._llm_agent_wrapper import process_llm_agent_output
+
+  agent = _make_agent(output_key='answer')
+  ctx = _bare_ctx()
+  event = _output_model_event(types.Part(text='half of an ans'), partial=True)
+
+  process_llm_agent_output(agent, ctx, event)
+
+  assert event.output is None
+  assert not event.node_info.message_as_output
+  assert ctx.actions.state_delta == {}
+
+
+def test_process_llm_agent_output_parses_text_against_the_output_schema():
+  """With an output_schema the text is parsed, not stored as a raw string."""
+  from google.adk.workflow._llm_agent_wrapper import process_llm_agent_output
+
+  agent = _make_agent(output_schema=StoryOutput, output_key='story')
+  ctx = _bare_ctx()
+  event = _output_model_event(
+      types.Part(text='{"title": "T", "content": "C"}'),
+  )
+
+  process_llm_agent_output(agent, ctx, event)
+
+  assert event.output == {'title': 'T', 'content': 'C'}
+  assert ctx.actions.state_delta == {'story': {'title': 'T', 'content': 'C'}}
+
+
+def test_process_llm_agent_output_blank_schema_response_writes_no_state():
+  """An empty response cannot satisfy the schema, so nothing is stored."""
+  from google.adk.workflow._llm_agent_wrapper import process_llm_agent_output
+
+  agent = _make_agent(output_schema=StoryOutput, output_key='story')
+  ctx = _bare_ctx()
+  event = _output_model_event(types.Part(text='   '))
+
+  process_llm_agent_output(agent, ctx, event)
+
+  assert event.output is None
+  assert ctx.actions.state_delta == {}

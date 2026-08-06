@@ -2392,3 +2392,103 @@ async def test_get_session_orders_tied_timestamps_by_id(
       await service.close()
 
   assert [event.id for event in retrieved_session.events] == event_ids
+
+
+def test_delete_session_sync_removes_only_the_targeted_users_session():
+  """Deleting is scoped to one (app, user, session) triple."""
+  service = InMemorySessionService()
+  app_name = 'my_app'
+  service.create_session_sync(app_name=app_name, user_id='u1', session_id='s1')
+  service.create_session_sync(app_name=app_name, user_id='u2', session_id='s1')
+
+  service.delete_session_sync(app_name=app_name, user_id='u1', session_id='s1')
+
+  assert (
+      service.get_session_sync(app_name=app_name, user_id='u1', session_id='s1')
+      is None
+  )
+  other_user_session = service.get_session_sync(
+      app_name=app_name, user_id='u2', session_id='s1'
+  )
+  assert other_user_session is not None
+  assert other_user_session.id == 's1'
+
+
+def test_delete_session_sync_unknown_session_is_a_noop():
+  """Deleting something that is not stored leaves the store untouched."""
+  service = InMemorySessionService()
+  app_name = 'my_app'
+  service.create_session_sync(app_name=app_name, user_id='u1', session_id='s1')
+
+  service.delete_session_sync(
+      app_name=app_name, user_id='u1', session_id='unknown_session'
+  )
+  service.delete_session_sync(
+      app_name=app_name, user_id='unknown_user', session_id='s1'
+  )
+  service.delete_session_sync(
+      app_name='unknown_app', user_id='u1', session_id='s1'
+  )
+
+  assert (
+      service.get_session_sync(app_name=app_name, user_id='u1', session_id='s1')
+      is not None
+  )
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_sync_strips_events_and_merges_scoped_state():
+  """Listed sessions carry merged app/user state but never their events."""
+  service = InMemorySessionService()
+  app_name = 'my_app'
+  session = await service.create_session(
+      app_name=app_name,
+      user_id='u1',
+      session_id='s1',
+      state={
+          'app:a': 'av',
+          'user:u': 'uv',
+          'sk': 'sv',
+          'temp:t': 'tv',
+      },
+  )
+  await service.append_event(
+      session=session,
+      event=Event(
+          invocation_id='inv1',
+          author='user',
+          actions=EventActions(state_delta={'sk2': 'sv2'}),
+      ),
+  )
+
+  response = service.list_sessions_sync(app_name=app_name, user_id='u1')
+
+  assert [s.id for s in response.sessions] == ['s1']
+  listed = response.sessions[0]
+  # Events are deliberately dropped from the listing.
+  assert listed.events == []
+  # app: and user: values are merged back in under their prefixes, session
+  # state is kept as-is, and temp: state is never stored.
+  assert listed.state == {
+      'app:a': 'av',
+      'user:u': 'uv',
+      'sk': 'sv',
+      'sk2': 'sv2',
+  }
+
+
+def test_list_sessions_sync_unknown_app_or_user_returns_empty_response():
+  """Listing an unknown app or user yields a response with no sessions."""
+  service = InMemorySessionService()
+  service.create_session_sync(app_name='my_app', user_id='u1', session_id='s1')
+
+  assert service.list_sessions_sync(app_name='unknown_app').sessions == []
+  assert (
+      service.list_sessions_sync(
+          app_name='my_app', user_id='unknown_user'
+      ).sessions
+      == []
+  )
+  assert [
+      s.id for s in service.list_sessions_sync(app_name='my_app').sessions
+  ] == ['s1']

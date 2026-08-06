@@ -3222,3 +3222,37 @@ def test_claude_vertex_error_explains_direct_anthropic_alternative(monkeypatch):
   # export.
   assert "AnthropicLlm" not in message
   assert "anthropic_llm" not in message
+
+
+@pytest.mark.parametrize(
+    "adk_role,expected_claude_role",
+    [
+        ("model", "assistant"),
+        ("assistant", "assistant"),
+        ("user", "user"),
+        # Tool results arrive on a non-model role; Claude only accepts them
+        # inside a user turn, so everything that is not the model maps to
+        # "user" rather than being passed through.
+        ("function", "user"),
+        ("tool", "user"),
+        ("", "user"),
+        (None, "user"),
+    ],
+)
+def test_to_claude_role_collapses_roles_to_user_or_assistant(
+    adk_role, expected_claude_role
+):
+  """Claude only has two roles; only the model turn becomes "assistant"."""
+  assert anthropic_llm.to_claude_role(adk_role) == expected_claude_role
+
+
+def test_anthropic_config_allows_thinking_budget_without_thinking_level():
+  """The thinking_level guard must not reject a plain thinking_budget."""
+  config = AnthropicGenerateContentConfig(
+      effort="high",
+      thinking_config=types.ThinkingConfig(thinking_budget=2048),
+  )
+
+  assert config.effort == "high"
+  assert config.thinking_config.thinking_budget == 2048
+  assert config.thinking_config.thinking_level is None
