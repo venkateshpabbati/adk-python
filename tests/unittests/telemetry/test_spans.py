@@ -23,6 +23,7 @@ from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.errors.tool_execution_error import ToolErrorType
 from google.adk.errors.tool_execution_error import ToolExecutionError
+from google.adk.events.event import Event
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
@@ -69,17 +70,6 @@ except ImportError:
   GEN_AI_TOOL_DEFINITIONS = 'gen_ai.tool.definitions'
 
 
-class Event:
-
-  def __init__(self, event_id: str, event_content: object):
-    self.id = event_id
-    self.content = event_content
-
-  def model_dumps_json(self, exclude_none: bool = False) -> str:
-    # This is just a stub for the spec. The mock will provide behavior.
-    return ''
-
-
 # Create a minimal concrete BaseTool for testing
 class SimpleTestTool(BaseTool):
 
@@ -104,14 +94,7 @@ def mock_tool_fixture():
 
 @pytest.fixture
 def mock_event_fixture():
-  event_mock = mock.create_autospec(Event, instance=True)
-  event_mock.id = 'test_event_id'
-  event_mock.model_dumps_json.return_value = (
-      '{"default_event_key": "default_event_value"}'
-  )
-  event_mock.content = mock.MagicMock()
-  event_mock.content.parts = []
-  return event_mock
+  return Event(id='test_event_id', author='test_agent')
 
 
 async def _create_invocation_context(
@@ -646,16 +629,25 @@ def test_trace_merged_tool_calls_sets_correct_attributes(
   )
 
   test_response_event_id = 'merged_evt_id_001'
-  custom_event_json_output = (
-      '{"custom_event_payload": true, "details": "merged_details"}'
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_003',
+                  name='test_function_1',
+                  response={'data': 'merged_details'},
+              )
+          ),
+      ],
   )
-  mock_event_fixture.model_dumps_json.return_value = custom_event_json_output
 
   trace_merged_tool_calls(
       response_event_id=test_response_event_id,
       function_response_event=mock_event_fixture,
   )
 
+  expected_event_json = mock_event_fixture.model_dump_json(exclude_none=True)
   expected_calls = [
       mock.call('gen_ai.operation.name', 'execute_tool'),
       mock.call('gen_ai.tool.name', '(merged tools)'),
@@ -663,7 +655,7 @@ def test_trace_merged_tool_calls_sets_correct_attributes(
       mock.call('gen_ai.tool.call.id', test_response_event_id),
       mock.call('gcp.vertex.agent.tool_call_args', 'N/A'),
       mock.call('gcp.vertex.agent.event_id', test_response_event_id),
-      mock.call('gcp.vertex.agent.tool_response', custom_event_json_output),
+      mock.call('gcp.vertex.agent.tool_response', expected_event_json),
       mock.call('gcp.vertex.agent.llm_request', '{}'),
       mock.call('gcp.vertex.agent.llm_response', '{}'),
   ]
@@ -672,7 +664,80 @@ def test_trace_merged_tool_calls_sets_correct_attributes(
   mock_span_fixture.set_attribute.assert_has_calls(
       expected_calls, any_order=True
   )
-  mock_event_fixture.model_dumps_json.assert_called_once_with(exclude_none=True)
+  # The merged response must be the real serialized event, not the
+  # "<not serializable>" fallback.
+  recorded_response = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.tool_response'
+  )
+  parsed = json.loads(recorded_response)
+  assert parsed['id'] == 'test_event_id'
+  assert 'merged_details' in recorded_response
+
+
+def test_trace_tool_call_skips_non_recording_span(
+    monkeypatch, mock_tool_fixture, mock_event_fixture
+):
+  span = mock.MagicMock()
+  span.is_recording.return_value = False
+  get_telemetry_config = mock.Mock()
+  serialize = mock.Mock(return_value='{}')
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._telemetry_config_from_invocation_context',
+      get_telemetry_config,
+  )
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing.safe_json_serialize', serialize
+  )
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_004',
+                  name='test_function_1',
+                  response={'data': 'structured_data'},
+              )
+          ),
+      ],
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={'query': 'details'},
+      function_response_event=mock_event_fixture,
+      span=span,
+  )
+
+  get_telemetry_config.assert_not_called()
+  serialize.assert_not_called()
+  span.set_attribute.assert_not_called()
+
+
+def test_trace_merged_tool_calls_skips_non_recording_span(
+    monkeypatch, mock_event_fixture
+):
+  span = mock.MagicMock()
+  span.is_recording.return_value = False
+  monkeypatch.setattr('opentelemetry.trace.get_current_span', lambda: span)
+  get_telemetry_config = mock.Mock()
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._telemetry_config_from_invocation_context',
+      get_telemetry_config,
+  )
+
+  with mock.patch.object(
+      Event, 'model_dump_json', autospec=True
+  ) as serialize_event:
+    trace_merged_tool_calls(
+        response_event_id='merged_evt_id_002',
+        function_response_event=mock_event_fixture,
+    )
+
+  get_telemetry_config.assert_not_called()
+  serialize_event.assert_not_called()
+  span.set_attribute.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -794,10 +859,6 @@ def test_trace_merged_tool_disabling_request_response_content(
   )
 
   test_response_event_id = 'merged_evt_id_001'
-  custom_event_json_output = (
-      '{"custom_event_payload": true, "details": "merged_details"}'
-  )
-  mock_event_fixture.model_dumps_json.return_value = custom_event_json_output
 
   # Act
   trace_merged_tool_calls(
