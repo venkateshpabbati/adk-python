@@ -45,6 +45,17 @@ import httpx
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def placeholder_anthropic_api_key(monkeypatch):
+  """Keeps client construction off whatever credential this machine has.
+
+  Patching `_anthropic_client` evaluates the cached property, which builds a
+  real client, so the tests below need some credential resolvable - and it
+  must be this placeholder rather than a developer's own key.
+  """
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-not-a-real-key")
+
+
 @pytest.fixture
 def generate_content_response():
   return anthropic_types.Message(
@@ -3091,3 +3102,123 @@ async def test_streaming_wraps_anthropic_rate_limit_error():
 
   assert "docs.anthropic.com/en/api/errors#http-errors" in str(excinfo.value)
   assert "rate limited" in str(excinfo.value)
+
+
+@pytest.fixture
+def no_anthropic_credentials(
+    placeholder_anthropic_api_key, monkeypatch, tmp_path
+):
+  """An environment where the Anthropic SDK can resolve no credential at all.
+
+  Clears every credential environment variable the SDK reads and points the
+  home directory at an empty one, so a developer who happens to be signed in
+  on this machine does not make these tests pass or fail by accident. Takes
+  the placeholder-key fixture as an argument only to run after it, undoing it.
+  """
+  del placeholder_anthropic_api_key
+  for name in (
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_PROFILE",
+      "ANTHROPIC_CONFIG_DIR",
+      "ANTHROPIC_IDENTITY_TOKEN",
+      "ANTHROPIC_IDENTITY_TOKEN_FILE",
+      "ANTHROPIC_FEDERATION_RULE_ID",
+      "ANTHROPIC_ORGANIZATION_ID",
+  ):
+    monkeypatch.delenv(name, raising=False)
+  for name in ("HOME", "USERPROFILE", "APPDATA"):
+    monkeypatch.setenv(name, str(tmp_path))
+
+
+def test_anthropic_client_raises_when_sdk_resolves_no_credential(
+    no_anthropic_credentials,
+):
+  """A missing credential names the variable instead of failing mid-request."""
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  with pytest.raises(ValueError) as exc_info:
+    _ = llm._anthropic_client
+
+  message = str(exc_info.value)
+  assert "ANTHROPIC_API_KEY" in message
+  assert "export ANTHROPIC_API_KEY=" in message
+
+
+def test_anthropic_client_created_from_api_key_env_var(
+    no_anthropic_credentials, monkeypatch
+):
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-not-a-real-key")
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  assert llm._anthropic_client.api_key
+
+
+def test_anthropic_client_created_from_auth_token_env_var(
+    no_anthropic_credentials, monkeypatch
+):
+  """The SDK also authenticates from a bearer token; do not reject it."""
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "placeholder-not-a-real-token")
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  assert llm._anthropic_client.auth_token
+
+
+def test_anthropic_client_created_from_sdk_credential_provider(
+    no_anthropic_credentials, monkeypatch
+):
+  """A provider-backed credential counts even with no API key or token.
+
+  Workload identity is used here because it needs nothing on disk, but the
+  same path is what a developer signed in through the Anthropic command line
+  gets: the SDK hands back a credential provider, not an API key.
+  """
+  monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "placeholder-rule")
+  monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "placeholder-org")
+  monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN", "placeholder-not-a-real-token")
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  client = llm._anthropic_client
+  assert client.api_key is None
+  assert client.auth_token is None
+  assert client.credentials is not None
+
+
+def test_anthropic_client_accepts_credential_resolved_without_env_vars(
+    no_anthropic_credentials,
+):
+  """Nothing in the environment, yet the SDK resolved a credential anyway.
+
+  This is the on-disk profile case: the client is authenticated, so building
+  it must succeed rather than report a missing key.
+  """
+  resolved_client = mock.Mock(
+      api_key=None, auth_token=None, credentials=mock.Mock()
+  )
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  with mock.patch.object(
+      anthropic_llm, "AsyncAnthropic", return_value=resolved_client
+  ):
+    assert llm._anthropic_client is resolved_client
+
+
+def test_claude_vertex_error_explains_direct_anthropic_alternative(monkeypatch):
+  """The Vertex error says it resolved to Vertex and what to do instead."""
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+  model = Claude(model="claude-3-5-sonnet-v2@20241022")
+
+  with pytest.raises(ValueError) as exc_info:
+    _ = model._anthropic_client
+
+  message = str(exc_info.value)
+  assert "claude-3-5-sonnet-v2@20241022" in message
+  assert "Vertex AI" in message
+  assert "GOOGLE_CLOUD_PROJECT" in message
+  assert "GOOGLE_CLOUD_LOCATION" in message
+  assert "ANTHROPIC_API_KEY" in message
+  # The hint must not send a reader at a symbol the models package does not
+  # export.
+  assert "AnthropicLlm" not in message
+  assert "anthropic_llm" not in message
