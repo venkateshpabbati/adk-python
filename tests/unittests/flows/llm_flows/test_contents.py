@@ -1983,6 +1983,55 @@ def test_recover_compacted_function_calls_uses_latest_sibling_response():
   assert result[2].get_function_responses()[0].response == {"result": "done-2"}
 
 
+def test_get_contents_attributes_compaction_summary_to_current_agent():
+  """A compacted summary is the agent's own history, not another agent's reply.
+
+  The materialized summary must stay a model turn for the requesting agent.
+  Attributing it to a fixed author makes every agent whose name differs treat
+  its own compacted history as foreign and rewrite it into a user-role
+  "For context: [...] said:" turn.
+  """
+  compaction = EventCompaction(
+      start_timestamp=1.0,
+      end_timestamp=2.0,
+      compacted_content=types.Content(
+          role="model", parts=[types.Part(text="summary of earlier turns")]
+      ),
+  )
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          timestamp=1.0,
+          content=types.UserContent("hello"),
+      ),
+      Event(
+          invocation_id="inv1",
+          author="my_agent",
+          timestamp=2.0,
+          content=types.ModelContent("hi there"),
+      ),
+      Event(
+          invocation_id="compacted",
+          author="user",
+          timestamp=2.0,
+          content=compaction.compacted_content,
+          actions=EventActions(compaction=compaction),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="user",
+          timestamp=3.0,
+          content=types.UserContent("and now?"),
+      ),
+  ]
+
+  result = contents._get_contents(None, events, agent_name="my_agent")  # pylint: disable=protected-access
+
+  assert result[0].role == "model"
+  assert result[0].parts[0].text == "summary of earlier turns"
+
+
 def test_get_contents_recovers_compacted_long_running_call_on_resume():
   """A long-running call compacted before resume is restored during assembly.
 

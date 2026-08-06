@@ -517,7 +517,9 @@ def _should_include_event_in_context(
   )
 
 
-def _process_compaction_events(events: list[Event]) -> list[Event]:
+def _process_compaction_events(
+    events: list[Event], agent_name: str = ''
+) -> list[Event]:
   """Processes events by applying compaction.
 
   Identifies compacted ranges and filters out events that are covered by
@@ -525,6 +527,9 @@ def _process_compaction_events(events: list[Event]) -> list[Event]:
 
   Args:
     events: A list of events to process.
+    agent_name: The name of the agent the history is being assembled for. The
+      materialized summary is attributed to it so the agent reads its own
+      compacted history as its own prior turns.
 
   Returns:
     A list of events with compaction applied.
@@ -587,7 +592,7 @@ def _process_compaction_events(events: list[Event]) -> list[Event]:
           i,
           Event(
               timestamp=compaction.end_timestamp,
-              author='model',
+              author=agent_name or 'model',
               content=compaction.compacted_content,
               branch=event.branch,
               invocation_id=event.invocation_id,
@@ -818,7 +823,9 @@ def _get_contents(
   )
 
   if has_compaction_events:
-    events_to_process = _process_compaction_events(raw_filtered_events)
+    events_to_process = _process_compaction_events(
+        raw_filtered_events, agent_name
+    )
     # Compaction may have removed a function_call whose response survives
     # (e.g. a long-running call resumed after it was compacted); restore it so
     # the call/response pairing is intact.
