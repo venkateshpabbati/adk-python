@@ -76,9 +76,14 @@ def _build_basic_request(
   # Preserved across the agent-config overwrite below, then merged back.
   run_config_http_options = llm_request.config.http_options
 
+  generate_content_config = agent.generate_content_config
   llm_request.config = (
-      agent.generate_content_config.model_copy(deep=True)
-      if agent.generate_content_config
+      generate_content_config.model_copy(
+          update={'labels': dict(generate_content_config.labels)}
+          if generate_content_config.labels
+          else {}
+      )
+      if generate_content_config
       else types.GenerateContentConfig()
   )
 

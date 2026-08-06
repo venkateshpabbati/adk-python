@@ -38,6 +38,8 @@ InstructionProvider: TypeAlias = Callable[
     [ReadonlyContext], Union[str, Awaitable[str]]
 ]
 
+_TEMPLATE_VAR_PATTERN = re.compile(r'{+[^{}]*}+')
+
 
 async def inject_session_state(
     template: str,
@@ -139,7 +141,7 @@ async def inject_session_state(
         else:
           raise KeyError(f'Context variable not found: `{var_name}`.')
 
-  return await _async_sub(r'{+[^{}]*}+', _replace_match, template)
+  return await _async_sub(_TEMPLATE_VAR_PATTERN, _replace_match, template)
 
 
 def _is_valid_state_name(var_name):
