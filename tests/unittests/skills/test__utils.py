@@ -14,17 +14,25 @@
 
 """Unit tests for skill utilities."""
 
+import asyncio
 import builtins
 import io
 import sys
+import threading
 from unittest import mock
 import zipfile
 
+from google.adk.skills import _utils
 from google.adk.skills import list_skills_in_dir
+from google.adk.skills import list_skills_in_dir_async as _list_skills_in_dir_async
 from google.adk.skills import list_skills_in_gcs_dir as _list_skills_in_gcs_dir
+from google.adk.skills import list_skills_in_gcs_dir_async as _list_skills_in_gcs_dir_async
 from google.adk.skills import load_skill_from_dir as _load_skill_from_dir
+from google.adk.skills import load_skill_from_dir_async as _load_skill_from_dir_async
 from google.adk.skills import load_skill_from_gcs_dir as _load_skill_from_gcs_dir
+from google.adk.skills import load_skill_from_gcs_dir_async as _load_skill_from_gcs_dir_async
 from google.adk.skills import load_skills_from_dir as _load_skills_from_dir
+from google.adk.skills import load_skills_from_dir_async as _load_skills_from_dir_async
 from google.adk.skills._utils import _load_skill_from_zip_bytes
 from google.adk.skills._utils import _read_skill_properties
 from google.adk.skills._utils import _validate_skill_dir
@@ -434,3 +442,261 @@ def test__load_skills_from_dir_errors(tmp_path):
   file_path.write_text("hello")
   with pytest.raises(ValueError, match="not a directory"):
     _load_skills_from_dir(file_path)
+
+
+# --- Async wrappers --------------------------------------------------------
+
+# Guards the deadlock-style test below: with a correct (off-thread)
+# implementation the handshake completes in milliseconds, so this only ever
+# elapses when the event loop is genuinely blocked.
+_BLOCKED_LOOP_TIMEOUT_SEC = 10
+
+# Each async wrapper and the blocking function it must offload, plus the
+# minimal positional args needed to call it.
+_ASYNC_WRAPPERS = [
+    ("_load_skill_from_dir_async", "_load_skill_from_dir", ("skill-dir",)),
+    ("_load_skills_from_dir_async", "_load_skills_from_dir", ("skills-dir",)),
+    ("_list_skills_in_dir_async", "_list_skills_in_dir", ("skills-dir",)),
+    (
+        "_load_skill_from_gcs_dir_async",
+        "_load_skill_from_gcs_dir",
+        ("my-bucket", "my-skill"),
+    ),
+    (
+        "_list_skills_in_gcs_dir_async",
+        "_list_skills_in_gcs_dir",
+        ("my-bucket",),
+    ),
+]
+
+
+@pytest.mark.parametrize("async_name, sync_name, args", _ASYNC_WRAPPERS)
+async def test_async_wrapper_runs_blocking_call_off_event_loop(
+    monkeypatch, async_name, sync_name, args
+):
+  """Each async wrapper must run its blocking counterpart in a worker thread.
+
+  This is the property that distinguishes these wrappers from a plain
+  ``async def f(): return _sync_f(...)``, which would satisfy every other test
+  in this file while still stalling the caller's event loop.
+  """
+  calls = []
+
+  def _record_thread(*call_args, **call_kwargs):
+    calls.append((threading.get_ident(), call_args, call_kwargs))
+    return "sentinel-result"
+
+  monkeypatch.setattr(_utils, sync_name, _record_thread)
+
+  result = await getattr(_utils, async_name)(*args)
+
+  assert len(calls) == 1
+  thread_id, call_args, _ = calls[0]
+  assert thread_id != threading.get_ident(), (
+      f"{sync_name} ran on the event loop thread; {async_name} must offload it"
+      " to a worker thread"
+  )
+  # The wrapper must forward its arguments through unchanged.
+  assert call_args[: len(args)] == args
+  assert result == "sentinel-result"
+
+
+async def test_async_wrapper_keeps_event_loop_responsive(monkeypatch):
+  """The event loop must keep scheduling tasks while a wrapper is in flight.
+
+  The blocking stand-in can only be released by a coroutine running on the
+  event loop, so an implementation that blocks the loop deadlocks here and
+  fails on the timeout instead of passing silently.
+  """
+  entered = threading.Event()
+  release = threading.Event()
+
+  def _blocking_loader(*args, **kwargs):
+    entered.set()
+    if not release.wait(timeout=_BLOCKED_LOOP_TIMEOUT_SEC):
+      raise AssertionError(
+          "event loop never resumed while the blocking call was in flight"
+      )
+    return "loaded"
+
+  monkeypatch.setattr(_utils, "_load_skill_from_dir", _blocking_loader)
+
+  async def _release_once_entered():
+    # Only makes progress if the event loop was not blocked by the wrapper.
+    while not entered.is_set():
+      await asyncio.sleep(0.001)
+    release.set()
+
+  results = await asyncio.wait_for(
+      asyncio.gather(
+          _load_skill_from_dir_async("skill-dir"), _release_once_entered()
+      ),
+      timeout=_BLOCKED_LOOP_TIMEOUT_SEC,
+  )
+
+  assert results[0] == "loaded"
+
+
+async def test_async_wrappers_run_concurrently(monkeypatch):
+  """Independent loads must overlap rather than serialize on the event loop."""
+  barrier = threading.Barrier(3, timeout=_BLOCKED_LOOP_TIMEOUT_SEC)
+
+  def _rendezvous(skill_dir):
+    # Each call blocks until all three are running at once. A serialized
+    # implementation can never reach the barrier count and times out.
+    barrier.wait()
+    return skill_dir
+
+  monkeypatch.setattr(_utils, "_load_skill_from_dir", _rendezvous)
+
+  results = await asyncio.wait_for(
+      asyncio.gather(*(_load_skill_from_dir_async(f"s{i}") for i in range(3))),
+      timeout=_BLOCKED_LOOP_TIMEOUT_SEC,
+  )
+
+  assert results == ["s0", "s1", "s2"]
+
+
+async def test_load_skill_from_dir_async(tmp_path):
+  """Tests loading a skill from a directory asynchronously."""
+  skill_dir = tmp_path / "test-skill"
+  skill_dir.mkdir()
+
+  skill_md_content = """---
+name: test-skill
+description: Test description
+---
+Test instructions
+"""
+  (skill_dir / "SKILL.md").write_text(skill_md_content)
+
+  # Create references
+  ref_dir = skill_dir / "references"
+  ref_dir.mkdir()
+  (ref_dir / "ref1.md").write_text("ref1 content")
+
+  skill = await _load_skill_from_dir_async(skill_dir)
+
+  assert skill.name == "test-skill"
+  assert skill.description == "Test description"
+  assert skill.instructions == "Test instructions"
+  assert skill.resources.get_reference("ref1.md") == "ref1 content"
+
+
+async def test_load_skill_from_dir_async_propagates_errors(tmp_path):
+  """Errors raised in the worker thread must surface to the caller."""
+  with pytest.raises(FileNotFoundError):
+    await _load_skill_from_dir_async(tmp_path / "nonexistent")
+
+
+async def test_load_skills_from_dir_async(tmp_path):
+  """Tests loading every skill in a directory asynchronously."""
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+
+  for name in ("skill-a", "skill-b"):
+    skill_dir = skills_dir / name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: desc {name}\n---\nbody {name}"
+    )
+  # Directories without a SKILL.md are skipped, matching the sync version.
+  (skills_dir / "not-a-skill").mkdir()
+
+  skills = await _load_skills_from_dir_async(skills_dir)
+
+  assert [skill.name for skill in skills] == ["skill-a", "skill-b"]
+  assert skills[0].instructions == "body skill-a"
+
+
+async def test_load_skills_from_dir_async_propagates_errors(tmp_path):
+  """Errors raised in the worker thread must surface to the caller."""
+  with pytest.raises(FileNotFoundError, match="does not exist"):
+    await _load_skills_from_dir_async(tmp_path / "nonexistent")
+
+
+async def test_list_skills_in_dir_async(tmp_path):
+  """Tests listing skills in a directory asynchronously."""
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+
+  # Valid skill 1
+  skill1_dir = skills_dir / "skill1"
+  skill1_dir.mkdir()
+  (skill1_dir / "SKILL.md").write_text(
+      "---\nname: skill1\ndescription: desc1\n---\nbody"
+  )
+
+  skills = await _list_skills_in_dir_async(skills_dir)
+
+  assert len(skills) == 1
+  assert "skill1" in skills
+  assert skills["skill1"].name == "skill1"
+
+
+@mock.patch("google.cloud.storage.Client")
+async def test_load_skill_from_gcs_dir_async(mock_client_class):
+  """Tests loading a skill from GCS asynchronously."""
+  mock_client = mock.MagicMock()
+  mock_client_class.return_value = mock_client
+  mock_bucket = mock.MagicMock()
+  mock_client.bucket.return_value = mock_bucket
+
+  def mock_blob_side_effect(path):
+    m = mock.MagicMock()
+    if path.endswith("SKILL.md"):
+      m.exists.return_value = True
+      m.download_as_text.return_value = (
+          "---\nname: my-skill\ndescription: Test description\n---\nTest"
+          " instructions"
+      )
+    else:
+      m.exists.return_value = False
+    return m
+
+  mock_bucket.blob.side_effect = mock_blob_side_effect
+
+  # For resources
+  def list_blobs_side_effect(prefix=None):
+    if prefix.endswith("references/"):
+      m = mock.MagicMock()
+      m.name = prefix + "ref1.md"
+      m.download_as_text.return_value = "ref1 content"
+      return [m]
+    return []
+
+  mock_bucket.list_blobs.side_effect = list_blobs_side_effect
+
+  skill = await _load_skill_from_gcs_dir_async(
+      "my-bucket", "my-skill", "skills"
+  )
+
+  assert skill.name == "my-skill"
+  assert skill.description == "Test description"
+  assert skill.instructions == "Test instructions"
+  assert skill.resources.get_reference("ref1.md") == "ref1 content"
+  mock_bucket.blob.assert_any_call("skills/my-skill/SKILL.md")
+
+
+@mock.patch("google.cloud.storage.Client")
+async def test_list_skills_in_gcs_dir_async(mock_client_class):
+  """Tests listing skills in GCS asynchronously."""
+  mock_client = mock.MagicMock()
+  mock_client_class.return_value = mock_client
+  mock_bucket = mock.MagicMock()
+  mock_client.bucket.return_value = mock_bucket
+
+  mock_iterator = mock.MagicMock()
+  mock_iterator.prefixes = ["skills/my-skill/"]
+  mock_bucket.list_blobs.return_value = mock_iterator
+
+  mock_blob = mock.MagicMock()
+  mock_blob.exists.return_value = True
+  mock_blob.download_as_text.return_value = (
+      "---\nname: my-skill\ndescription: A skill\n---\nBody"
+  )
+  mock_bucket.blob.return_value = mock_blob
+
+  skills = await _list_skills_in_gcs_dir_async("my-bucket", "skills/")
+  assert "my-skill" in skills
+  assert skills["my-skill"].name == "my-skill"
