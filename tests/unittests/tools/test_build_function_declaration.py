@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from enum import Enum
+from typing import Any
 
 from google.adk.features import FeatureName
 from google.adk.features._feature_registry import temporary_feature_override
@@ -108,6 +109,85 @@ class TestBuildFunctionDeclarationLegacy:
     assert function_decl.name == 'simple_function'
     assert function_decl.parameters.type == 'OBJECT'
     assert function_decl.parameters.properties['input_str'].type == 'OBJECT'
+    assert (
+        function_decl.parameters.properties[
+            'input_str'
+        ].additional_properties.type
+        == 'STRING'
+    )
+
+  def test_dict_input_with_int_values(self):
+    def simple_function(input_str: dict[str, int]) -> str:
+      return {'result': input_str}
+
+    function_decl = _automatic_function_calling_util.build_function_declaration(
+        func=simple_function
+    )
+
+    assert function_decl.name == 'simple_function'
+    assert function_decl.parameters.type == 'OBJECT'
+    assert function_decl.parameters.properties['input_str'].type == 'OBJECT'
+    assert (
+        function_decl.parameters.properties[
+            'input_str'
+        ].additional_properties.type
+        == 'INTEGER'
+    )
+
+  def test_dict_input_with_any_values(self):
+    def simple_function(input_str: dict[str, Any]) -> str:
+      return {'result': input_str}
+
+    function_decl = _automatic_function_calling_util.build_function_declaration(
+        func=simple_function
+    )
+
+    assert function_decl.name == 'simple_function'
+    assert function_decl.parameters.type == 'OBJECT'
+    assert function_decl.parameters.properties['input_str'].type == 'OBJECT'
+    assert (
+        function_decl.parameters.properties[
+            'input_str'
+        ].additional_properties.type
+        is None
+    )
+
+  def test_untyped_dict_input(self):
+    def simple_function(input_str: dict) -> str:
+      return {'result': input_str}
+
+    function_decl = _automatic_function_calling_util.build_function_declaration(
+        func=simple_function
+    )
+
+    assert function_decl.name == 'simple_function'
+    assert function_decl.parameters.type == 'OBJECT'
+    assert function_decl.parameters.properties['input_str'].type == 'OBJECT'
+    assert (
+        function_decl.parameters.properties['input_str'].additional_properties
+        is None
+    )
+
+  def test_list_of_dict_input(self):
+    """Test list[dict[str, str]] emits proper schema with additional_properties."""
+
+    def simple_function(fruits: list[dict[str, str]]) -> str:
+      return str(fruits)
+
+    function_decl = _automatic_function_calling_util.build_function_declaration(
+        func=simple_function
+    )
+
+    assert function_decl.name == 'simple_function'
+    assert function_decl.parameters.type == 'OBJECT'
+    assert function_decl.parameters.properties['fruits'].type == 'ARRAY'
+    assert function_decl.parameters.properties['fruits'].items.type == 'OBJECT'
+    assert (
+        function_decl.parameters.properties[
+            'fruits'
+        ].items.additional_properties.type
+        == 'STRING'
+    )
 
   def test_basemodel_input(self):
     class CustomInput(BaseModel):
@@ -321,6 +401,12 @@ class TestBuildFunctionDeclarationLegacy:
     assert function_decl.parameters.properties['input_dir'].type == 'ARRAY'
     assert (
         function_decl.parameters.properties['input_dir'].items.type == 'OBJECT'
+    )
+    assert (
+        function_decl.parameters.properties[
+            'input_dir'
+        ].items.additional_properties.type
+        == 'STRING'
     )
 
   def test_enums(self):
@@ -643,6 +729,42 @@ class TestBuildFunctionDeclarationWithJsonSchema:
     schema = decl.parameters_json_schema
     assert schema['properties']['data'] == {
         'additionalProperties': {'type': 'string'},
+        'title': 'Data',
+        'type': 'object',
+    }
+
+  def test_dict_parameter_with_any(self):
+    """Test dict[str, Any] parameter with feature flag enabled."""
+
+    def process_data(data: dict[str, Any]) -> str:
+      """Process a dictionary."""
+      return str(data)
+
+    decl = _automatic_function_calling_util.build_function_declaration(
+        process_data
+    )
+
+    schema = decl.parameters_json_schema
+    assert schema['properties']['data'] == {
+        'additionalProperties': True,
+        'title': 'Data',
+        'type': 'object',
+    }
+
+  def test_untyped_dict_parameter(self):
+    """Test untyped dict parameter with feature flag enabled."""
+
+    def process_data(data: dict) -> str:
+      """Process a dictionary."""
+      return str(data)
+
+    decl = _automatic_function_calling_util.build_function_declaration(
+        process_data
+    )
+
+    schema = decl.parameters_json_schema
+    assert schema['properties']['data'] == {
+        'additionalProperties': True,
         'title': 'Data',
         'type': 'object',
     }
