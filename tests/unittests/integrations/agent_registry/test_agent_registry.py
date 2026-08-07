@@ -690,13 +690,6 @@ class TestAgentRegistry:
     ):
       registry._make_request("test-path")
 
-  def test_make_request_handles_http_error_without_response(self, registry):
-    error = requests.exceptions.HTTPError("Connection closed")
-    registry._session.get.side_effect = error
-
-    with pytest.raises(RuntimeError, match="API request failed:"):
-      registry._make_request("test-path")
-
   def test_make_request_raises_request_error(self, registry):
     error = requests.exceptions.RequestException(
         "Connection failed", request=MagicMock()

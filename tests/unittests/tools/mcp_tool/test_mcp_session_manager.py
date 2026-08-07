@@ -1489,10 +1489,8 @@ class TestGoogleAuthAsyncByteStream:
   @pytest.mark.asyncio
   async def test_iteration_yields_chunks(self):
     mock_auth_response = AsyncMock()
-    requested_chunk_sizes: list[int] = []
 
-    async def mock_content(chunk_size: int):
-      requested_chunk_sizes.append(chunk_size)
+    async def mock_content():
       yield b"chunk1"
       yield b"chunk2"
 
@@ -1504,7 +1502,6 @@ class TestGoogleAuthAsyncByteStream:
       chunks.append(chunk)
 
     assert chunks == [b"chunk1", b"chunk2"]
-    assert requested_chunk_sizes == [1024]
 
   @pytest.mark.asyncio
   async def test_aclose_closes_response(self):

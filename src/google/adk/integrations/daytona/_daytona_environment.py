@@ -215,7 +215,6 @@ class DaytonaEnvironment(BaseEnvironment):
     if self._timeout > 0 and auto_stop_interval_mins == 0:
       auto_stop_interval_mins = 1
 
-    params: CreateSandboxFromImageParams | CreateSandboxFromSnapshotParams
     if self._image:
       params = CreateSandboxFromImageParams(
           image=self._image,

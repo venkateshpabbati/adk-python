@@ -23,7 +23,6 @@ from __future__ import annotations
 import base64
 import logging
 from typing import Any
-from typing import cast
 from typing import Literal
 from typing import TYPE_CHECKING
 
@@ -133,12 +132,7 @@ class SandboxClient:
     import json
 
     if hasattr(response, "body") and response.body:
-      parsed: object = json.loads(response.body)
-      if not isinstance(parsed, dict) or not all(
-          isinstance(key, str) for key in parsed
-      ):
-        raise ValueError("Sandbox response body must be a JSON object.")
-      return parsed
+      return json.loads(response.body)
     return {}
 
   def update_access_token(self, access_token: str) -> None:
@@ -212,7 +206,7 @@ class SandboxClient:
           request_dict=request_dict,
       )
       parsed = self._parse_response(response)
-      return cast(list[dict[str, Any]], parsed.get("results", []))
+      return parsed.get("results", [])
     except Exception as e:
       # Batch endpoint not available, fall back to sequential
       if "404" in str(e) or "not found" in str(e).lower():
@@ -221,7 +215,7 @@ class SandboxClient:
         logger.warning("Batch CDP failed: %s, falling back to sequential", e)
 
     # Sequential fallback
-    results: list[dict[str, Any]] = []
+    results = []
     for cmd in commands:
       try:
         result = await self.make_cdp_request(
@@ -304,15 +298,9 @@ class SandboxClient:
         if active_tab_id is None:
           return None
 
-        all_tabs = parsed.get("all_tabs")
-        if not isinstance(all_tabs, list):
-          return None
-        for tab in all_tabs:
-          if not isinstance(tab, dict):
-            continue
+        for tab in parsed.get("all_tabs", []):
           if tab.get("id") == active_tab_id:
-            url = tab.get("url")
-            return url if isinstance(url, str) else None
+            return tab.get("url")
 
         return None
       except Exception as e:

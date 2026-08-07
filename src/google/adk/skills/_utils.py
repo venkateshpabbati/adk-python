@@ -59,7 +59,7 @@ def _load_dir(directory: pathlib.Path) -> dict[str, str]:
   Returns:
     Dictionary mapping relative file paths to their string content.
   """
-  files: dict[str, str] = {}
+  files = {}
   if directory.exists() and directory.is_dir():
     for file_path in directory.rglob("*"):
       if "__pycache__" in file_path.parts:
@@ -74,9 +74,7 @@ def _load_dir(directory: pathlib.Path) -> dict[str, str]:
   return files
 
 
-def _parse_skill_md_content(
-    content: str,
-) -> tuple[dict[str, object], str]:
+def _parse_skill_md_content(content: str) -> tuple[dict, str]:
   """Parse SKILL.md from raw content string.
 
   Args:
@@ -106,17 +104,12 @@ def _parse_skill_md_content(
   if not isinstance(parsed, dict):
     raise ValueError("SKILL.md frontmatter must be a YAML mapping")
 
-  frontmatter: dict[str, object] = {}
-  for key, value in parsed.items():
-    if not isinstance(key, str):
-      raise ValueError("SKILL.md frontmatter keys must be strings")
-    frontmatter[key] = value
-  return frontmatter, body
+  return parsed, body
 
 
 def _parse_skill_md(
     skill_dir: pathlib.Path,
-) -> tuple[dict[str, object], str, pathlib.Path]:
+) -> tuple[dict, str, pathlib.Path]:
   """Parse SKILL.md from a skill directory.
 
   Args:
@@ -484,7 +477,7 @@ def _list_skills_in_dir(
     Dictionary mapping skill IDs to their frontmatter.
   """
   skills_base_path = pathlib.Path(skills_base_path).resolve()
-  skills: dict[str, models.Frontmatter] = {}
+  skills = {}
 
   if not skills_base_path.is_dir():
     logging.warning(
@@ -553,7 +546,7 @@ def _list_skills_in_gcs_dir(
     pass
   logging.info("Found %s skills in GCS.", iterator.prefixes)
 
-  skills: dict[str, models.Frontmatter] = {}
+  skills = {}
   for skill_prefix in sorted(iterator.prefixes):
     manifest_blob = bucket.blob(f"{skill_prefix}SKILL.md")
 
@@ -635,10 +628,10 @@ def _load_skill_from_gcs_dir(
         f" name '{skill_name_expected}'."
     )
 
-  def _load_files_in_dir(subdir: str) -> dict[str, Union[str, bytes]]:
+  def _load_files_in_dir(subdir: str) -> Dict[str, Union[str, bytes]]:
     prefix = f"{skill_dir_prefix}{subdir}/"
     blobs = bucket.list_blobs(prefix=prefix)
-    result: dict[str, str | bytes] = {}
+    result = {}
 
     for blob in blobs:
       relative_path = blob.name[len(prefix) :]
@@ -655,7 +648,7 @@ def _load_skill_from_gcs_dir(
   assets = _load_files_in_dir("assets")
   raw_scripts = _load_files_in_dir("scripts")
 
-  scripts: dict[str, models.Script] = {}
+  scripts = {}
   for name, src in raw_scripts.items():
     if isinstance(src, bytes):
       try:

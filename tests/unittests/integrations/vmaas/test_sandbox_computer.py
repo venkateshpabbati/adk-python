@@ -14,7 +14,6 @@
 
 """Unit tests for the AgentEngineSandboxComputer class."""
 
-import asyncio
 import time
 import unittest
 from unittest.mock import AsyncMock

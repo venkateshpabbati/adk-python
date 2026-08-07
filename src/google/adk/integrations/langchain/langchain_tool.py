@@ -90,8 +90,6 @@ class LangchainTool(FunctionTool):
           type(tool),
       )
 
-    if func is None:
-      raise ValueError('Langchain tool must define a sync or async callable.')
     super().__init__(func)
     # run_manager is a special parameter for langchain tool
     self._ignore_params.append('run_manager')
@@ -159,7 +157,7 @@ class LangchainTool(FunctionTool):
               False,
               self.name,
               self.description,
-              self.func,
+              tool_wrapper.func,
               tool_wrapper.args,
           )
 

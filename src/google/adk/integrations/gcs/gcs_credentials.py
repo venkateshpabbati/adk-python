@@ -30,10 +30,10 @@ class GCSCredentialsConfig(BaseGoogleCredentialsConfig):
 
   def __post_init__(self) -> GCSCredentialsConfig:
     """Populate default scope if scopes is None."""
-    super().__post_init__()  # type: ignore[misc]
+    super().__post_init__()
 
     if not self.scopes:
-      self.scopes = GCS_DEFAULT_SCOPE.copy()
+      self.scopes = GCS_DEFAULT_SCOPE
 
     # Set the token cache key
     self._token_cache_key = GCS_TOKEN_CACHE_KEY
