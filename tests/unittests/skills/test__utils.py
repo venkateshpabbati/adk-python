@@ -17,10 +17,13 @@
 import asyncio
 import builtins
 import io
+import struct
 import sys
 import threading
+import tracemalloc
 from unittest import mock
 import zipfile
+import zlib
 
 from google.adk.skills import _utils
 from google.adk.skills import list_skills_in_dir
@@ -34,6 +37,8 @@ from google.adk.skills import load_skill_from_gcs_dir_async as _load_skill_from_
 from google.adk.skills import load_skills_from_dir as _load_skills_from_dir
 from google.adk.skills import load_skills_from_dir_async as _load_skills_from_dir_async
 from google.adk.skills._utils import _load_skill_from_zip_bytes
+from google.adk.skills._utils import _MAX_ZIP_ENTRIES
+from google.adk.skills._utils import _MAX_ZIP_UNCOMPRESSED_BYTES
 from google.adk.skills._utils import _read_skill_properties
 from google.adk.skills._utils import _validate_skill_dir
 import pytest
@@ -374,6 +379,143 @@ def test__load_skill_from_zip_bytes():
   assert skill.instructions == "Body instructions"
   assert skill.resources.get_reference("ref1.md") == "ref1 content"
   assert skill.resources.get_script("script1.sh").src == "echo hello"
+
+
+def test__load_skill_from_zip_bytes_rejects_oversized_archive():
+  """Tests that an archive declaring too much decompressed data is refused."""
+
+  zip_buffer = io.BytesIO()
+  with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr(
+        "SKILL.md",
+        "---\nname: my-skill\ndescription: A skill\n---\nBody instructions",
+    )
+    # Stream the payload so the test never holds the whole thing in memory.
+    chunk = b"a" * (1024 * 1024)
+    chunks = _MAX_ZIP_UNCOMPRESSED_BYTES // len(chunk) + 1
+    with z.open("references/big.md", "w") as f:
+      for _ in range(chunks):
+        f.write(chunk)
+
+  with pytest.raises(ValueError, match="decompressed"):
+    _load_skill_from_zip_bytes(zip_buffer.getvalue())
+
+
+def test__load_skill_from_zip_bytes_rejects_too_many_entries():
+  """Tests that an archive with too many entries is refused."""
+
+  zip_buffer = io.BytesIO()
+  with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr(
+        "SKILL.md",
+        "---\nname: my-skill\ndescription: A skill\n---\nBody instructions",
+    )
+    for i in range(_MAX_ZIP_ENTRIES):
+      z.writestr(f"references/ref{i}.md", "x")
+
+  with pytest.raises(ValueError, match="too many entries"):
+    _load_skill_from_zip_bytes(zip_buffer.getvalue())
+
+
+def test__load_skill_from_zip_bytes_accepts_archive_at_the_limits():
+  """Tests that an archive exactly at both ceilings is still accepted."""
+
+  skill_md = "---\nname: my-skill\ndescription: A skill\n---\nBody"
+  padding = "x" * 64
+  zip_buffer = io.BytesIO()
+  with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("SKILL.md", skill_md)
+    z.writestr("references/pad.md", padding)
+
+  # Two entries, and exactly as many bytes as the ceiling allows.
+  with (
+      mock.patch("google.adk.skills._utils._MAX_ZIP_ENTRIES", 2),
+      mock.patch(
+          "google.adk.skills._utils._MAX_ZIP_UNCOMPRESSED_BYTES",
+          len(skill_md) + len(padding),
+      ),
+  ):
+    skill = _load_skill_from_zip_bytes(zip_buffer.getvalue())
+
+  assert skill.resources.get_reference("pad.md") == padding
+
+
+_UNDERSTATED_REAL_BYTES = 64 * 1024 * 1024
+
+
+def _zip_understating_big_member(
+    real_size: int, declared_size: int, *, matching_crc: bool
+) -> bytes:
+  """Builds an archive whose central directory under-reports a member's size.
+
+  ``references/big.md`` really expands to ``real_size`` bytes while the
+  directory claims ``declared_size``, the way a hostile archive would. With
+  ``matching_crc`` the checksum is rewritten to cover only the declared
+  prefix, so the archive is internally consistent about the lie.
+  """
+  zip_buffer = io.BytesIO()
+  with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr(
+        "SKILL.md",
+        "---\nname: my-skill\ndescription: A skill\n---\nBody instructions",
+    )
+    # Stream the payload so the test never holds the whole thing in memory.
+    chunk = b"a" * (1024 * 1024)
+    with z.open("references/big.md", "w") as f:
+      for _ in range(real_size // len(chunk)):
+        f.write(chunk)
+  raw = bytearray(zip_buffer.getvalue())
+
+  # Walk the central directory and rewrite the big member's declared size.
+  eocd = raw.rfind(b"PK\x05\x06")
+  entry_count = struct.unpack("<H", raw[eocd + 10 : eocd + 12])[0]
+  offset = struct.unpack("<I", raw[eocd + 16 : eocd + 20])[0]
+  for _ in range(entry_count):
+    name_len, extra_len, comment_len = struct.unpack(
+        "<HHH", raw[offset + 28 : offset + 34]
+    )
+    if bytes(raw[offset + 46 : offset + 46 + name_len]) == b"references/big.md":
+      raw[offset + 24 : offset + 28] = struct.pack("<I", declared_size)
+      if matching_crc:
+        raw[offset + 16 : offset + 20] = struct.pack(
+            "<I", zlib.crc32(b"a" * declared_size)
+        )
+    offset += 46 + name_len + extra_len + comment_len
+  return bytes(raw)
+
+
+def test__load_skill_from_zip_bytes_rejects_member_understating_its_size():
+  """Tests that a member expanding past the size it declares is refused."""
+
+  zip_bytes = _zip_understating_big_member(
+      _UNDERSTATED_REAL_BYTES, 100, matching_crc=False
+  )
+
+  with pytest.raises(ValueError, match="malformed"):
+    _load_skill_from_zip_bytes(zip_bytes)
+
+
+def test__load_skill_from_zip_bytes_bounds_bytes_read_from_a_lying_member():
+  """Tests that reading costs what a member holds, not what it hides."""
+
+  # Nothing in this archive gives the lie away: the declared sizes are small
+  # enough to pass every up-front check and the checksum matches the declared
+  # prefix, so the read itself has to stay bounded.
+  zip_bytes = _zip_understating_big_member(
+      _UNDERSTATED_REAL_BYTES, 100, matching_crc=True
+  )
+
+  tracemalloc.start()
+  try:
+    skill = _load_skill_from_zip_bytes(zip_bytes)
+    peak = tracemalloc.get_traced_memory()[1]
+  finally:
+    tracemalloc.stop()
+
+  assert skill.resources.get_reference("big.md") == "a" * 100
+  # Decompressing the member in one call peaks at roughly the 64 MB it really
+  # holds; decompressing it in steps peaks near the size of the archive.
+  assert peak < _UNDERSTATED_REAL_BYTES // 4
 
 
 def test__list_skills_in_gcs_dir_import_error():
