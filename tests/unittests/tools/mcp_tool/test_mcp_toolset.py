@@ -89,6 +89,15 @@ class TestMcpToolset:
         return_value=self.mock_session
     )
 
+  @pytest.fixture
+  def allow_config_stdio_servers(self):
+    """Opts this process in to stdio MCP servers declared in agent configs."""
+    mcp_toolset_module._set_allow_config_stdio_servers(True)
+    try:
+      yield
+    finally:
+      mcp_toolset_module._set_allow_config_stdio_servers(None)
+
   def test_init_basic(self):
     """Test basic initialization with StdioServerParameters."""
     toolset = McpToolset(connection_params=self.mock_stdio_params)
@@ -248,6 +257,7 @@ class TestMcpToolset:
     assert toolset._auth_credential == auth_credential
     assert toolset._auth_config.credential_key == "my_custom_key"
 
+  @pytest.mark.usefixtures("allow_config_stdio_servers")
   def test_from_config_with_credential_key(self):
     """Test that from_config correctly parses credential_key."""
 
@@ -262,6 +272,76 @@ class TestMcpToolset:
 
     assert isinstance(toolset._auth_scheme, OAuth2)
     assert toolset._auth_config.credential_key == "my_custom_key"
+
+  def test_from_config_rejects_stdio_server_params(self):
+    """Config-supplied stdio servers are rejected by default."""
+    config = ToolArgsConfig(stdio_server_params=self.mock_stdio_params)
+
+    with pytest.raises(ValueError, match="not allowed in agent configs"):
+      McpToolset.from_config(config, "")
+
+  def test_from_config_rejects_stdio_connection_params(self):
+    """The stdio_connection_params spelling is rejected the same way."""
+    config = ToolArgsConfig(
+        stdio_connection_params=StdioConnectionParams(
+            server_params=self.mock_stdio_params
+        )
+    )
+
+    with pytest.raises(ValueError, match="not allowed in agent configs"):
+      McpToolset.from_config(config, "")
+
+  def test_from_config_rejection_names_the_env_var(self):
+    """The error tells the operator how to opt in."""
+    config = ToolArgsConfig(stdio_server_params=self.mock_stdio_params)
+
+    with pytest.raises(
+        ValueError, match=mcp_toolset_module.ALLOW_CONFIG_STDIO_SERVERS_ENV_VAR
+    ):
+      McpToolset.from_config(config, "")
+
+  def test_from_config_allows_stdio_when_env_var_set(self, monkeypatch):
+    """The environment variable opts a whole process in."""
+    monkeypatch.setenv(
+        mcp_toolset_module.ALLOW_CONFIG_STDIO_SERVERS_ENV_VAR, "1"
+    )
+    config = ToolArgsConfig(stdio_server_params=self.mock_stdio_params)
+
+    toolset = McpToolset.from_config(config, "")
+
+    assert isinstance(toolset, McpToolset)
+
+  @pytest.mark.usefixtures("allow_config_stdio_servers")
+  def test_from_config_allows_stdio_when_set_programmatically(self):
+    """An embedding application can opt in without touching the environment."""
+    config = ToolArgsConfig(stdio_server_params=self.mock_stdio_params)
+
+    toolset = McpToolset.from_config(config, "")
+
+    assert isinstance(toolset, McpToolset)
+
+  def test_programmatic_setting_overrides_env_var(self, monkeypatch):
+    """An explicit False wins over an environment variable that says yes."""
+    monkeypatch.setenv(
+        mcp_toolset_module.ALLOW_CONFIG_STDIO_SERVERS_ENV_VAR, "1"
+    )
+    monkeypatch.setattr(
+        mcp_toolset_module, "_allow_config_stdio_servers", False
+    )
+    config = ToolArgsConfig(stdio_server_params=self.mock_stdio_params)
+
+    with pytest.raises(ValueError, match="not allowed in agent configs"):
+      McpToolset.from_config(config, "")
+
+  def test_from_config_allows_remote_connection_params(self):
+    """Remote MCP servers are unaffected: they launch no local process."""
+    config = ToolArgsConfig(
+        sse_connection_params=SseConnectionParams(url="https://example.com/sse")
+    )
+
+    toolset = McpToolset.from_config(config, "")
+
+    assert isinstance(toolset, McpToolset)
 
   def test_init_missing_connection_params(self):
     """Test initialization with missing connection params raises error."""
