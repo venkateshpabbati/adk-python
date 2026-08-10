@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
+import dataclasses
 import inspect
 import logging
 import sys
+import time
 from typing import Any
 from typing import Awaitable
 from typing import Callable
@@ -37,6 +40,7 @@ from mcp.client.session import SamplingFnT
 from mcp.shared.session import ProgressFnT
 from mcp.types import ListResourcesResult
 from mcp.types import ListToolsResult
+from mcp.types import Tool as McpBaseTool
 from pydantic import model_validator
 from typing_extensions import override
 
@@ -63,6 +67,19 @@ logger = logging.getLogger("google_adk." + __name__)
 
 
 T = TypeVar("T")
+
+# Hard ceiling on cached tool lists, so a `header_provider` minting a fresh
+# value per request cannot grow the cache without bound while entries are
+# still unexpired.
+_MAX_TOOL_LIST_CACHE_ENTRIES = 64
+
+
+@dataclasses.dataclass
+class _CachedToolList:
+  """A ``tools/list`` response and the monotonic time it stops being usable."""
+
+  tools: List[McpBaseTool]
+  expires_at: float
 
 
 class McpToolset(BaseToolset):
@@ -106,6 +123,7 @@ class McpToolset(BaseToolset):
       ),
       tool_filter: ToolPredicate | list[str] | None = None,
       tool_name_prefix: str | None = None,
+      tool_list_cache_ttl_seconds: float | None = None,
       errlog: TextIO = sys.stderr,
       auth_scheme: AuthScheme | None = None,
       auth_credential: AuthCredential | None = None,
@@ -140,6 +158,14 @@ class McpToolset(BaseToolset):
         filtering logic
       tool_name_prefix: A prefix to be added to the name of each tool in this
         toolset.
+      tool_list_cache_ttl_seconds: If set, reuse the MCP server's ``tools/list``
+        response for this many seconds instead of listing on every
+        ``get_tools()`` call. Entries are keyed the way MCP sessions are pooled,
+        so each ``header_provider`` identity gets its own. ADK does not
+        subscribe to ``notifications/tools/list_changed``, so a tool the server
+        adds or removes goes unnoticed until the entry expires. The cache lives
+        on this toolset instance, so sharing it means sharing the instance.
+        Defaults to None, which lists on every call.
       errlog: TextIO stream for error logging.
       auth_scheme: The auth scheme of the tool for tool calling
       auth_credential: The auth credential of the tool for tool calling
@@ -178,6 +204,20 @@ class McpToolset(BaseToolset):
     if not connection_params:
       raise ValueError("Missing connection params in McpToolset.")
 
+    if (
+        tool_list_cache_ttl_seconds is not None
+        and tool_list_cache_ttl_seconds <= 0
+    ):
+      raise ValueError(
+          "tool_list_cache_ttl_seconds must be positive, got"
+          f" {tool_list_cache_ttl_seconds}."
+      )
+
+    self._tool_list_cache_ttl_seconds = tool_list_cache_ttl_seconds
+    # Ordered least- to most-recently used, so the cap evicts from the front.
+    self._tool_list_cache: collections.OrderedDict[str, _CachedToolList] = (
+        collections.OrderedDict()
+    )
     self._connection_params = connection_params
     self._errlog = errlog
     self._header_provider = header_provider
@@ -327,19 +367,18 @@ class McpToolset(BaseToolset):
   def errlog(self) -> TextIO:
     return self._errlog
 
-  async def _execute_with_session(
-      self,
-      coroutine_func: Callable[[Any], Awaitable[T]],
-      error_message: str,
-      readonly_context: Optional[ReadonlyContext] = None,
-  ) -> T:
-    """Creates a session and executes a coroutine with it."""
-    current_debug: list[dict[str, Any]] = []
-    debug_token = (
-        _http_debug_var.set(current_debug)
-        if logger.isEnabledFor(logging.DEBUG)
-        else None
-    )
+  async def _build_headers(
+      self, readonly_context: Optional[ReadonlyContext] = None
+  ) -> Dict[str, str]:
+    """Builds the per-request headers for an MCP session.
+
+    Args:
+      readonly_context: Context passed to the header provider and used to look
+        up the exchanged credential.
+
+    Returns:
+        The merged header provider and auth headers, empty if there are none.
+    """
     headers: Dict[str, str] = {}
 
     # Add headers from header_provider if available
@@ -354,6 +393,38 @@ class McpToolset(BaseToolset):
     auth_headers = self._get_auth_headers(readonly_context)
     if auth_headers:
       headers.update(auth_headers)
+
+    return headers
+
+  async def _execute_with_session(
+      self,
+      coroutine_func: Callable[[Any], Awaitable[T]],
+      error_message: str,
+      readonly_context: Optional[ReadonlyContext] = None,
+      headers: Optional[Dict[str, str]] = None,
+  ) -> T:
+    """Creates a session and executes a coroutine with it.
+
+    Args:
+      coroutine_func: Receives the session and performs the MCP call.
+      error_message: Prefix for the ConnectionError raised on failure.
+      readonly_context: Context used to build headers, unless `headers` is
+        already supplied.
+      headers: Headers from a previous `_build_headers` call, for callers that
+        need them before opening the session. None means build them here; pass
+        an empty dict for "no headers".
+
+    Returns:
+        Whatever `coroutine_func` returned.
+    """
+    current_debug: list[dict[str, Any]] = []
+    debug_token = (
+        _http_debug_var.set(current_debug)
+        if logger.isEnabledFor(logging.DEBUG)
+        else None
+    )
+    if headers is None:
+      headers = await self._build_headers(readonly_context)
 
     try:
       session = await self._mcp_session_manager.create_session(
@@ -384,6 +455,54 @@ class McpToolset(BaseToolset):
                 current_debug
             )
 
+  def _tool_list_cache_key(self, headers: Dict[str, str]) -> Optional[str]:
+    """Returns the cache key for these headers, or None if caching is off."""
+    if self._tool_list_cache_ttl_seconds is None:
+      return None
+    # Key on the session pool key, so an entry never outlives the identity it
+    # was fetched with: a different tenant reaches a different session.
+    # pylint: disable-next=protected-access
+    return self._mcp_session_manager._session_key_for(headers or None)
+
+  def _read_tool_list_cache(
+      self, cache_key: Optional[str]
+  ) -> Optional[List[McpBaseTool]]:
+    """Returns the unexpired cached tool list, or None on a miss."""
+    if cache_key is None:
+      return None
+    entry = self._tool_list_cache.get(cache_key)
+    if entry is None:
+      return None
+    if entry.expires_at <= time.monotonic():
+      del self._tool_list_cache[cache_key]
+      return None
+    self._tool_list_cache.move_to_end(cache_key)
+    return entry.tools
+
+  def _write_tool_list_cache(
+      self, cache_key: Optional[str], mcp_tools: List[McpBaseTool]
+  ) -> None:
+    """Caches a tool list, unless caching is off."""
+    ttl_seconds = self._tool_list_cache_ttl_seconds
+    if cache_key is None or ttl_seconds is None:
+      return
+
+    # Reads only evict the key they were asked for, so a key that never comes
+    # back is never reclaimed. Bound the cache here instead: sweep what has
+    # expired, then cap what has not.
+    now = time.monotonic()
+    for key, entry in list(self._tool_list_cache.items()):
+      if entry.expires_at <= now:
+        del self._tool_list_cache[key]
+
+    self._tool_list_cache[cache_key] = _CachedToolList(
+        tools=list(mcp_tools),
+        expires_at=now + ttl_seconds,
+    )
+    self._tool_list_cache.move_to_end(cache_key)
+    while len(self._tool_list_cache) > _MAX_TOOL_LIST_CACHE_ENTRIES:
+      self._tool_list_cache.popitem(last=False)
+
   @retry_on_errors
   async def get_tools(
       self,
@@ -398,16 +517,25 @@ class McpToolset(BaseToolset):
     Returns:
         List[BaseTool]: A list of tools available under the specified context.
     """
-    # Fetch available tools from the MCP server
-    tools_response: ListToolsResult = await self._execute_with_session(
-        lambda session: session.list_tools(),
-        "Failed to get tools from MCP server",
-        readonly_context,
-    )
+    headers = await self._build_headers(readonly_context)
+    cache_key = self._tool_list_cache_key(headers)
+    mcp_tools = self._read_tool_list_cache(cache_key)
 
-    # Apply filtering based on context and tool_filter
+    if mcp_tools is None:
+      # Fetch available tools from the MCP server
+      tools_response: ListToolsResult = await self._execute_with_session(
+          lambda session: session.list_tools(),
+          "Failed to get tools from MCP server",
+          readonly_context,
+          headers=headers,
+      )
+      mcp_tools = tools_response.tools
+      self._write_tool_list_cache(cache_key, mcp_tools)
+
+    # Apply filtering based on context and tool_filter. This runs on every call
+    # even on a cache hit, so only the round trip is skipped.
     tools = []
-    for tool in tools_response.tools:
+    for tool in mcp_tools:
       mcp_tool = MCPTool(
           mcp_tool=tool,
           mcp_session_manager=self._mcp_session_manager,
@@ -491,6 +619,7 @@ class McpToolset(BaseToolset):
     It's designed to be safe to call multiple times and handles cleanup errors
     gracefully to avoid blocking application shutdown.
     """
+    self._tool_list_cache.clear()
     try:
       await self._mcp_session_manager.close()
     except Exception as e:
@@ -530,6 +659,9 @@ class McpToolset(BaseToolset):
         connection_params=connection_params,
         tool_filter=mcp_toolset_config.tool_filter,
         tool_name_prefix=mcp_toolset_config.tool_name_prefix,
+        tool_list_cache_ttl_seconds=(
+            mcp_toolset_config.tool_list_cache_ttl_seconds
+        ),
         auth_scheme=mcp_toolset_config.auth_scheme,
         auth_credential=mcp_toolset_config.auth_credential,
         credential_key=mcp_toolset_config.credential_key,
@@ -541,6 +673,9 @@ class McpToolset(BaseToolset):
     state = self.__dict__.copy()
     # Remove unpicklable file-like objects
     state.pop("_errlog", None)
+    # The session pool does not survive pickling, so neither should tool lists
+    # cached against its keys.
+    state["_tool_list_cache"] = collections.OrderedDict()
     return state
 
   def __setstate__(self, state):
@@ -579,6 +714,8 @@ class McpToolsetConfig(BaseToolConfig):
   tool_filter: Optional[List[str]] = None
 
   tool_name_prefix: Optional[str] = None
+
+  tool_list_cache_ttl_seconds: float | None = None
 
   auth_scheme: Optional[AuthScheme] = None
 
