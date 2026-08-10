@@ -8088,6 +8088,203 @@ class TestCacheMetadataLogging:
     attributes = json.loads(log_entry["attributes"])
     assert "cache_metadata" not in attributes
 
+  async def _run_after_model(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+      llm_response,
+  ):
+    """Drives after_model_callback and returns the LLM_RESPONSE attributes."""
+    bigquery_agent_analytics_plugin.TraceManager.push_span(callback_context)
+    await bq_plugin_inst.after_model_callback(
+        callback_context=callback_context,
+        llm_response=llm_response,
+    )
+    await asyncio.sleep(0.05)
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    log_entry = next(r for r in rows if r["event_type"] == "LLM_RESPONSE")
+    return json.loads(log_entry["attributes"])
+
+  @pytest.mark.asyncio
+  async def test_cache_type_explicit(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """cache_name set + cached tokens -> explicit (ADK-managed cache)."""
+    llm_response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="hi")]),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=20,
+            total_token_count=120,
+            cached_content_token_count=80,
+        ),
+        cache_metadata={
+            "cache_name": "projects/p/locations/us-central1/cachedContents/c",
+            "expire_time": 9999999999.0,
+            "fingerprint": "fp-1",
+            "invocations_used": 1,
+            "contents_count": 2,
+            "created_at": 1.0,
+        },
+    )
+    attributes = await self._run_after_model(
+        bq_plugin_inst,
+        mock_write_client,
+        callback_context,
+        dummy_arrow_schema,
+        llm_response,
+    )
+    assert attributes["cache_type"] == "explicit"
+
+  @pytest.mark.asyncio
+  async def test_cache_type_implicit(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Cached tokens with no cache_metadata -> implicit (provider prefix)."""
+    llm_response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="hi")]),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=20,
+            total_token_count=120,
+            cached_content_token_count=80,
+        ),
+    )
+    attributes = await self._run_after_model(
+        bq_plugin_inst,
+        mock_write_client,
+        callback_context,
+        dummy_arrow_schema,
+        llm_response,
+    )
+    assert attributes["cache_type"] == "implicit"
+
+  @pytest.mark.asyncio
+  async def test_cache_type_explicit_fingerprint_only(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Fingerprint-only cache_metadata (cache_name=None) is still explicit."""
+    llm_response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="hi")]),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=20,
+            total_token_count=120,
+            cached_content_token_count=80,
+        ),
+        cache_metadata={"fingerprint": "fp-1", "contents_count": 2},
+    )
+    attributes = await self._run_after_model(
+        bq_plugin_inst,
+        mock_write_client,
+        callback_context,
+        dummy_arrow_schema,
+        llm_response,
+    )
+    assert attributes["cache_type"] == "explicit"
+
+  @pytest.mark.asyncio
+  async def test_cache_type_none_with_active_cache(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Active cache but no cached tokens (creation turn / miss) -> none."""
+    llm_response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="hi")]),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=20,
+            total_token_count=120,
+        ),
+        cache_metadata={
+            "cache_name": "projects/p/locations/us-central1/cachedContents/c",
+            "expire_time": 9999999999.0,
+            "fingerprint": "fp-1",
+            "invocations_used": 1,
+            "contents_count": 2,
+            "created_at": 1.0,
+        },
+    )
+    attributes = await self._run_after_model(
+        bq_plugin_inst,
+        mock_write_client,
+        callback_context,
+        dummy_arrow_schema,
+        llm_response,
+    )
+    assert attributes["cache_type"] == "none"
+
+  @pytest.mark.asyncio
+  async def test_cache_type_none(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """No cached tokens -> none."""
+    llm_response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="hi")]),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=20,
+            total_token_count=120,
+        ),
+    )
+    attributes = await self._run_after_model(
+        bq_plugin_inst,
+        mock_write_client,
+        callback_context,
+        dummy_arrow_schema,
+        llm_response,
+    )
+    assert attributes["cache_type"] == "none"
+
+  @pytest.mark.asyncio
+  async def test_cache_type_absent_on_partial_response(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """Partial streaming rows carry no cache_type, even with cached tokens."""
+    llm_response = llm_response_lib.LlmResponse(
+        content=types.Content(parts=[types.Part(text="hi")]),
+        partial=True,
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=20,
+            total_token_count=120,
+            cached_content_token_count=80,
+        ),
+    )
+    attributes = await self._run_after_model(
+        bq_plugin_inst,
+        mock_write_client,
+        callback_context,
+        dummy_arrow_schema,
+        llm_response,
+    )
+    assert "cache_type" not in attributes
+
 
 # ==============================================================
 # TEST CLASS: A2A_INTERACTION event logging via on_event_callback

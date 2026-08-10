@@ -3655,6 +3655,9 @@ _EVENT_VIEW_DEFS: dict[str, list[str]] = {
         "JSON_VALUE(attributes, '$.model_version') AS model_version",
         "JSON_QUERY(attributes, '$.usage_metadata') AS usage_metadata",
         "JSON_QUERY(attributes, '$.cache_metadata') AS cache_metadata",
+        # NULL on partial streaming rows and pre-CL rows; filter to final
+        # responses before aggregating on cache_type.
+        "JSON_VALUE(attributes, '$.cache_type') AS cache_type",
     ],
     "LLM_ERROR": [
         "CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) AS total_ms",
@@ -6761,6 +6764,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     is_popped = False
     duration = 0
     tfft = None
+    extra_attributes: dict[str, Any] = {}
+    usage_metadata = llm_response.usage_metadata
+    cache_metadata = getattr(llm_response, "cache_metadata", None)
 
     if hasattr(llm_response, "partial") and llm_response.partial:
       # Streaming chunk - do NOT pop span yet
@@ -6796,6 +6802,29 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # Otherwise log_event will fetch current stack (which is parent).
       span_id = popped_span_id or span_id
 
+      # cache_type classifies the cached-token hit so analytics can separate
+      # ADK-managed explicit caching from Gemini provider-side implicit prefix
+      # caching (the two are indistinguishable from token counts alone).
+      # cache_metadata is attached only when ADK explicit caching is configured,
+      # so its presence means explicit (including the fingerprint-only,
+      # cache_name=None state). No cached tokens -> "none", regardless of
+      # whether a cache is configured. Only derived on the final response.
+      # Token counts carry no source, so when ADK caching is configured the
+      # cache_metadata presence wins the "explicit" label even if some of the
+      # cached tokens came from provider-side implicit caching.
+      cached = bool(
+          usage_metadata
+          and (getattr(usage_metadata, "cached_content_token_count", 0) or 0)
+          > 0
+      )
+      if not cached:
+        cache_type = "none"
+      elif cache_metadata is not None:
+        cache_type = "explicit"
+      else:
+        cache_type = "implicit"
+      extra_attributes["cache_type"] = cache_type
+
     await self._log_event(
         "LLM_RESPONSE",
         callback_context,
@@ -6805,10 +6834,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             latency_ms=duration,
             time_to_first_token_ms=tfft,
             model_version=llm_response.model_version,
-            usage_metadata=llm_response.usage_metadata,
-            cache_metadata=getattr(llm_response, "cache_metadata", None),
+            usage_metadata=usage_metadata,
+            cache_metadata=cache_metadata,
             span_id_override=span_id if is_popped else None,
             parent_span_id_override=(parent_span_id if is_popped else None),
+            extra_attributes=extra_attributes,
         ),
     )
 
