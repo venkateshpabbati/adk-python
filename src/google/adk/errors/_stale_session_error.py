@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._stale_session_error import StaleSessionError
+from __future__ import annotations
 
-__all__ = ["StaleSessionError"]
+
+class StaleSessionError(ValueError):
+  """Raised when a session write loses an optimistic concurrency race.
+
+  Inherits from ValueError for backward compatibility with existing callers.
+  """
