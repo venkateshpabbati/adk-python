@@ -213,7 +213,7 @@ $(function() {
 
     currentSessionId = null;
     document.cookie =
-        'session_id=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; samesite=lax';
+        'session_id=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; samesite=lax; secure';
 
     resetChatFeed();
     updateAgentInfoPane();
