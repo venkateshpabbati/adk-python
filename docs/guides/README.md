@@ -12,6 +12,9 @@ This directory contains specific developer guides for the ADK Python implementat
 ### Artifacts
 * [BaseArtifactService](artifacts/artifact_service/index.md) - Storing binary payloads outside the conversation history, with versioning and user-scoped filenames.
 
+### Auth
+* [AuthConfig and authenticated tools](auth/tool_auth/index.md) - Declaring the credentials a tool needs, and the pause-for-consent handshake.
+
 ### Events
 * [Event and NodeInfo](events/event/index.md) - Understanding Event and NodeInfo in workflows.
 * [RequestInput](events/request_input/index.md) - How to use RequestInput for human-in-the-loop interactions.
