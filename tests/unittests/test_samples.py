@@ -354,3 +354,102 @@ async def test_stale_agent_reports_failed_audits(
   assert ("Failed to process 1 issues." in caplog.text) == (
       failing_issue is not None
   )
+
+
+@pytest.mark.parametrize(
+    "failing_issue, expected_exit_code", [(None, 0), (4, 1)]
+)
+async def test_issue_monitoring_agent_separates_skips_from_failures(
+    failing_issue: int | None,
+    expected_exit_code: int,
+    monkeypatch,
+    caplog,
+):
+  """A skipped issue is not a failure, and a failed one is not a success."""
+  for key, value in _DUMMY_ENV.items():
+    monkeypatch.setenv(key, value)
+
+  reviewed: list[int] = []
+
+  class _FakeSession:
+    id = "fake-session"
+
+  class _FakeSessionService:
+
+    async def create_session(
+        self, *, user_id: str, app_name: str
+    ) -> _FakeSession:
+      return _FakeSession()
+
+  class _FakeRunner:
+    """Stands in for InMemoryRunner, failing the audit of one issue."""
+
+    def __init__(self, *, agent: Any, app_name: str) -> None:
+      self.session_service = _FakeSessionService()
+
+    async def run_async(
+        self, *, user_id: str, session_id: str, new_message: types.Content
+    ) -> AsyncIterator[Event]:
+      text = new_message.parts[0].text
+      issue_number = int(text.split("#")[1].split(":")[0])
+      reviewed.append(issue_number)
+      if issue_number == failing_issue:
+        raise RuntimeError("model backend unavailable")
+      yield Event(
+          author="agent",
+          content=types.Content(
+              role="model", parts=[types.Part(text="Not spam.")]
+          ),
+      )
+
+  with _sample_module(
+      SAMPLES_DIR / "adk_team" / "adk_issue_monitoring_agent", "main"
+  ) as main_module:
+    # 1 and 4 are audited, 2 is skipped because the bot already alerted on it,
+    # 3 is skipped because only a maintainer has written on it.
+    details = {
+        n: {"user": {"login": "maintainer"}, "body": "tracking"} for n in (2, 3)
+    }
+    details[1] = {"user": {"login": "outsider"}, "body": "buy things"}
+    details[4] = {"user": {"login": "outsider"}, "body": "buy more things"}
+    comments = {
+        2: [{
+            "user": {"login": main_module.BOT_NAME},
+            "body": main_module.BOT_ALERT_SIGNATURE,
+        }],
+        3: [{"user": {"login": "maintainer"}, "body": "still looking"}],
+    }
+
+    monkeypatch.setattr(main_module, "InMemoryRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "SLEEP_BETWEEN_CHUNKS", 0)
+    monkeypatch.setattr(
+        main_module,
+        "get_repository_maintainers",
+        lambda owner, repo: ["maintainer"],
+    )
+    monkeypatch.setattr(
+        main_module, "get_target_issues", lambda owner, repo: [1, 2, 3, 4]
+    )
+    monkeypatch.setattr(
+        main_module,
+        "get_issue_details",
+        lambda owner, repo, issue_number: details[issue_number],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "get_issue_comments",
+        lambda owner, repo, issue_number: comments.get(issue_number, []),
+    )
+    with caplog.at_level(logging.INFO, logger="google_adk"):
+      exit_code = await main_module.main()
+
+  assert exit_code == expected_exit_code
+  # Every reviewable issue still reaches the agent: one failure must not abort
+  # the batch.
+  assert sorted(reviewed) == [1, 4]
+  expected_successes = 2 if failing_issue is None else 1
+  assert f"Successfully processed {expected_successes} issues." in caplog.text
+  assert "Skipped 2 issues." in caplog.text
+  assert ("Failed to process 1 issues." in caplog.text) == (
+      failing_issue is not None
+  )
