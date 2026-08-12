@@ -49,7 +49,7 @@ This skill guides AI assistants in performing a comprehensive, rigorous review o
 
 ### 7. Test Coverage & Quality
 - **Coverage**: Ensure that all modified or new code paths have corresponding unit or integration tests under `tests/`.
-- **ADK Test Rules**: Ensure test implementations adhere to the 9 rules in the `adk-style` testing reference (e.g., using deterministic IDs, event normalization, and clean up utilities).
+- **ADK Test Rules**: Ensure test implementations follow the rules in the `adk-style` testing reference (e.g., test names describe behavior not mechanism, one behavior per test, test through the public interface, and a new test belongs in the existing `test_<module>*.py` file for its unit rather than a file named after the change).
 
 ---
 

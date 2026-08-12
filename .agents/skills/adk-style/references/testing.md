@@ -203,6 +203,32 @@ def test_cache_behavior():
     assert cache.size == 2
 ```
 
+### 10. One test file per unit under test, not per change
+
+Add a new test to the existing test file for the module or feature under test.
+Never create a test file named after a CL, bug, or change — it fragments a
+module's coverage across files and rots, because the next person editing that
+module looks in the module's file, not in a file named after a one-time cleanup.
+
+Before adding a file, look for an existing home (`test_<module>*.py`). ADK
+already splits some modules by concern, so the home may be feature-specific
+(e.g. an `LlmAgent` error-message test belongs in
+`test_llm_agent_error_messages.py`, a runner test in `test_runners.py`). If a
+sibling test already asserts the same behavior, extend that assertion rather
+than duplicating it in a new file. Only create a new file for a genuinely new
+module or feature area, naming it `test_<module>_<feature>.py`.
+
+```python
+# Bad — a file named after the change; splits llm_agent/runner/llm_request
+#       coverage across a grab-bag no one will maintain
+tests/unittests/agents/test_improved_error_messages.py
+
+# Good — each test lands in the existing file for its unit
+tests/unittests/agents/test_llm_agent_error_messages.py  # LlmAgent messages
+tests/unittests/models/test_llm_request.py               # LlmRequest messages
+tests/unittests/test_runners.py                          # Runner messages
+```
+
 ### Test Structure Template
 
 ```python
