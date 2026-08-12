@@ -9,6 +9,9 @@ This directory contains specific developer guides for the ADK Python implementat
 * [LlmAgent Task Mode](agents/llm_agent/task.md) - Guide on using LlmAgent in task mode.
 * [ManagedAgent](agents/managed_agent/index.md) - Guide on using ManagedAgent with server-side tools.
 
+### Apps
+* [App](apps/app/index.md) - The top-level container binding a root agent to app-wide plugins and configuration.
+
 ### Artifacts
 * [BaseArtifactService](artifacts/artifact_service/index.md) - Storing binary payloads outside the conversation history, with versioning and user-scoped filenames.
 
