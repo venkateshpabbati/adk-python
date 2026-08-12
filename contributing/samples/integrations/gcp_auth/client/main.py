@@ -167,7 +167,21 @@ async def chat(request: ChatRequest, response: Response):
       return stream_error("No local agent specified.")
 
     # Validate that the local agent exists in the project directory
-    agent_file = os.path.join(AGENT_PROJECT_DIR, f"{request.local_agent}.py")
+    if (
+        os.path.isabs(request.local_agent)
+        or "/" in request.local_agent
+        or "\\" in request.local_agent
+        or ".." in request.local_agent
+    ):
+      return stream_error("Invalid local agent name.")
+
+    base_dir = os.path.realpath(AGENT_PROJECT_DIR)
+    agent_file = os.path.realpath(
+        os.path.join(base_dir, f"{request.local_agent}.py")
+    )
+    if os.path.commonpath([base_dir, agent_file]) != base_dir:
+      return stream_error("Invalid local agent path.")
+
     if not os.path.exists(agent_file):
       return stream_error(
           f"Local agent module {request.local_agent} not found in"
