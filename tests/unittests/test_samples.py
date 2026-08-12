@@ -50,7 +50,11 @@ def get_test_files():
   """Yields (sample_dir, test_file_path)."""
   if not CONTRIBUTING_DIR.exists():
     return
-  for test_file in CONTRIBUTING_DIR.rglob("tests/*.json"):
+  # Sort files to ensure deterministic order across pytest-xdist workers
+  test_files = sorted(
+      CONTRIBUTING_DIR.rglob("tests/*.json"), key=lambda p: p.as_posix()
+  )
+  for test_file in test_files:
     sample_dir = test_file.parent.parent
     if (
         (sample_dir / "agent.py").exists()
@@ -149,6 +153,9 @@ XFAIL_LOAD = {
 }
 
 _DUMMY_ENV = {
+    # Samples in this repo are trusted, so they are allowed to declare a stdio
+    # MCP server in their agent config. Loading one does not start the server.
+    "ADK_ALLOW_CONFIG_STDIO_MCP_SERVERS": "1",
     "GOOGLE_API_KEY": "dummy-key",
     "GEMINI_API_KEY": "dummy-key",
     "GOOGLE_CLOUD_PROJECT": "dummy-project",
