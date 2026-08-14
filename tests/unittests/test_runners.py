@@ -1918,7 +1918,13 @@ class TestRunnerResolveApp:
   def test_resolve_app_rejects_app_and_agent(self):
     """Test that providing both app and agent raises."""
     app = App(name="test_app", root_agent=self.root_agent)
-    with pytest.raises(ValueError, match="Only one of app, agent, or node"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Only one of app, agent, or node may be provided, but got:"
+            r" app=App, agent=MockLlmAgent\. Pass exactly one to Runner\(\)\."
+        ),
+    ):
       Runner(
           app=app,
           agent=self.root_agent,
@@ -1931,7 +1937,13 @@ class TestRunnerResolveApp:
 
     app = App(name="test_app", root_agent=self.root_agent)
     node = BaseNode(name="test_node")
-    with pytest.raises(ValueError, match="Only one of app, agent, or node"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Only one of app, agent, or node may be provided, but got:"
+            r" app=App, node=BaseNode\. Pass exactly one to Runner\(\)\."
+        ),
+    ):
       Runner(
           app=app,
           node=node,
@@ -1943,7 +1955,14 @@ class TestRunnerResolveApp:
     from google.adk.workflow._base_node import BaseNode
 
     node = BaseNode(name="test_node")
-    with pytest.raises(ValueError, match="Only one of app, agent, or node"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Only one of app, agent, or node may be provided, but got:"
+            r" agent=MockLlmAgent, node=BaseNode\. Pass exactly one to"
+            r" Runner\(\)\."
+        ),
+    ):
       Runner(
           app_name="test_app",
           agent=self.root_agent,
@@ -1954,7 +1973,11 @@ class TestRunnerResolveApp:
   def test_resolve_app_rejects_none(self):
     """Test that providing no app, agent, or node raises."""
     with pytest.raises(
-        ValueError, match="One of app, agent, or node must be provided"
+        ValueError,
+        match=(
+            r"One of app, agent, or node must be provided\. Got none\. Pass"
+            r" exactly one to Runner\(\)\."
+        ),
     ):
       Runner(
           app_name="test_app",
