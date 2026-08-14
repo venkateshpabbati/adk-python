@@ -40,6 +40,7 @@ from .agents.context_cache_config import ContextCacheConfig
 from .agents.invocation_context import InvocationContext
 from .agents.invocation_context import new_invocation_context_id
 from .agents.live_request_queue import LiveRequestQueue
+from .agents.llm.task._finish_task_tool import FINISH_TASK_ERROR_RESULT
 from .agents.llm.task._finish_task_tool import FINISH_TASK_SUCCESS_RESULT
 from .agents.llm.task._finish_task_tool import FINISH_TASK_TOOL_NAME
 from .agents.run_config import RunConfig
@@ -115,12 +116,13 @@ def _find_active_task_scope(session: Session) -> Optional[tuple[str, str]]:
       scope = ``<node_name>@<run_id>``, stamped on every event the
       task agent emits.
 
-  Both close on a SUCCESSFUL ``finish_task`` FunctionResponse —
-  i.e., one whose response is ``FINISH_TASK_SUCCESS_RESULT``.  An
-  error FR (validation failure) does NOT close the scope: the task
-  agent is still active, will see the error, and retry.  Walking
-  backward, the first non-empty scope we encounter that hasn't been
-  closed by a later successful ``finish_task`` is the paused task
+  Both close on a terminal ``finish_task`` FunctionResponse containing a
+  'result' key matching ``FINISH_TASK_SUCCESS_RESULT`` or
+  ``FINISH_TASK_ERROR_RESULT``. A FunctionResponse containing an 'error' key
+  (indicating a tool validation failure) does NOT close the scope: the task
+  agent is still active, will see the validation error, and retry. Walking
+  backward, the first non-empty scope we encounter that hasn't been closed by a
+  later successful or failed terminal ``finish_task`` is the paused task
   awaiting the user's next reply.
 
   Used by ``Runner._append_user_event`` to scope the new user message
@@ -130,8 +132,12 @@ def _find_active_task_scope(session: Session) -> Optional[tuple[str, str]]:
     A tuple of (isolation_scope, invocation_id) for the active task if found,
     or None if no active task scope is found.
   """
+  # Pass 1: Scan forward to find all scopes that have successfully finished.
+  # We must do this in a separate pass because walking backward directly would
+  # hit post-finish events (like status updates or duplicate FRs) before hitting
+  # the older success FR, falsely indicating the scope is still active.
   finished_scopes: set[str] = set()
-  for event in reversed(session.events):
+  for event in session.events:
     scope = event.isolation_scope
     if not scope:
       continue
@@ -140,9 +146,18 @@ def _find_active_task_scope(session: Session) -> Optional[tuple[str, str]]:
         fr = part.function_response
         if fr and fr.name == FINISH_TASK_TOOL_NAME:
           response = fr.response or {}
-          if response.get('result') == FINISH_TASK_SUCCESS_RESULT:
+          if response.get('result') in (
+              FINISH_TASK_SUCCESS_RESULT,
+              FINISH_TASK_ERROR_RESULT,
+          ):
             finished_scopes.add(scope)
           break
+
+  # Pass 2: Walk backward to find the latest active scope that is not finished.
+  for event in reversed(session.events):
+    scope = event.isolation_scope
+    if not scope:
+      continue
     if scope not in finished_scopes:
       return scope, event.invocation_id
   return None
@@ -1203,6 +1218,15 @@ class Runner:
     from .agents.llm_agent import LlmAgent
     from .workflow._base_node import BaseNode
 
+    # Optional dependency: RemoteA2aAgent is only available if a2a is installed.
+    remote_a2a_agent_type: Any = None
+    try:
+      from .agents.remote_a2a_agent import RemoteA2aAgent  # pylint: disable=g-import-not-at-top
+
+      remote_a2a_agent_type = RemoteA2aAgent
+    except ImportError:
+      pass
+
     if isinstance(self.agent, LlmAgent):
       if self.agent.mode is None:
         # LlmAgent as root agent defaults to chat mode.
@@ -1223,8 +1247,14 @@ class Runner:
           # when the chat coordinator has task-mode sub-agents,
           # the wrapper handles delegation via ctx.run_node. Don't let
           # the legacy sub-agent picker bypass the coordinator on resume.
+          remote_a2a_agent_class = (
+              (remote_a2a_agent_type,)
+              if remote_a2a_agent_type is not None
+              else ()
+          )
           has_task_subagent = any(
-              isinstance(sa, LlmAgent) and getattr(sa, 'mode', None) == 'task'
+              isinstance(sa, (LlmAgent,) + remote_a2a_agent_class)
+              and getattr(sa, 'mode', None) == 'task'
               for sa in self.agent.sub_agents or []
           )
           agent_to_run: BaseAgent
