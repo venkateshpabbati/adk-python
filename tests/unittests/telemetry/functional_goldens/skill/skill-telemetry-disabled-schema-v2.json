@@ -44,11 +44,7 @@
                   "gcp.vertex.agent.tool_call_args": "{}",
                   "gen_ai.tool.call.id": "PRESENT",
                   "gcp.vertex.agent.event_id": "PRESENT",
-                  "gcp.vertex.agent.tool_response": "{}",
-                  "adk.experimental.skill.name": "registry-skill",
-                  "adk.experimental.skill.description": "A sample skill.",
-                  "adk.experimental.skill.source.uri": "https://fake-registry.com/skill/registry-skill",
-                  "adk.experimental.skill.additional_tools": []
+                  "gcp.vertex.agent.tool_response": "{}"
                 },
                 "status": "UNSET",
                 "children": [],
@@ -127,11 +123,7 @@
                   "gcp.vertex.agent.tool_call_args": "{}",
                   "gen_ai.tool.call.id": "PRESENT",
                   "gcp.vertex.agent.event_id": "PRESENT",
-                  "gcp.vertex.agent.tool_response": "{}",
-                  "adk.experimental.skill.name": "registry-skill",
-                  "adk.experimental.skill.description": "A sample skill.",
-                  "adk.experimental.skill.source.uri": "https://fake-registry.com/skill/registry-skill",
-                  "adk.experimental.skill.additional_tools": []
+                  "gcp.vertex.agent.tool_response": "{}"
                 },
                 "status": "UNSET",
                 "children": [],
