@@ -1112,11 +1112,17 @@ def _present_other_agent_message(
           types.Part(text=f'[{event.author}] said: {part.text}')
       )
     elif part.function_call:
+      # Sort args by key so the rendered dict is deterministic across runs.
+      args = (
+          dict(sorted(part.function_call.args.items()))
+          if part.function_call.args
+          else part.function_call.args
+      )
       content.parts.append(
           types.Part(
               text=(
                   f'[{event.author}] called tool `{part.function_call.name}`'
-                  f' with parameters: {part.function_call.args}'
+                  f' with parameters: {args}'
               )
           )
       )
@@ -1306,16 +1312,6 @@ def _is_live_model_media_event_with_inline_data(event: Event) -> bool:
   return False
 
 
-def _content_contains_function_response(content: types.Content) -> bool:
-  """Checks whether the content includes any function response parts."""
-  if not content.parts:
-    return False
-  for part in content.parts:
-    if part.function_response:
-      return True
-  return False
-
-
 def _add_model_input_context_to_user_content(
     invocation_context: InvocationContext,
     llm_request: LlmRequest,
@@ -1356,24 +1352,6 @@ async def _add_instructions_to_user_content(
   """
   if not instruction_contents:
     return
-
-  # Find the insertion point: before the last continuous batch of user content
-  # Walk backwards to find the first non-user content, then insert after it
-  insert_index = len(llm_request.contents)
-
-  if llm_request.contents:
-    for i in range(len(llm_request.contents) - 1, -1, -1):
-      content = llm_request.contents[i]
-      if content.role != 'user':
-        insert_index = i + 1
-        break
-      if _content_contains_function_response(content):
-        insert_index = i + 1
-        break
-      insert_index = i
-  else:
-    # No contents remaining, just append at the end
-    insert_index = 0
-
-  # Insert all instruction contents at the proper position using efficient slicing
-  llm_request.contents[insert_index:insert_index] = instruction_contents
+  llm_request._insert_transient_user_content(  # pylint: disable=protected-access
+      instruction_contents
+  )

@@ -31,6 +31,8 @@ from ...tools.base_tool import BaseTool
 from ...tools.tool_confirmation import ToolConfirmation
 from ...tools.tool_context import ToolContext
 from ._base_llm_processor import BaseLlmRequestProcessor
+from .agent_transfer import _build_transfer_tool
+from .agent_transfer import _get_transfer_targets
 from .functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
 
 if TYPE_CHECKING:
@@ -38,6 +40,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("google_adk." + __name__)
+
+_A2A_METADATA_KEY = "a2a_metadata"
 
 
 def _parse_tool_confirmation(response: dict[str, Any]) -> ToolConfirmation:
@@ -130,6 +134,8 @@ async def _resolve_confirmation_targets(
 
     for function_call in event_function_calls:
       if not function_call.id or function_call.id not in confirmation_fc_ids:
+        continue
+      if function_call.name != REQUEST_CONFIRMATION_FUNCTION_CALL_NAME:
         continue
 
       original_function_call_args = _get_original_function_call_args(
@@ -258,6 +264,18 @@ class _RequestConfirmationLlmRequestProcessor(BaseLlmRequestProcessor):
 
     agent = invocation_context.agent
 
+    # A human-in-the-loop confirmation must not be satisfiable by a
+    # function_response that arrived over A2A: a remote peer is not the human
+    # operator and could self-approve a pending dangerous tool call.
+    run_config = invocation_context.run_config
+    custom_metadata = run_config.custom_metadata if run_config else None
+    if custom_metadata is not None and _A2A_METADATA_KEY in custom_metadata:
+      logger.warning(
+          "Ignoring tool confirmation(s) that arrived over A2A: a remote peer"
+          " cannot satisfy a human-in-the-loop confirmation."
+      )
+      return
+
     # Only look at events in the current branch.
     events = invocation_context._get_events(current_branch=True)
     if not events:
@@ -328,6 +346,14 @@ class _RequestConfirmationLlmRequestProcessor(BaseLlmRequestProcessor):
               ReadonlyContext(invocation_context)
           )
       }
+
+    from ...agents.llm_agent import LlmAgent
+
+    if isinstance(agent, LlmAgent):
+      transfer_targets = _get_transfer_targets(agent)
+      if transfer_targets:
+        transfer_tool = _build_transfer_tool(transfer_targets)
+        tools_dict[transfer_tool.name] = transfer_tool
 
     # Step 3: Resolve confirmation targets using extracted helper.
     confirmation_fc_ids = set(confirmations_by_fc_id.keys())

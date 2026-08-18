@@ -23,6 +23,7 @@ import time
 from unittest import mock
 import warnings
 
+from google.adk.errors import StaleSessionError
 from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.events.event import Event
@@ -984,7 +985,7 @@ async def test_append_event_to_stale_session():
         timestamp=current_time + 3,
         actions=EventActions(state_delta={'sk3': 'v3'}),
     )
-    with pytest.raises(ValueError, match='modified in storage'):
+    with pytest.raises(StaleSessionError, match='modified in storage'):
       await session_service.append_event(original_session, event3)
 
     # If we fetch session from DB, it should only contain the committed events.
@@ -999,6 +1000,35 @@ async def test_append_event_to_stale_session():
         'inv1',
         'inv2',
     ]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_append_event_uses_typed_stale_session_error(tmp_path):
+  """The legacy SQLite backend exposes the shared stale-writer contract."""
+  service = get_session_service(SessionServiceType.SQLITE, tmp_path)
+  session = await service.create_session(app_name='app', user_id='user')
+  stale_session = session.model_copy(deep=True)
+
+  await service.append_event(
+      session,
+      Event(
+          invocation_id='winner',
+          author='user',
+          timestamp=session.last_update_time + 1,
+      ),
+  )
+
+  with pytest.raises(StaleSessionError) as error:
+    await service.append_event(
+        stale_session,
+        Event(
+            invocation_id='stale',
+            author='user',
+            timestamp=session.last_update_time + 1,
+        ),
+    )
+
+  assert isinstance(error.value, ValueError)
 
 
 @pytest.mark.asyncio
@@ -1101,7 +1131,7 @@ async def test_append_event_concurrent_stale_sessions_reject_stale_writer():
       ]
       assert len(successes) == 1
       assert len(errors) == 1
-      assert isinstance(errors[0], ValueError)
+      assert isinstance(errors[0], StaleSessionError)
       assert 'modified in storage' in str(errors[0])
 
     session_final = await session_service.get_session(
@@ -2535,3 +2565,93 @@ def test_list_sessions_sync_unknown_app_or_user_returns_empty_response():
   assert [
       s.id for s in service.list_sessions_sync(app_name='my_app').sessions
   ] == ['s1']
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for duplicate-event deduplication (issue #5723)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'session_service',
+    [InMemorySessionService()],
+    ids=['in_memory'],
+)
+async def test_append_event_is_idempotent_for_same_event_id(session_service):
+  """Re-delivering an event must not duplicate entries or double-apply state.
+
+  A broadcast can re-deliver the same event either as the same object or as
+  an equal copy, so both must be deduplicated.
+  """
+  app_name = 'test_app'
+  user_id = 'user_dup'
+  session = await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='session_dup'
+  )
+
+  event = Event(
+      invocation_id='inv_dup',
+      author='user',
+      actions=EventActions(state_delta={'session:counter': 1}),
+  )
+
+  # Re-deliver as the same object and again as an equal copy (a broadcast
+  # to several concurrent session references can produce either).
+  await session_service.append_event(session=session, event=event)
+  await session_service.append_event(session=session, event=event)
+  await session_service.append_event(
+      session=session, event=event.model_copy(deep=True)
+  )
+
+  # The storage session must contain the event exactly once.
+  retrieved = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id='session_dup'
+  )
+  matching = [e for e in retrieved.events if e.id == event.id]
+  assert (
+      len(matching) == 1
+  ), f'Expected 1 occurrence of event {event.id!r}, got {len(matching)}'
+
+  # State must not be double-applied.
+  assert (
+      retrieved.state.get('session:counter') == 1
+  ), 'State was applied more than once — duplicate event caused double-apply'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'session_service',
+    [InMemorySessionService()],
+    ids=['in_memory'],
+)
+async def test_append_different_events_not_deduplicated(session_service):
+  """Distinct events must both be stored, even when they share an event id.
+
+  Deduplication is keyed on object identity, not event id: a caller can
+  legitimately reuse an id across genuinely different events (e.g. a test
+  that patches uuid4 to a constant), and keying on id alone would silently
+  drop the later events.
+  """
+  app_name = 'test_app'
+  user_id = 'user_multi'
+  session = await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='session_multi'
+  )
+
+  # Two genuinely different events that share an id, as happens when a test
+  # patches uuid generation to a fixed value.
+  shared_id = 'shared-event-id'
+  e1 = Event(id=shared_id, invocation_id='inv_a', author='user')
+  e2 = Event(id=shared_id, invocation_id='inv_b', author='agent')
+
+  await session_service.append_event(session=session, event=e1)
+  await session_service.append_event(session=session, event=e2)
+
+  retrieved = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id='session_multi'
+  )
+  assert (
+      len(retrieved.events) == 2
+  ), f'Expected 2 distinct events, got {len(retrieved.events)}'
+  assert [e.author for e in retrieved.events] == ['user', 'agent']
