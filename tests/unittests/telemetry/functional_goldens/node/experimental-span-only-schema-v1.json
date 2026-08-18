@@ -14,6 +14,30 @@
         "status": "UNSET",
         "children": [
           {
+            "name": "invoke_workflow my_nested_workflow",
+            "attributes": {
+              "gen_ai.operation.name": "invoke_workflow",
+              "gen_ai.conversation.id": "PRESENT",
+              "gen_ai.workflow.nested": true,
+              "gen_ai.workflow.name": "my_nested_workflow"
+            },
+            "status": "UNSET",
+            "children": [
+              {
+                "name": "invoke_node some_node",
+                "attributes": {
+                  "gen_ai.operation.name": "invoke_node",
+                  "gen_ai.conversation.id": "PRESENT",
+                  "gcp.vertex.agent.associated_event_ids": "PRESENT"
+                },
+                "status": "UNSET",
+                "children": [],
+                "logs": []
+              }
+            ],
+            "logs": []
+          },
+          {
             "name": "invoke_agent some_root_agent",
             "attributes": {
               "gen_ai.operation.name": "invoke_agent",
@@ -43,25 +67,6 @@
                 },
                 "status": "UNSET",
                 "children": [
-                  {
-                    "name": "execute_tool some_tool",
-                    "attributes": {
-                      "gen_ai.operation.name": "execute_tool",
-                      "gen_ai.tool.description": "A sample tool.",
-                      "gen_ai.tool.name": "some_tool",
-                      "gen_ai.tool.type": "FunctionTool",
-                      "gen_ai.agent.name": "some_root_agent",
-                      "gcp.vertex.agent.llm_request": "{}",
-                      "gcp.vertex.agent.llm_response": "{}",
-                      "gcp.vertex.agent.tool_call_args": "{}",
-                      "gen_ai.tool.call.id": "PRESENT",
-                      "gcp.vertex.agent.event_id": "PRESENT",
-                      "gcp.vertex.agent.tool_response": "{}"
-                    },
-                    "status": "UNSET",
-                    "children": [],
-                    "logs": []
-                  },
                   {
                     "name": "generate_content mock",
                     "attributes": {
@@ -160,6 +165,25 @@
                         }
                       }
                     ]
+                  },
+                  {
+                    "name": "execute_tool some_tool",
+                    "attributes": {
+                      "gen_ai.operation.name": "execute_tool",
+                      "gen_ai.tool.description": "A sample tool.",
+                      "gen_ai.tool.name": "some_tool",
+                      "gen_ai.tool.type": "FunctionTool",
+                      "gen_ai.agent.name": "some_root_agent",
+                      "gcp.vertex.agent.llm_request": "{}",
+                      "gcp.vertex.agent.llm_response": "{}",
+                      "gcp.vertex.agent.tool_call_args": "{}",
+                      "gen_ai.tool.call.id": "PRESENT",
+                      "gcp.vertex.agent.event_id": "PRESENT",
+                      "gcp.vertex.agent.tool_response": "{}"
+                    },
+                    "status": "UNSET",
+                    "children": [],
+                    "logs": []
                   }
                 ],
                 "logs": []
@@ -305,30 +329,6 @@
                     ]
                   }
                 ],
-                "logs": []
-              }
-            ],
-            "logs": []
-          },
-          {
-            "name": "invoke_workflow my_nested_workflow",
-            "attributes": {
-              "gen_ai.operation.name": "invoke_workflow",
-              "gen_ai.conversation.id": "PRESENT",
-              "gen_ai.workflow.nested": true,
-              "gen_ai.workflow.name": "my_nested_workflow"
-            },
-            "status": "UNSET",
-            "children": [
-              {
-                "name": "invoke_node some_node",
-                "attributes": {
-                  "gen_ai.operation.name": "invoke_node",
-                  "gen_ai.conversation.id": "PRESENT",
-                  "gcp.vertex.agent.associated_event_ids": "PRESENT"
-                },
-                "status": "UNSET",
-                "children": [],
                 "logs": []
               }
             ],

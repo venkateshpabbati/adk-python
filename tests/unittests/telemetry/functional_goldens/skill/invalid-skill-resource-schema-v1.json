@@ -28,6 +28,50 @@
             "status": "UNSET",
             "children": [
               {
+                "name": "generate_content mock",
+                "attributes": {
+                  "gen_ai.system": "gemini",
+                  "gen_ai.operation.name": "generate_content",
+                  "gen_ai.request.model": "mock",
+                  "gen_ai.agent.name": "some_root_agent",
+                  "gen_ai.conversation.id": "PRESENT",
+                  "gcp.vertex.agent.event_id": "PRESENT",
+                  "gcp.vertex.agent.invocation_id": "PRESENT"
+                },
+                "status": "UNSET",
+                "children": [],
+                "logs": [
+                  {
+                    "event_name": "gen_ai.system.message",
+                    "body": {
+                      "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.user.message",
+                    "body": {
+                      "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.choice",
+                    "body": {
+                      "content": "<elided>",
+                      "index": 0
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  }
+                ]
+              },
+              {
                 "name": "execute_tool load_skill_resource",
                 "attributes": {
                   "gen_ai.operation.name": "execute_tool",
@@ -49,50 +93,6 @@
                 "status": "ERROR",
                 "children": [],
                 "logs": []
-              },
-              {
-                "name": "generate_content mock",
-                "attributes": {
-                  "gen_ai.system": "gemini",
-                  "gen_ai.operation.name": "generate_content",
-                  "gen_ai.request.model": "mock",
-                  "gen_ai.agent.name": "some_root_agent",
-                  "gen_ai.conversation.id": "PRESENT",
-                  "gcp.vertex.agent.event_id": "PRESENT",
-                  "gcp.vertex.agent.invocation_id": "PRESENT"
-                },
-                "status": "UNSET",
-                "children": [],
-                "logs": [
-                  {
-                    "event_name": "gen_ai.choice",
-                    "body": {
-                      "content": "<elided>",
-                      "index": 0
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
-                    "event_name": "gen_ai.system.message",
-                    "body": {
-                      "content": "<elided>"
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
-                    "event_name": "gen_ai.user.message",
-                    "body": {
-                      "content": "<elided>"
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  }
-                ]
               }
             ],
             "logs": []
@@ -110,6 +110,68 @@
             },
             "status": "UNSET",
             "children": [
+              {
+                "name": "generate_content mock",
+                "attributes": {
+                  "gen_ai.system": "gemini",
+                  "gen_ai.operation.name": "generate_content",
+                  "gen_ai.request.model": "mock",
+                  "gen_ai.agent.name": "some_root_agent",
+                  "gen_ai.conversation.id": "PRESENT",
+                  "gcp.vertex.agent.event_id": "PRESENT",
+                  "gcp.vertex.agent.invocation_id": "PRESENT"
+                },
+                "status": "UNSET",
+                "children": [],
+                "logs": [
+                  {
+                    "event_name": "gen_ai.system.message",
+                    "body": {
+                      "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.user.message",
+                    "body": {
+                      "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.user.message",
+                    "body": {
+                      "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.user.message",
+                    "body": {
+                      "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.choice",
+                    "body": {
+                      "content": "<elided>",
+                      "index": 0
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  }
+                ]
+              },
               {
                 "name": "execute_tool load_skill_resource",
                 "attributes": {
@@ -132,68 +194,6 @@
                 "status": "ERROR",
                 "children": [],
                 "logs": []
-              },
-              {
-                "name": "generate_content mock",
-                "attributes": {
-                  "gen_ai.system": "gemini",
-                  "gen_ai.operation.name": "generate_content",
-                  "gen_ai.request.model": "mock",
-                  "gen_ai.agent.name": "some_root_agent",
-                  "gen_ai.conversation.id": "PRESENT",
-                  "gcp.vertex.agent.event_id": "PRESENT",
-                  "gcp.vertex.agent.invocation_id": "PRESENT"
-                },
-                "status": "UNSET",
-                "children": [],
-                "logs": [
-                  {
-                    "event_name": "gen_ai.choice",
-                    "body": {
-                      "content": "<elided>",
-                      "index": 0
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
-                    "event_name": "gen_ai.system.message",
-                    "body": {
-                      "content": "<elided>"
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
-                    "event_name": "gen_ai.user.message",
-                    "body": {
-                      "content": "<elided>"
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
-                    "event_name": "gen_ai.user.message",
-                    "body": {
-                      "content": "<elided>"
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
-                    "event_name": "gen_ai.user.message",
-                    "body": {
-                      "content": "<elided>"
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  }
-                ]
               }
             ],
             "logs": []
@@ -226,16 +226,6 @@
                 "children": [],
                 "logs": [
                   {
-                    "event_name": "gen_ai.choice",
-                    "body": {
-                      "content": "<elided>",
-                      "index": 0
-                    },
-                    "attributes": {
-                      "gen_ai.system": "gemini"
-                    }
-                  },
-                  {
                     "event_name": "gen_ai.system.message",
                     "body": {
                       "content": "<elided>"
@@ -284,6 +274,16 @@
                     "event_name": "gen_ai.user.message",
                     "body": {
                       "content": "<elided>"
+                    },
+                    "attributes": {
+                      "gen_ai.system": "gemini"
+                    }
+                  },
+                  {
+                    "event_name": "gen_ai.choice",
+                    "body": {
+                      "content": "<elided>",
+                      "index": 0
                     },
                     "attributes": {
                       "gen_ai.system": "gemini"

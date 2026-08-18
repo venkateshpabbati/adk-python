@@ -146,7 +146,10 @@ class SpanDigest:
   ) -> SpanDigest:
     """Builds the in-memory span tree, attaching logs by span id.
 
-    Used for clear diffs with pytest assertions.
+    Children and logs come out in the order they were emitted -- the scenario
+    runs single-threaded, so that order is deterministic, and it is the order
+    a reader of the golden expects the run to have gone in. The exporter hands
+    spans over as they *end*, so the tree is assembled by start time.
     """
     digest_by_id: dict[int, SpanDigest] = {}
     for span in spans:
@@ -155,7 +158,7 @@ class SpanDigest:
       digest_by_id[span.context.span_id] = cls.from_span(span)
 
     # Attach each log to its enclosing span (matched by span_id).
-    for log in logs:
+    for log in sorted(logs, key=lambda log: log.log_record.observed_timestamp):
       span_id = log.log_record.span_id
       if span_id is None or span_id == 0:
         continue
@@ -165,7 +168,7 @@ class SpanDigest:
       digest.logs.append(LogDigest.from_log(log))
 
     root: SpanDigest | None = None
-    for span in spans:
+    for span in sorted(spans, key=lambda span: span.start_time or 0):
       if span.context is None:
         continue
       digest = digest_by_id[span.context.span_id]
@@ -177,38 +180,9 @@ class SpanDigest:
           raise ValueError("Multiple root spans found.")
         root = digest
 
-    # Sort for deterministic comparisons.
-    for digest in digest_by_id.values():
-      digest.children.sort(key=lambda s: s.name)
-      digest.logs[:] = sorted_log_digests(digest.logs)
-
     if root is None:
       raise ValueError("No root span found in the provided spans.")
     return root
-
-  def all_logs(self) -> list[LogDigest]:
-    """Returns all log digests in the tree, sorted deterministically."""
-    collected: list[LogDigest] = []
-
-    def _walk(node: SpanDigest) -> None:
-      collected.extend(node.logs)
-      for child in node.children:
-        _walk(child)
-
-    _walk(self)
-    return sorted_log_digests(collected)
-
-
-def sorted_log_digests(logs: list[LogDigest]) -> list[LogDigest]:
-  """Returns ``logs`` sorted in a stable, content-derived order."""
-  return sorted(
-      logs,
-      key=lambda log: (
-          log.event_name,
-          json.dumps(log.body, sort_keys=True, default=str),
-          json.dumps(log.attributes, sort_keys=True, default=str),
-      ),
-  )
 
 
 @dataclass(frozen=True)
