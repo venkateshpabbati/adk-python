@@ -43,6 +43,7 @@ from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.tools.base_toolset import BaseToolset
+from google.adk.tools.enterprise_search_tool import EnterpriseWebSearchTool
 from google.adk.tools.google_search_tool import GoogleSearchTool
 from google.adk.utils.context_utils import Aclosing
 from google.adk.utils.variant_utils import GoogleLLMVariant
@@ -2945,3 +2946,191 @@ async def test_llm_calls_are_counted_against_max_llm_calls():
 
   with pytest.raises(LlmCallsLimitExceededError):
     await _drive_one_llm_call(flow, invocation_context)
+
+
+@pytest.mark.asyncio
+async def test_search_agent_in_hierarchy_without_bypass_does_not_inject_transfer():
+  """A sub-agent using built-in google_search must not receive transfer_to_agent."""
+  search_agent = Agent(
+      name='search_agent',
+      model='gemini-2.0-flash',
+      tools=[GoogleSearchTool(bypass_multi_tools_limit=False)],
+  )
+  _ = Agent(
+      name='root_agent',
+      model='gemini-2.0-flash',
+      sub_agents=[search_agent],
+  )
+  ctx = await testing_utils.create_invocation_context(
+      agent=search_agent, user_content='search for weather'
+  )
+  llm_request = LlmRequest(model='gemini-2.0-flash')
+  flow = search_agent._llm_flow
+
+  async for _ in flow._preprocess_async(ctx, llm_request):
+    pass
+
+  assert 'transfer_to_agent' not in llm_request.tools_dict
+  assert len(llm_request.config.tools) == 1
+  assert llm_request.config.tools[0].google_search is not None
+
+
+@pytest.mark.asyncio
+async def test_search_agent_in_hierarchy_with_bypass_injects_transfer_and_agent_tool():
+  """A sub-agent using bypassed google_search receives both transfer_to_agent and google_search_agent."""
+  search_agent = Agent(
+      name='search_agent',
+      model='gemini-2.0-flash',
+      tools=[GoogleSearchTool(bypass_multi_tools_limit=True)],
+  )
+  _ = Agent(
+      name='root_agent',
+      model='gemini-2.0-flash',
+      sub_agents=[search_agent],
+  )
+  ctx = await testing_utils.create_invocation_context(
+      agent=search_agent, user_content='search for weather'
+  )
+  llm_request = LlmRequest(model='gemini-2.0-flash')
+  flow = search_agent._llm_flow
+
+  async for _ in flow._preprocess_async(ctx, llm_request):
+    pass
+
+  assert 'transfer_to_agent' in llm_request.tools_dict
+  assert 'google_search_agent' in llm_request.tools_dict
+  assert len(llm_request.config.tools) == 1
+  func_decl_names = [
+      fd.name for fd in llm_request.config.tools[0].function_declarations
+  ]
+  assert 'transfer_to_agent' in func_decl_names
+  assert 'google_search_agent' in func_decl_names
+
+
+@pytest.mark.asyncio
+async def test_search_agent_in_hierarchy_enterprise_web_search_does_not_inject_transfer():
+  """A sub-agent using EnterpriseWebSearchTool does not receive transfer_to_agent."""
+  search_agent = Agent(
+      name='search_agent',
+      model='gemini-2.0-flash',
+      tools=[EnterpriseWebSearchTool()],
+  )
+  _ = Agent(
+      name='root_agent',
+      model='gemini-2.0-flash',
+      sub_agents=[search_agent],
+  )
+  ctx = await testing_utils.create_invocation_context(
+      agent=search_agent, user_content='search for enterprise docs'
+  )
+  llm_request = LlmRequest(model='gemini-2.0-flash')
+  flow = search_agent._llm_flow
+
+  async for _ in flow._preprocess_async(ctx, llm_request):
+    pass
+
+  assert 'transfer_to_agent' not in llm_request.tools_dict
+  assert len(llm_request.config.tools) == 1
+  assert llm_request.config.tools[0].enterprise_web_search is not None
+
+
+@pytest.mark.asyncio
+async def test_search_agent_with_sub_agents_and_builtin_search_raises_value_error():
+  """An agent with sub_agents using built-in GoogleSearchTool without bypass raises ValueError."""
+  sub_agent = Agent(
+      name='sub_agent',
+      model='gemini-2.0-flash',
+  )
+  root_agent = Agent(
+      name='root_agent',
+      model='gemini-2.0-flash',
+      tools=[GoogleSearchTool(bypass_multi_tools_limit=False)],
+      sub_agents=[sub_agent],
+  )
+  ctx = await testing_utils.create_invocation_context(
+      agent=root_agent, user_content='search and delegate'
+  )
+  llm_request = LlmRequest(model='gemini-2.0-flash')
+  flow = root_agent._llm_flow
+
+  with pytest.raises(
+      ValueError,
+      match=(
+          'has sub-agent transfer targets but is configured with'
+          ' GoogleSearchTool'
+      ),
+  ):
+    async for _ in flow._preprocess_async(ctx, llm_request):
+      pass
+
+
+@pytest.mark.asyncio
+async def test_search_agent_with_sub_agents_and_enterprise_search_raises_value_error():
+  """An agent with sub_agents using EnterpriseWebSearchTool raises ValueError."""
+  sub_agent = Agent(
+      name='sub_agent',
+      model='gemini-2.0-flash',
+  )
+  root_agent = Agent(
+      name='root_agent',
+      model='gemini-2.0-flash',
+      tools=[EnterpriseWebSearchTool()],
+      sub_agents=[sub_agent],
+  )
+  ctx = await testing_utils.create_invocation_context(
+      agent=root_agent, user_content='search and delegate'
+  )
+  llm_request = LlmRequest(model='gemini-2.0-flash')
+  flow = root_agent._llm_flow
+
+  with pytest.raises(
+      ValueError,
+      match=(
+          'has sub-agent transfer targets but is configured with'
+          ' EnterpriseWebSearchTool'
+      ),
+  ):
+    async for _ in flow._preprocess_async(ctx, llm_request):
+      pass
+
+
+@pytest.mark.asyncio
+async def test_search_agent_with_task_mode_sub_agents_and_builtin_search_does_not_raise():
+  """An agent with task-mode sub_agents (not transfer targets) and built-in search does not raise."""
+  task_agent = Agent(
+      name='task_agent',
+      model='gemini-2.0-flash',
+      mode='task',
+  )
+  root_agent = Agent(
+      name='root_agent',
+      model='gemini-2.0-flash',
+      tools=[GoogleSearchTool(bypass_multi_tools_limit=False)],
+      sub_agents=[task_agent],
+  )
+  ctx = await testing_utils.create_invocation_context(
+      agent=root_agent, user_content='search only'
+  )
+  llm_request = LlmRequest(model='gemini-2.0-flash')
+  flow = root_agent._llm_flow
+
+  # Preprocessing should succeed without raising ValueError since task_agent is not a transfer target.
+  async for _ in flow._preprocess_async(ctx, llm_request):
+    pass
+
+  assert 'transfer_to_agent' not in llm_request.tools_dict
+  assert 'task_agent' in llm_request.tools_dict
+  assert len(llm_request.config.tools) == 2
+  assert llm_request.config.tools[0].google_search is not None
+
+
+def test_duck_typed_agent_transfer_targets_safe():
+  """A duck-typed agent without transfer attributes is safe in _get_transfer_targets."""
+  from google.adk.flows.llm_flows.agent_transfer import _get_transfer_targets
+
+  class DuckAgent:
+    tools = []
+    canonical_model = 'gemini-2.0-flash'
+
+  duck = DuckAgent()
+  assert _get_transfer_targets(duck) == []

@@ -492,7 +492,9 @@ async def _process_agent_tools(
     return
   agent = cast('LlmAgent', raw_agent)
 
-  multiple_tools = len(agent.tools) > 1
+  from .agent_transfer import _get_transfer_targets
+
+  multiple_tools = len(agent.tools) > 1 or bool(_get_transfer_targets(agent))
   model = agent.canonical_model
 
   from ...agents.llm_agent import _convert_tool_union_to_tools
