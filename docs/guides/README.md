@@ -5,6 +5,7 @@ This directory contains specific developer guides for the ADK Python implementat
 ## Index
 
 ### Agents
+* [LiveRequestQueue](agents/live_request_queue/index.md) - Streaming content, realtime audio, and stream control signals to live agents.
 * [LlmAgent Single-Turn Mode](agents/llm_agent/single_turn.md) - Guide on using LlmAgent in single-turn mode.
 * [LlmAgent Task Mode](agents/llm_agent/task.md) - Guide on using LlmAgent in task mode.
 * [ManagedAgent](agents/managed_agent/index.md) - Guide on using ManagedAgent with server-side tools.
