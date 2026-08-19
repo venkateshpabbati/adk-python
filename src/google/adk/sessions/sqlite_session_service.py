@@ -205,7 +205,7 @@ class SqliteSessionService(BaseSessionService):
           )
 
       # Extract state deltas
-      state_deltas = _session_util.extract_state_delta(state or {})
+      state_deltas = _session_util.extract_json_safe_state_delta(state or {})
       app_state_delta = state_deltas["app"]
       user_state_delta = state_deltas["user"]
       session_state = state_deltas["session"]
@@ -431,7 +431,7 @@ class SqliteSessionService(BaseSessionService):
       # Apply state delta if present
       has_session_state_delta = False
       if event.actions.state_delta:
-        state_deltas = _session_util.extract_state_delta(
+        state_deltas = _session_util.extract_json_safe_state_delta(
             event.actions.state_delta
         )
         app_state_delta = state_deltas["app"]

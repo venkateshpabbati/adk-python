@@ -885,6 +885,41 @@ async def test_append_event_with_requested_tool_confirmations(session_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'service_type',
+    [SessionServiceType.DATABASE, SessionServiceType.SQLITE],
+)
+async def test_append_event_with_non_serializable_state_delta(
+    service_type, tmp_path
+):
+  """A value the JSON encoder rejects must not destroy the whole event."""
+  session_service = get_session_service(service_type, tmp_path)
+  app_name = 'my_app'
+  user_id = 'user'
+
+  session = await session_service.create_session(
+      app_name=app_name, user_id=user_id
+  )
+  event = Event(
+      invocation_id='invocation',
+      author='user',
+      actions=EventActions(state_delta={'callback': lambda: 1, 'ok': 2}),
+  )
+  await session_service.append_event(session=session, event=event)
+
+  refreshed_session = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=session.id
+  )
+  assert refreshed_session is not None
+  assert len(refreshed_session.events) == 1
+  assert refreshed_session.state['ok'] == 2
+  assert isinstance(refreshed_session.state['callback'], str)
+
+  if isinstance(session_service, DatabaseSessionService):
+    await session_service.close()
+
+
+@pytest.mark.asyncio
 async def test_session_last_update_time_updates_on_event(session_service):
   app_name = 'my_app'
   user_id = 'user'
