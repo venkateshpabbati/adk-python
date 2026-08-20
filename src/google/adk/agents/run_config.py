@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import Any
 from typing import Optional
@@ -211,6 +212,9 @@ class RunConfig(BaseModel):
   """
   A limit on the total number of llm calls for a given run.
 
+  This limit can be overridden by setting the `ADK_MAX_LLM_CALLS` environment
+  variable.
+
   Valid Values:
     - More than 0 and less than sys.maxsize: The bound on the number of llm
       calls is enforced, if the value is set in this range.
@@ -282,6 +286,27 @@ class RunConfig(BaseModel):
       )
       if data['save_live_audio']:
         data['save_live_blob'] = True
+    return data
+
+  @model_validator(mode='before')
+  @classmethod
+  def set_default_max_llm_calls(cls, data: Any) -> Any:
+    """Sets default max_llm_calls from env var if not explicitly provided."""
+    if isinstance(data, dict):
+      if 'max_llm_calls' not in data:
+        env_val = os.getenv('ADK_MAX_LLM_CALLS')
+        if env_val is not None:
+          try:
+            data['max_llm_calls'] = int(env_val)
+          except ValueError:
+            default_val = cls.model_fields['max_llm_calls'].default
+            data['max_llm_calls'] = default_val
+            logger.warning(
+                'Invalid value for ADK_MAX_LLM_CALLS env var: %s. Using default'
+                ' %s.',
+                env_val,
+                default_val,
+            )
     return data
 
   @field_validator('max_llm_calls', mode='after')
