@@ -2875,9 +2875,10 @@ class _CfcFlowForTesting(BaseLlmFlow):
   """BaseLlmFlow subclass that stubs run_live so the CFC branch can be driven."""
 
   async def run_live(self, invocation_context):
-    yield LlmResponse(
-        content=testing_utils.ModelContent(
-            [types.Part.from_text(text='live_hello')]
+    yield Event(
+        author='root_agent',
+        content=types.Content(
+            role='model', parts=[types.Part.from_text(text='live_hello')]
         ),
         turn_complete=True,
     )
@@ -2924,6 +2925,68 @@ async def test_cfc_llm_calls_are_counted_against_max_llm_calls():
 
   with pytest.raises(LlmCallsLimitExceededError):
     await _drive_one_llm_call(flow, invocation_context)
+
+
+@pytest.mark.asyncio
+async def test_cfc_run_async_does_not_duplicate_function_calls():
+  """support_cfc=True in run_async must invoke tool functions exactly once."""
+  call_count = 0
+
+  def test_tool(param: str) -> str:
+    nonlocal call_count
+    call_count += 1
+    return f'result_{param}'
+
+  from google.adk.flows.llm_flows import functions
+
+  class _MockCfcFlow(BaseLlmFlow):
+
+    async def run_live(self, invocation_context):
+      fc_part = types.Part(
+          function_call=types.FunctionCall(
+              id='call_1',
+              name='test_tool',
+              args={'param': 'val'},
+          )
+      )
+      model_event = Event(
+          author='root_agent',
+          content=types.Content(role='model', parts=[fc_part]),
+      )
+      yield model_event
+      from google.adk.tools.function_tool import FunctionTool
+
+      tools_dict = {'test_tool': FunctionTool(test_tool)}
+      fr_event = await functions.handle_function_calls_live(
+          invocation_context,
+          model_event,
+          tools_dict,
+      )
+      if fr_event:
+        yield fr_event
+      yield Event(
+          author='root_agent',
+          content=types.Content(
+              role='model', parts=[types.Part.from_text(text='done')]
+          ),
+          turn_complete=True,
+      )
+
+  agent = Agent(
+      name='root_agent',
+      model=testing_utils.MockModel.create(responses=[]),
+      tools=[test_tool],
+  )
+  flow = _MockCfcFlow()
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent,
+      user_content='test',
+      run_config=RunConfig(support_cfc=True),
+  )
+
+  events = [e async for e in flow.run_async(invocation_context)]
+  assert call_count == 1
+  assert len(events) == 3
 
 
 @pytest.mark.asyncio
