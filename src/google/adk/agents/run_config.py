@@ -34,6 +34,22 @@ from ._streaming_mode import StreamingMode
 
 logger = logging.getLogger('google_adk.' + __name__)
 
+_DEFAULT_MAX_LLM_CALLS = 500
+
+
+def _default_max_llm_calls() -> int:
+  """Resolves the default max LLM calls limit from environment or fallback."""
+  if env_val := os.getenv('ADK_MAX_LLM_CALLS'):
+    try:
+      return int(env_val)
+    except ValueError:
+      logger.warning(
+          'Invalid value for ADK_MAX_LLM_CALLS env var: %s. Using default %s.',
+          env_val,
+          _DEFAULT_MAX_LLM_CALLS,
+      )
+  return _DEFAULT_MAX_LLM_CALLS
+
 
 class ToolThreadPoolConfig(BaseModel):
   """Configuration for the tool thread pool executor.
@@ -208,7 +224,13 @@ class RunConfig(BaseModel):
       ),
   )
 
-  max_llm_calls: int = 500
+  max_llm_calls: int = Field(
+      default_factory=_default_max_llm_calls,
+      description=(
+          'A limit on the total number of llm calls for a given run. Can be'
+          ' overridden by ADK_MAX_LLM_CALLS environment variable.'
+      ),
+  )
   """
   A limit on the total number of llm calls for a given run.
 
@@ -286,27 +308,6 @@ class RunConfig(BaseModel):
       )
       if data['save_live_audio']:
         data['save_live_blob'] = True
-    return data
-
-  @model_validator(mode='before')
-  @classmethod
-  def set_default_max_llm_calls(cls, data: Any) -> Any:
-    """Sets default max_llm_calls from env var if not explicitly provided."""
-    if isinstance(data, dict):
-      if 'max_llm_calls' not in data:
-        env_val = os.getenv('ADK_MAX_LLM_CALLS')
-        if env_val is not None:
-          try:
-            data['max_llm_calls'] = int(env_val)
-          except ValueError:
-            default_val = cls.model_fields['max_llm_calls'].default
-            data['max_llm_calls'] = default_val
-            logger.warning(
-                'Invalid value for ADK_MAX_LLM_CALLS env var: %s. Using default'
-                ' %s.',
-                env_val,
-                default_val,
-            )
     return data
 
   @field_validator('max_llm_calls', mode='after')
