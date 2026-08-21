@@ -19,6 +19,7 @@ import base64
 import importlib
 import json
 import os
+import re
 import sys
 import traceback
 from typing import Optional
@@ -54,6 +55,9 @@ app = FastAPI()
 
 # Global cache for local runners to persist session history
 local_runners = {}
+
+# Allow only simple Python module names for local agents.
+LOCAL_AGENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Mount static files
 try:
@@ -166,13 +170,8 @@ async def chat(request: ChatRequest, response: Response):
     if not request.local_agent:
       return stream_error("No local agent specified.")
 
-    # Validate that the local agent exists in the project directory
-    if (
-        os.path.isabs(request.local_agent)
-        or "/" in request.local_agent
-        or "\\" in request.local_agent
-        or ".." in request.local_agent
-    ):
+    # Validate local agent name using a strict allowlist to prevent path abuse.
+    if not LOCAL_AGENT_NAME_RE.fullmatch(request.local_agent):
       return stream_error("Invalid local agent name.")
 
     base_dir = os.path.realpath(AGENT_PROJECT_DIR)
