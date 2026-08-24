@@ -51,6 +51,7 @@ from .auth.credential_service.base_credential_service import BaseCredentialServi
 from .code_executors.built_in_code_executor import BuiltInCodeExecutor
 from .errors._stale_session_error import StaleSessionError
 from .errors.session_not_found_error import SessionNotFoundError
+from .events._branch_path import _BranchPath
 from .events.event import Event
 from .events.event_actions import EventActions
 from .flows.llm_flows import contents
@@ -202,6 +203,91 @@ def _can_transfer_between_agents(root: Any) -> bool:
       return True
     pending.extend(sub_agents)
   return False
+
+
+def _strip_run_ids_from_path(path_str: str) -> str:
+  """Strips run ids (e.g. ``@1``) from every segment of a node path."""
+  if not path_str:
+    return ''
+  segments = path_str.split('/')
+  static_segments = [seg.rsplit('@', 1)[0] for seg in segments]
+  return '/'.join(static_segments)
+
+
+def _find_static_node_path(root: BaseNode, target: BaseNode) -> Optional[str]:
+  """Returns the static (run-id-free) path of ``target`` within ``root``."""
+  from .workflow._base_node import BaseNode
+
+  visited: set[int] = set()
+
+  def _recurse(curr: BaseNode) -> Optional[list[str]]:
+    if id(curr) in visited:
+      return None
+    visited.add(id(curr))
+
+    if curr is target:
+      return [curr.name]
+
+    # Walk child nodes declared as Pydantic fields.
+    for _, val in curr:
+      if isinstance(val, BaseNode):
+        path = _recurse(val)
+        if path:
+          return [curr.name] + path
+      elif isinstance(val, list):
+        for item in val:
+          if isinstance(item, BaseNode):
+            path = _recurse(item)
+            if path:
+              return [curr.name] + path
+      elif isinstance(val, dict):
+        for item in val.values():
+          if isinstance(item, BaseNode):
+            path = _recurse(item)
+            if path:
+              return [curr.name] + path
+    return None
+
+  path_list = _recurse(root)
+  if path_list:
+    return '/'.join(path_list)
+  return None
+
+
+def _collect_function_call_ids(events: list[Event]) -> set[str]:
+  """Returns the ids of every function call recorded in ``events``."""
+  call_ids: set[str] = set()
+  for event in events:
+    for function_call in event.get_function_calls():
+      if function_call.id:
+        call_ids.add(function_call.id)
+  return call_ids
+
+
+def _is_tool_branch(
+    branch: str, node_name: str, tool_call_ids: set[str]
+) -> bool:
+  """Whether ``branch`` is the sub-branch a tool message is published on.
+
+  ``functions.py`` publishes a tool's user-facing message on
+  ``<tool>@<function_call_id>``. Such an event is authored under the agent's
+  name and carries the agent's node path, so the branch is the only thing that
+  identifies it; a function call id in the leaf segment distinguishes it from an
+  ordinary node branch, whose leaf carries a run id instead.
+
+  A function call id in the leaf is not sufficient on its own: ``AgentTool``
+  runs a real sub-agent on ``<parent>.<agent name>@<function call id>``
+  (``agent_tool.py``), which is that sub-agent's own branch and must be
+  restored. A leaf naming the node itself is therefore never treated as a
+  tool branch.
+  """
+  segments = _BranchPath.from_string(branch).segments
+  if not segments:
+    return False
+  leaf_name, separator, trailing_id = segments[-1].rpartition('@')
+  if not separator or trailing_id not in tool_call_ids:
+    return False
+  return leaf_name != node_name
 
 
 class Runner:
@@ -631,6 +717,11 @@ class Runner:
             run_config=run_config or RunConfig(),
             invocation_id=invocation_id,
         )
+        if node and node is not self.agent:
+          ic.agent = node
+          self._restore_branch_from_history(
+              ic, node, root=self.agent, invocation_id=invocation_id
+          )
         ic._event_queue = asyncio.Queue()
 
         # 2. Append user message to session and resolve node_input
@@ -671,6 +762,8 @@ class Runner:
               user_event = await self._append_user_event(
                   ic, new_message, state_delta=state_delta
               )
+              if user_event.branch:
+                ic.branch = user_event.branch
               if yield_user_message and user_event:
                 yield user_event
 
@@ -1968,6 +2061,10 @@ class Runner:
     invocation_context.agent = self._find_agent_to_run(
         invocation_context.session, root_agent
     )
+    if invocation_context.agent and invocation_context.agent is not root_agent:
+      self._restore_branch_from_history(
+          invocation_context, invocation_context.agent, root=root_agent
+      )
 
     async def execute(ctx: InvocationContext) -> AsyncGenerator[Event, None]:
       active_agent = ctx.agent
@@ -2264,6 +2361,63 @@ class Runner:
 
     return collected_events
 
+  def _restore_branch_from_history(
+      self,
+      invocation_context: InvocationContext,
+      node: BaseNode,
+      *,
+      root: BaseNode,
+      invocation_id: Optional[str] = None,
+  ) -> None:
+    """Restores a non-root node's branch from its latest matching event.
+
+    A freshly created ``InvocationContext`` has no branch, so a node that
+    previously ran on a sub-branch (e.g. a resumed sub-agent, or an agent
+    resolved by ``_find_agent_to_run``) would otherwise continue on the root
+    branch.
+
+    Tool branches are skipped. A tool's user-facing message is authored under
+    the agent's name (``functions.py``) and stamped with the agent's node path
+    (``base_agent.py``), so it is indistinguishable from the agent's own turns
+    by author or path; what gives it away is its branch, which the same code
+    builds as ``<tool>@<function_call_id>`` from a call in this session. Such a
+    branch is therefore recognised and skipped, while every other event the node
+    authored -- including a plain text turn, which is all a non-resumable
+    sub-agent may leave behind -- still carries ``ctx.branch`` and is eligible.
+    A branch whose leaf names the node itself is kept even when its id is a
+    function call id, since that is how ``AgentTool`` scopes a real sub-agent.
+
+    Nodes are matched by their static path (run ids stripped) so that two nodes
+    sharing a name (e.g. the same sub-agent mounted under two parents) are
+    disambiguated; events that predate node paths fall back to author/name
+    matching. When ``invocation_id`` is provided (resuming a known invocation),
+    only that invocation's events are considered, so a resumed node cannot
+    inherit a stale branch authored in an earlier invocation. When it is None
+    (a fresh direct-node turn, or a new invocation continuing a sub-agent), the
+    most recent matching event across the session is used.
+    """
+    expected_static_path = _find_static_node_path(root, node)
+    tool_call_ids = _collect_function_call_ids(
+        invocation_context.session.events
+    )
+    for event in reversed(invocation_context.session.events):
+      if invocation_id is not None and event.invocation_id != invocation_id:
+        continue
+      if not event.branch:
+        continue
+      if _is_tool_branch(event.branch, node.name, tool_call_ids):
+        continue
+      matched = False
+      if expected_static_path and event.node_info.path:
+        event_static_path = _strip_run_ids_from_path(event.node_info.path)
+        if event_static_path == expected_static_path:
+          matched = True
+      elif event.author == node.name or event.node_info.name == node.name:
+        matched = True
+      if matched:
+        invocation_context.branch = event.branch
+        break
+
   async def _setup_context_for_new_invocation(
       self,
       *,
@@ -2306,6 +2460,10 @@ class Runner:
     invocation_context.agent = self._find_agent_to_run(
         invocation_context.session, root_agent
     )
+    if invocation_context.agent and invocation_context.agent is not root_agent:
+      self._restore_branch_from_history(
+          invocation_context, invocation_context.agent, root=root_agent
+      )
     return invocation_context
 
   async def _setup_context_for_resumed_invocation(
@@ -2372,6 +2530,16 @@ class Runner:
       invocation_context.agent = self._find_agent_to_run(
           invocation_context.session, root_agent
       )
+      if (
+          invocation_context.agent
+          and invocation_context.agent is not root_agent
+      ):
+        self._restore_branch_from_history(
+            invocation_context,
+            invocation_context.agent,
+            root=root_agent,
+            invocation_id=invocation_context.invocation_id,
+        )
     return invocation_context
 
   def _find_user_message_for_invocation(
