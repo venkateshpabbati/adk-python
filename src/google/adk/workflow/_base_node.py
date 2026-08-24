@@ -97,8 +97,8 @@ class BaseNode(BaseModel, abc.ABC):
   input_schema: SchemaType | None = None
   """Schema to validate and coerce node input data.
 
-  Supports all ``SchemaType`` variants. Validation uses ``TypeAdapter``
-  and runs centrally in the node runner before ``node.run()`` is called.
+  Validated with ``TypeAdapter``. A raw ``dict`` JSON schema or a genai
+  ``Schema`` is accepted but never enforced.
 
   ``None`` means no input validation (the default).
   """
@@ -106,12 +106,9 @@ class BaseNode(BaseModel, abc.ABC):
   output_schema: SchemaType | None = None
   """Schema to validate and coerce node output data.
 
-  Supports all ``SchemaType`` variants (Pydantic ``BaseModel`` subclass,
-  generic aliases like ``list[str]``, raw ``dict`` schemas, etc.).
-
-  When set to a ``BaseModel`` subclass, the node's output data is validated:
-    - dict → ``output_schema.model_validate(data).model_dump()``
-    - BaseModel instance → ``data.model_dump()`` (already converted)
+  Validated with ``TypeAdapter``; a validated ``BaseModel`` is dumped to a
+  dict with ``None`` fields dropped. A raw ``dict`` JSON schema or a genai
+  ``Schema`` is accepted but never enforced.
 
   ``None`` means no output validation (the default).
   """
