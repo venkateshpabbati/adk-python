@@ -299,6 +299,7 @@ class ApplicationIntegrationToolset(BaseToolset):  # type: ignore[misc]
         rest_api_tool=tool._rest_api_tool,
         auth_scheme=tool._auth_scheme,
         auth_credential=auth_credential,
+        credential_key=tool._credential_key,
     )
 
   @override
