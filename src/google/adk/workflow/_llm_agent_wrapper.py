@@ -40,7 +40,13 @@ if TYPE_CHECKING:
 
 
 def _extract_finish_task_fc(event: Event) -> types.FunctionCall | None:
-  """Returns the finish_task FC in this event, or None."""
+  """Returns the finish_task FC in this event, or None.
+
+  A partial event is skipped: its arguments may still be arriving, and
+  promoting them would make a fragment decide the task's output.
+  """
+  if event.partial:
+    return None
   for fc in event.get_function_calls():
     if fc.name == _FINISH_TASK_FC_NAME:
       return fc
@@ -53,7 +59,16 @@ def _extract_task_delegation_fcs(
   """Return task-delegation FCs from this event.
 
   A task-delegation FC is one whose tool is a ``_TaskAgentTool`` instance.
+
+  A partial event yields nothing, the way ``process_llm_agent_output``
+  already treats one. Its arguments may still be arriving, and the Runner
+  never appends a fragment to the session, so dispatching from one would run
+  the specialist on truncated arguments and leave the delegation out of the
+  history the coordinator replays.
   """
+  if event.partial:
+    return []
+
   from ..tools.agent_tool import _TaskAgentTool
 
   return [
