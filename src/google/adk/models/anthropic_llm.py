@@ -48,6 +48,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import override
 
+from . import _prompt_cache
 from ..utils import _json_utils
 from ..utils._google_client_headers import get_tracking_headers
 from .base_llm import BaseLlm
@@ -100,11 +101,6 @@ _RATE_LIMIT_POSSIBLE_FIX_MESSAGE = (
     "On how to mitigate this issue, please refer to:\n\n"
     "https://docs.anthropic.com/en/api/errors#http-errors"
 )
-
-# Claude offers exactly two cache lifetimes, five minutes and one hour, and
-# charges a higher write price for the longer one. Only a lifetime of at least
-# an hour is worth that price.
-_ONE_HOUR_CACHE_TTL_SECONDS = 3600
 
 # Claude rejects a cache breakpoint on a reasoning block.
 _UNCACHEABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
@@ -814,49 +810,11 @@ def function_declaration_to_tool_param(
   )
 
 
-def _resolve_cache_config(
-    llm_request: LlmRequest,
-) -> ContextCacheConfig | None:
-  """Returns the cache config governing this request, or None to not cache.
-
-  Args:
-    llm_request: Request whose cache configuration is being resolved.
-
-  Returns:
-    The cache config to honor, or None when the request should not be cached.
-  """
-  cache_config = llm_request.cache_config
-  if cache_config is None:
-    return None
-
-  # ``min_tokens`` gates on the previous turn's measured prompt size, the same
-  # signal the Gemini path uses. That size is unknown on the first turn, where
-  # a breakpoint costs nothing beyond writing the cache.
-  previous_prompt_tokens = llm_request.cacheable_contents_token_count
-  if (
-      previous_prompt_tokens is not None
-      and previous_prompt_tokens < cache_config.min_tokens
-  ):
-    logger.debug(
-        "Skipping cache breakpoints: the previous prompt of %d tokens is below"
-        " the configured minimum of %d.",
-        previous_prompt_tokens,
-        cache_config.min_tokens,
-    )
-    return None
-
-  return cache_config
-
-
 def _to_cache_control(
     cache_config: ContextCacheConfig,
 ) -> anthropic_types.CacheControlEphemeralParam:
-  """Maps the configured cache lifetime onto one Claude actually offers.
-
-  An hour is the longest Claude keeps a cached prefix, so a longer configured
-  lifetime gets an hour rather than what it asked for.
-  """
-  if cache_config.ttl_seconds >= _ONE_HOUR_CACHE_TTL_SECONDS:
+  """Maps the configured cache lifetime onto one Claude actually offers."""
+  if _prompt_cache.use_one_hour_ttl(cache_config):
     return anthropic_types.CacheControlEphemeralParam(
         type="ephemeral", ttl="1h"
     )
@@ -1015,7 +973,7 @@ class AnthropicLlm(BaseLlm):
         system = system_str
 
     system_param: str | list[anthropic_types.TextBlockParam] | NotGiven = system
-    cache_config = _resolve_cache_config(llm_request)
+    cache_config = _prompt_cache.resolve_cache_config(llm_request)
     if cache_config is not None:
       system_param = _apply_cache_breakpoints(
           cache_config=cache_config,
