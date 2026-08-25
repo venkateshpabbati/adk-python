@@ -3130,39 +3130,6 @@ async def test_run_node_restores_branch_on_function_response_resume():
   assert model_events[0].branch == "node_agent@1"
 
 
-def test_strip_run_ids_from_path():
-  """Static path stripping removes @run_id from every segment."""
-  assert runners._strip_run_ids_from_path("") == ""
-  assert runners._strip_run_ids_from_path("A") == "A"
-  assert runners._strip_run_ids_from_path("wf/A/B") == "wf/A/B"
-  assert runners._strip_run_ids_from_path("wf/A@1/B@2") == "wf/A/B"
-
-
-def test_find_static_node_path_disambiguates_same_name_nodes():
-  """Two sub-agents sharing a name resolve to distinct static paths."""
-  coordinator = MockLlmAgent("coordinator")
-  team_a = MockLlmAgent("team_a", parent_agent=coordinator)
-  team_b = MockLlmAgent("team_b", parent_agent=coordinator)
-  worker_a = MockLlmAgent("worker", parent_agent=team_a)
-  worker_b = MockLlmAgent("worker", parent_agent=team_b)
-  team_a.sub_agents = [worker_a]
-  team_b.sub_agents = [worker_b]
-  coordinator.sub_agents = [team_a, team_b]
-
-  assert (
-      runners._find_static_node_path(coordinator, worker_a)
-      == "coordinator/team_a/worker"
-  )
-  assert (
-      runners._find_static_node_path(coordinator, worker_b)
-      == "coordinator/team_b/worker"
-  )
-  # A node that is not in the tree has no path.
-  assert (
-      runners._find_static_node_path(coordinator, MockLlmAgent("nope")) is None
-  )
-
-
 @pytest.mark.asyncio
 async def test_resumed_invocation_ignores_branch_from_other_invocation():
   """Invocation-scoping: a resumed sub-agent does not inherit a stale branch.
@@ -3386,36 +3353,6 @@ async def test_run_live_restores_branch_for_non_root_agent():
   # The resumed sub-agent runs on its historical branch, not the root branch.
   assert event.author == "worker"
   assert event.branch == "worker@1"
-
-
-def test_is_tool_branch_excludes_agent_tool_sub_branch():
-  """Only a tool's own message branch is a tool branch.
-
-  `AgentTool` scopes a real sub-agent with
-  `_BranchPath.create_sub_branch(base, name=agent.name,
-  run_id=function_call_id)`
-  (`agent_tool.py`), so a function call id in the leaf is not enough on its own:
-  a leaf naming the node itself is that node's branch and must be kept.
-  """
-  call_ids = {"fc-1"}
-
-  # A tool's user-facing message: the leaf names the tool, not the node.
-  assert runners._is_tool_branch("do@fc-1", "worker", call_ids) is True
-  assert (
-      runners._is_tool_branch("coordinator.do@fc-1", "worker", call_ids) is True
-  )
-
-  # An AgentTool sub-agent branch: the leaf names the node itself.
-  assert (
-      runners._is_tool_branch("coordinator.worker@fc-1", "worker", call_ids)
-      is False
-  )
-  assert runners._is_tool_branch("worker@fc-1", "worker", call_ids) is False
-
-  # An ordinary node branch carries a run id, not a function call id.
-  assert runners._is_tool_branch("worker@1", "worker", call_ids) is False
-  assert runners._is_tool_branch("worker", "worker", call_ids) is False
-  assert runners._is_tool_branch("", "worker", call_ids) is False
 
 
 @pytest.mark.asyncio

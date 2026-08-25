@@ -52,10 +52,12 @@ from .code_executors.built_in_code_executor import BuiltInCodeExecutor
 from .errors._stale_session_error import StaleSessionError
 from .errors.session_not_found_error import SessionNotFoundError
 from .events._branch_path import _BranchPath
+from .events._node_path_builder import _NodePathBuilder
 from .events.event import Event
 from .events.event_actions import EventActions
 from .flows.llm_flows import contents
 from .flows.llm_flows.agent_transfer import _get_transfer_targets
+from .flows.llm_flows.functions import _collect_function_call_ids
 from .flows.llm_flows.functions import find_event_by_function_call_id
 from .flows.llm_flows.functions import find_matching_function_call
 from .memory.base_memory_service import BaseMemoryService
@@ -203,91 +205,6 @@ def _can_transfer_between_agents(root: Any) -> bool:
       return True
     pending.extend(sub_agents)
   return False
-
-
-def _strip_run_ids_from_path(path_str: str) -> str:
-  """Strips run ids (e.g. ``@1``) from every segment of a node path."""
-  if not path_str:
-    return ''
-  segments = path_str.split('/')
-  static_segments = [seg.rsplit('@', 1)[0] for seg in segments]
-  return '/'.join(static_segments)
-
-
-def _find_static_node_path(root: BaseNode, target: BaseNode) -> Optional[str]:
-  """Returns the static (run-id-free) path of ``target`` within ``root``."""
-  from .workflow._base_node import BaseNode
-
-  visited: set[int] = set()
-
-  def _recurse(curr: BaseNode) -> Optional[list[str]]:
-    if id(curr) in visited:
-      return None
-    visited.add(id(curr))
-
-    if curr is target:
-      return [curr.name]
-
-    # Walk child nodes declared as Pydantic fields.
-    for _, val in curr:
-      if isinstance(val, BaseNode):
-        path = _recurse(val)
-        if path:
-          return [curr.name] + path
-      elif isinstance(val, list):
-        for item in val:
-          if isinstance(item, BaseNode):
-            path = _recurse(item)
-            if path:
-              return [curr.name] + path
-      elif isinstance(val, dict):
-        for item in val.values():
-          if isinstance(item, BaseNode):
-            path = _recurse(item)
-            if path:
-              return [curr.name] + path
-    return None
-
-  path_list = _recurse(root)
-  if path_list:
-    return '/'.join(path_list)
-  return None
-
-
-def _collect_function_call_ids(events: list[Event]) -> set[str]:
-  """Returns the ids of every function call recorded in ``events``."""
-  call_ids: set[str] = set()
-  for event in events:
-    for function_call in event.get_function_calls():
-      if function_call.id:
-        call_ids.add(function_call.id)
-  return call_ids
-
-
-def _is_tool_branch(
-    branch: str, node_name: str, tool_call_ids: set[str]
-) -> bool:
-  """Whether ``branch`` is the sub-branch a tool message is published on.
-
-  ``functions.py`` publishes a tool's user-facing message on
-  ``<tool>@<function_call_id>``. Such an event is authored under the agent's
-  name and carries the agent's node path, so the branch is the only thing that
-  identifies it; a function call id in the leaf segment distinguishes it from an
-  ordinary node branch, whose leaf carries a run id instead.
-
-  A function call id in the leaf is not sufficient on its own: ``AgentTool``
-  runs a real sub-agent on ``<parent>.<agent name>@<function call id>``
-  (``agent_tool.py``), which is that sub-agent's own branch and must be
-  restored. A leaf naming the node itself is therefore never treated as a
-  tool branch.
-  """
-  segments = _BranchPath.from_string(branch).segments
-  if not segments:
-    return False
-  leaf_name, separator, trailing_id = segments[-1].rpartition('@')
-  if not separator or trailing_id not in tool_call_ids:
-    return False
-  return leaf_name != node_name
 
 
 class Runner:
@@ -2396,7 +2313,9 @@ class Runner:
     (a fresh direct-node turn, or a new invocation continuing a sub-agent), the
     most recent matching event across the session is used.
     """
-    expected_static_path = _find_static_node_path(root, node)
+    from .workflow._base_node import find_static_node_path
+
+    expected_static_path = find_static_node_path(root, node)
     tool_call_ids = _collect_function_call_ids(
         invocation_context.session.events
     )
@@ -2405,11 +2324,13 @@ class Runner:
         continue
       if not event.branch:
         continue
-      if _is_tool_branch(event.branch, node.name, tool_call_ids):
+      if _BranchPath.is_tool_branch(event.branch, node.name, tool_call_ids):
         continue
       matched = False
       if expected_static_path and event.node_info.path:
-        event_static_path = _strip_run_ids_from_path(event.node_info.path)
+        event_static_path = _NodePathBuilder.from_string(
+            event.node_info.path
+        ).static_path
         if event_static_path == expected_static_path:
           matched = True
       elif event.author == node.name or event.node_info.name == node.name:

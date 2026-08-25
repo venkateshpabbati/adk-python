@@ -205,6 +205,52 @@ class BaseNode(BaseModel, abc.ABC):
     return False
 
 
+def find_static_node_path(root: BaseNode, target: BaseNode) -> str | None:
+  """Returns the static (run-id-free) path of ``target`` within ``root``.
+
+  The path is the chain of node names from ``root`` down to ``target``, joined
+  by ``/`` and carrying no run ids, so it identifies a node's position in the
+  tree independently of any particular run. Returns ``None`` when ``target`` is
+  not reachable from ``root``.
+
+  Children are discovered through the node's Pydantic fields, so nodes held in
+  a list or dict field are traversed as well.
+  """
+  visited: set[int] = set()
+
+  def _recurse(curr: BaseNode) -> list[str] | None:
+    if id(curr) in visited:
+      return None
+    visited.add(id(curr))
+
+    if curr is target:
+      return [curr.name]
+
+    for _, val in curr:
+      if isinstance(val, BaseNode):
+        path = _recurse(val)
+        if path:
+          return [curr.name] + path
+      elif isinstance(val, list):
+        for item in val:
+          if isinstance(item, BaseNode):
+            path = _recurse(item)
+            if path:
+              return [curr.name] + path
+      elif isinstance(val, dict):
+        for item in val.values():
+          if isinstance(item, BaseNode):
+            path = _recurse(item)
+            if path:
+              return [curr.name] + path
+    return None
+
+  path_list = _recurse(root)
+  if path_list:
+    return '/'.join(path_list)
+  return None
+
+
 START = BaseNode(name='__START__')
 """Sentinel node marking the entry point of a workflow graph.
 
