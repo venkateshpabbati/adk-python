@@ -625,6 +625,16 @@ class Runner:
             if active_scope:
               _, inv_id = active_scope
               invocation_id = inv_id
+        elif invocation_id and new_message:
+          # A caller-supplied id is reconciled against the responses rather
+          # than trusted: resuming under an id that does not own the call
+          # means the call is not found and the response is dropped, losing
+          # the tool result. This is the same reconciliation the non-node
+          # path performs, through the same helper, so a root LlmAgent gets
+          # one answer no matter which path the runner picked for it.
+          invocation_id = self._resolve_invocation_id(
+              session, new_message, invocation_id
+          )
 
         ic = self._new_invocation_context(
             session,
