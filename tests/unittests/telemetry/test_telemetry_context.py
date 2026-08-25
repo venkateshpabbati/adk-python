@@ -284,22 +284,22 @@ def test_capture_mode_env_legacy_coercion_is_silent(
 # ---------------------------------------------------------------------------
 
 
-def test_resolution_properties_read_env_lazily_at_access_time(
+def test_resolution_properties_are_static_once_constructed(
     monkeypatch: pytest.MonkeyPatch,
 ):
-  """Properties re-read os.environ on each access (not frozen at construction).
+  """Properties resolve at construction, not on each access.
 
-  This is the whole reason resolution lives in properties rather than a
-  ``default_factory``: a caller that mutates the environment after building the
-  (frozen) config still observes the new value.
+  A config is a decision rather than a live view of the environment. Holding
+  one still is what keeps a single run whole: an ``os.environ`` change part way
+  through cannot leave half its telemetry gated one way and half the other.
   """
   _set_env(monkeypatch)
   cfg = TelemetryConfig()  # all fields unset => pure env-fallback.
   assert cfg.should_use_experimental_genai_semconv is False
   monkeypatch.setenv(_ENV_EXPERIMENTAL, 'gen_ai_latest_experimental')
-  assert cfg.should_use_experimental_genai_semconv is True
-  monkeypatch.delenv(_ENV_EXPERIMENTAL, raising=False)
   assert cfg.should_use_experimental_genai_semconv is False
+  # A caller that wants the new environment builds a config under it.
+  assert TelemetryConfig().should_use_experimental_genai_semconv is True
 
 
 # (opt_in field, env value, expected) for should_use_experimental_genai_semconv.

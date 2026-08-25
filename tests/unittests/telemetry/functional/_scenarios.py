@@ -14,9 +14,8 @@
 
 """The end-to-end scenarios the functional tests record.
 
-Three of them -- a plain agent, a workflow of nodes around that agent, and an
-agent whose tools come from an MCP server -- each driven by the same canned
-conversation, and each recorded under both inference instrumentations.
+One per graph shape, listed in ``Scenario``, each with its own
+``run_*_scenario`` and each recorded under both inference instrumentations.
 
 ``install_telemetry`` points ADK's telemetry globals at in-memory exporters;
 ``inference_under_test`` hands out the model to run with, its instrumentation
@@ -48,6 +47,7 @@ from google.adk.skills.skill_registry import SkillRegistry
 from google.adk.telemetry import _metrics
 from google.adk.telemetry import node_tracing
 from google.adk.telemetry import tracing
+from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
@@ -100,8 +100,18 @@ EXPERIMENTAL_OPT_IN = "gen_ai_latest_experimental"
 ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN = "ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN"
 ADK_EXPERIMENTAL_TELEMETRY = "ADK_EXPERIMENTAL_TELEMETRY"
 
-# Which end-to-end scenario a test case drives.
-Scenario = Literal["agent", "node", "mcp", "skill"]
+# Which end-to-end scenario a test case drives. The last three are variants of
+# `agent` and `node`, named rather than flagged: which graph a case drives is
+# what the case is, so it belongs here and not in a boolean on the case.
+Scenario = Literal[
+    "agent",
+    "node",
+    "mcp",
+    "skill",
+    "multi_agent",
+    "agent_tool",
+    "nested_agents_in_workflow",
+]
 
 # The type of skill being used in a test case.
 SkillType = Literal["local", "registry", "nonexistent"]
@@ -196,6 +206,37 @@ _PATCHED_HISTOGRAMS: tuple[HistogramSpec, ...] = (
         attr="_invoke_agent_tool_input_tokens",
         metric_name="adk.experimental.invoke_agent.tool.input_tokens",
     ),
+    # The same spend summed over the whole turn, dropping the agent key.
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_input_tokens",
+        metric_name="adk.experimental.invoke_workflow.input_tokens",
+    ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_output_tokens",
+        metric_name="adk.experimental.invoke_workflow.output_tokens",
+    ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_total_tokens",
+        metric_name="adk.experimental.invoke_workflow.total_tokens",
+    ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_cache_read_input_tokens",
+        metric_name="adk.experimental.invoke_workflow.cache_read.input_tokens",
+    ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_reasoning_output_tokens",
+        metric_name="adk.experimental.invoke_workflow.reasoning.output_tokens",
+    ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_tool_input_tokens",
+        metric_name="adk.experimental.invoke_workflow.tool.input_tokens",
+    ),
 )
 
 
@@ -282,6 +323,9 @@ FINAL_TEXT = "text response"
 # ``MockModel`` renamed to match, so the two recordings differ only where the
 # instrumentations do and not over the model name.
 MODEL_NAME = "gemini-2.5-flash"
+# The agent a multi-agent turn is handed on to, mid-turn, by transfer_to_agent.
+SPECIALIST_AGENT_NAME = "some_specialist_agent"
+SPECIALIST_AGENT_DESCRIPTION = "A sample specialist agent."
 TOOL_NAME = "some_tool"
 TOOL_DESCRIPTION = "A sample tool."
 # What the scenario's tool raises for a case that asks it to fail.
@@ -298,6 +342,16 @@ WORKFLOW_NAME = "my_workflow"
 # span attribute + metric dimension (only nested workflows carry it).
 NESTED_WORKFLOW_NAME = "my_nested_workflow"
 NODE_NAME = "some_node"
+# The agent the nested workflow runs in place of its plain node.
+NESTED_AGENT_NAME = "some_nested_agent"
+NESTED_AGENT_DESCRIPTION = "A sample agent inside a nested workflow."
+# The agent-tool graph: an agent whose tool wraps another agent, and the Runner
+# boundary that tool puts between the two.
+AGENT_TOOL_WORKFLOW_NAME = "my_agent_tool_workflow"
+DELEGATING_AGENT_NAME = "some_delegating_agent"
+DELEGATING_AGENT_DESCRIPTION = "A sample agent that delegates."
+DELEGATE_AGENT_NAME = "some_delegate_agent"
+DELEGATE_AGENT_DESCRIPTION = "A sample delegate agent."
 NODE_RESULT = "some result"
 NODE_USER_ID = "some_user"
 NODE_APP_NAME = "some_app"
@@ -326,6 +380,14 @@ SECOND_TURN_CACHED_TOKEN_COUNT = 60
 SECOND_TURN_CANDIDATES_TOKEN_COUNT = 35
 SECOND_TURN_THOUGHTS_TOKEN_COUNT = 15
 SECOND_TURN_TOTAL_TOKEN_COUNT = 200
+# Spent by the nested workflow's agent, in the one graph that runs one. Also
+# distinct from both turns above, so the nested datapoint and the root one it
+# rolls up into cannot be confused for each other.
+NESTED_TURN_PROMPT_TOKEN_COUNT = 70
+NESTED_TURN_CACHED_TOKEN_COUNT = 30
+NESTED_TURN_CANDIDATES_TOKEN_COUNT = 10
+NESTED_TURN_THOUGHTS_TOKEN_COUNT = 3
+NESTED_TURN_TOTAL_TOKEN_COUNT = 83
 
 FIRST_TURN_USAGE = GenerateContentResponseUsageMetadata(
     prompt_token_count=FIRST_TURN_PROMPT_TOKEN_COUNT,
@@ -341,6 +403,13 @@ SECOND_TURN_USAGE = GenerateContentResponseUsageMetadata(
     thoughts_token_count=SECOND_TURN_THOUGHTS_TOKEN_COUNT,
     total_token_count=SECOND_TURN_TOTAL_TOKEN_COUNT,
 )
+NESTED_TURN_USAGE = GenerateContentResponseUsageMetadata(
+    prompt_token_count=NESTED_TURN_PROMPT_TOKEN_COUNT,
+    cached_content_token_count=NESTED_TURN_CACHED_TOKEN_COUNT,
+    candidates_token_count=NESTED_TURN_CANDIDATES_TOKEN_COUNT,
+    thoughts_token_count=NESTED_TURN_THOUGHTS_TOKEN_COUNT,
+    total_token_count=NESTED_TURN_TOTAL_TOKEN_COUNT,
+)
 
 # One canned model response: what it answers, and what it bills for it.
 Turn = tuple[Part, GenerateContentResponseUsageMetadata]
@@ -350,6 +419,40 @@ TOOL_CALLING_TURNS: tuple[Turn, ...] = (
     (Part.from_function_call(name=TOOL_NAME, args=TOOL_ARGS), FIRST_TURN_USAGE),
     (Part.from_text(text=FINAL_TEXT), SECOND_TURN_USAGE),
 )
+
+# The graphs below run more than one agent off the one model, so their turns
+# are consumed in the order the graph invokes the agents, one turn each.
+
+# The root transfers mid-turn, then the specialist answers.
+MULTI_AGENT_TURNS: tuple[Turn, ...] = (
+    (
+        Part.from_function_call(
+            name="transfer_to_agent",
+            args={"agent_name": SPECIALIST_AGENT_NAME},
+        ),
+        FIRST_TURN_USAGE,
+    ),
+    (Part.from_text(text=FINAL_TEXT), SECOND_TURN_USAGE),
+)
+
+# The delegating agent calls the tool, the delegate the tool starts answers,
+# then the delegating agent answers with what came back.
+AGENT_TOOL_TURNS: tuple[Turn, ...] = (
+    (
+        Part.from_function_call(
+            name=DELEGATE_AGENT_NAME, args={"request": USER_PROMPT}
+        ),
+        FIRST_TURN_USAGE,
+    ),
+    (Part.from_text(text=NODE_RESULT), NESTED_TURN_USAGE),
+    (Part.from_text(text=FINAL_TEXT), SECOND_TURN_USAGE),
+)
+
+# The nested workflow's agent answers first, since the graph feeds its output
+# to the canonical agent, which then spends the usual two turns.
+NESTED_WORKFLOW_TURNS: tuple[Turn, ...] = (
+    (Part.from_text(text=NODE_RESULT), NESTED_TURN_USAGE),
+) + TOOL_CALLING_TURNS
 
 
 def mock_test_model(
@@ -407,6 +510,30 @@ def build_test_agent(
   )
 
 
+def build_multi_agent_test_agent(model: BaseLlm) -> Agent:
+  """Builds the canonical two-agent turn: the root hands off to a specialist.
+
+  One model call each, billing the same two usages the single-agent scenario
+  spends over its two calls. The turn totals therefore match that scenario's
+  exactly, and only the per-agent split tells the two recordings apart --
+  which is the point: it is where an agent's spend is booked that a turn-grain
+  metric has to get right.
+  """
+  specialist = Agent(
+      name=SPECIALIST_AGENT_NAME,
+      description=SPECIALIST_AGENT_DESCRIPTION,
+      instruction=BASE_INSTRUCTION,
+      model=model,
+  )
+  return Agent(
+      name=AGENT_NAME,
+      description=AGENT_DESCRIPTION,
+      instruction=BASE_INSTRUCTION,
+      model=model,
+      sub_agents=[specialist],
+  )
+
+
 def build_test_runner(
     model: BaseLlm, *, tool_exception: Exception | None = None
 ) -> TestInMemoryRunner:
@@ -416,10 +543,20 @@ def build_test_runner(
   )
 
 
+def build_multi_agent_test_runner(model: BaseLlm) -> TestInMemoryRunner:
+  """Builds a runner around the two-agent handoff."""
+  return TestInMemoryRunner(node=build_multi_agent_test_agent(model))
+
+
 def build_test_workflow(
     model: BaseLlm, *, tool_exception: Exception | None = None
 ) -> Workflow:
-  """Builds the canonical Workflow: a nested workflow feeding the agent."""
+  """Builds the canonical Workflow: a nested workflow feeding the agent.
+
+  The nested workflow's node is a plain function, which spends nothing, so the
+  nested workflow earns a `gen_ai.workflow.nested` span and duration but no
+  token datapoint.
+  """
   test_agent = build_test_agent(model, tool_exception=tool_exception)
 
   async def some_node(ctx, node_input):
@@ -437,19 +574,65 @@ def build_test_workflow(
   )
 
 
-async def run_node_scenario(
-    model: BaseLlm,
-    *,
-    tool_exception: Exception | None = None,
-    event_sink: list[Event] | None = None,
-) -> list[Event]:
-  """Runs the workflow scenario to completion, draining the event stream.
+def build_nested_agents_test_workflow(model: BaseLlm) -> Workflow:
+  """Builds the canonical Workflow with an agent as the nested node.
 
-  If ``event_sink`` is provided, collected events are appended to it as they
-  are drained. This lets callers inspect the events that were emitted before
-  an exception propagates (e.g. when ``tool_exception`` is set).
+  A nested workflow has to run an agent for the token grain to have anything
+  to report.
   """
-  workflow = build_test_workflow(model, tool_exception=tool_exception)
+  test_agent = build_test_agent(model)
+
+  nested_workflow = Workflow(
+      name=NESTED_WORKFLOW_NAME,
+      edges=[(START, build_nested_test_agent(model))],
+  )
+
+  return Workflow(
+      name=WORKFLOW_NAME,
+      edges=[(START, nested_workflow, test_agent)],
+  )
+
+
+def build_nested_test_agent(model: BaseLlm) -> Agent:
+  """Builds the single-turn agent the nested workflow runs, when it runs one."""
+  return Agent(
+      name=NESTED_AGENT_NAME,
+      description=NESTED_AGENT_DESCRIPTION,
+      instruction=BASE_INSTRUCTION,
+      model=model,
+  )
+
+
+def build_agent_tool_test_workflow(model: BaseLlm) -> Workflow:
+  """Builds the graph whose agent calls an ``AgentTool``, starting a Runner.
+
+  An ``AgentTool`` runs the agent it wraps on a Runner of its own, nested
+  inside the turn that called the tool. What that Runner spends therefore
+  belongs to the calling turn, and not to a turn of its own.
+  """
+  delegate = Agent(
+      name=DELEGATE_AGENT_NAME,
+      description=DELEGATE_AGENT_DESCRIPTION,
+      instruction=BASE_INSTRUCTION,
+      model=model,
+  )
+  delegating_agent = Agent(
+      name=DELEGATING_AGENT_NAME,
+      description=DELEGATING_AGENT_DESCRIPTION,
+      instruction=BASE_INSTRUCTION,
+      model=model,
+      tools=[AgentTool(agent=delegate)],
+  )
+  return Workflow(
+      name=AGENT_TOOL_WORKFLOW_NAME,
+      edges=[(START, delegating_agent)],
+  )
+
+
+async def _run_workflow(
+    workflow: Workflow, event_sink: list[Event] | None
+) -> list[Event]:
+  """Runs a workflow to completion, draining the event stream."""
   runner = InMemoryRunner(app_name=NODE_APP_NAME, node=workflow)
   session = await runner.session_service.create_session(
       app_name=NODE_APP_NAME, user_id=NODE_USER_ID
@@ -469,6 +652,39 @@ async def run_node_scenario(
       collected_events.append(event)
 
   return collected_events
+
+
+async def run_node_scenario(
+    model: BaseLlm,
+    *,
+    tool_exception: Exception | None = None,
+    event_sink: list[Event] | None = None,
+) -> list[Event]:
+  """Runs the workflow scenario to completion, draining the event stream.
+
+  If ``event_sink`` is provided, collected events are appended to it as they
+  are drained. This lets callers inspect the events that were emitted before
+  an exception propagates (e.g. when ``tool_exception`` is set).
+  """
+  return await _run_workflow(
+      build_test_workflow(model, tool_exception=tool_exception), event_sink
+  )
+
+
+async def run_agent_tool_scenario(
+    model: BaseLlm, *, event_sink: list[Event] | None = None
+) -> list[Event]:
+  """Runs the agent-tool workflow scenario to completion."""
+  return await _run_workflow(build_agent_tool_test_workflow(model), event_sink)
+
+
+async def run_nested_agents_scenario(
+    model: BaseLlm, *, event_sink: list[Event] | None = None
+) -> list[Event]:
+  """Runs the nested-agent workflow scenario to completion."""
+  return await _run_workflow(
+      build_nested_agents_test_workflow(model), event_sink
+  )
 
 
 async def run_agent_scenario(
