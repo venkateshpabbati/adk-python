@@ -108,45 +108,41 @@ _client_operation_duration = (
     gen_ai_metrics.create_gen_ai_client_operation_duration(meter)
 )
 _client_token_usage = gen_ai_metrics.create_gen_ai_client_token_usage(meter)
+
+# Bounds are upper inclusive, so the leading 0 buckets exact zeros on their own.
+# The tail is sized for a workflow rather than a single agent: a coding agent
+# routinely spends hundreds of model and tool calls finishing one task, and a
+# workflow sums every agent that ran in it.
+_CALL_COUNT_BUCKET_BOUNDS = [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    12,
+    16,
+    24,
+    32,
+    64,
+    128,
+    256,
+    512,
+]
+
 _invoke_agent_inference_calls = meter.create_histogram(
     "gen_ai.invoke_agent.inference_calls",
     unit="1",
     description="Number of inference (model) calls per agent invocation.",
-    explicit_bucket_boundaries_advisory=[
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        8,
-        12,
-        16,
-        24,
-        32,
-        64,
-    ],
+    explicit_bucket_boundaries_advisory=_CALL_COUNT_BUCKET_BOUNDS,
 )
 _invoke_agent_tool_calls = meter.create_histogram(
     "gen_ai.invoke_agent.tool_calls",
     unit="1",
     description="Number of tool calls per agent invocation.",
-    explicit_bucket_boundaries_advisory=[
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        8,
-        12,
-        16,
-        24,
-        32,
-        64,
-    ],
+    explicit_bucket_boundaries_advisory=_CALL_COUNT_BUCKET_BOUNDS,
 )
 
 # Bounds are upper inclusive, so the leading 0 buckets exact zeros on their own.
@@ -278,6 +274,21 @@ _invoke_workflow_tool_input_tokens = _create_token_histogram(
     f"{TOOL_INPUT_TOKENS_MEANING} Summed over {_PER_WORKFLOW}.",
     _INPUT_TOKEN_BUCKET_BOUNDS,
 )
+_invoke_workflow_inference_calls = meter.create_histogram(
+    "adk.experimental.invoke_workflow.inference_calls",
+    unit="1",
+    description=f"Number of inference (model) calls over {_PER_WORKFLOW}.",
+    explicit_bucket_boundaries_advisory=_CALL_COUNT_BUCKET_BOUNDS,
+)
+_invoke_workflow_tool_calls = meter.create_histogram(
+    "adk.experimental.invoke_workflow.tool_calls",
+    unit="1",
+    description=(
+        f"Number of tool calls over {_PER_WORKFLOW}. Includes the"
+        " `transfer_to_agent` calls that route between them."
+    ),
+    explicit_bucket_boundaries_advisory=_CALL_COUNT_BUCKET_BOUNDS,
+)
 
 
 def record_agent_invocation_duration(
@@ -379,10 +390,11 @@ def _invoke_workflow_attrs(
 
 
 def record_invoke_workflow_token_usage(
+    *,
     root_agent_name: str,
     workflow_name: str | None,
     totals: InvocationTokenTotals,
-    nested: bool = False,
+    nested: bool,
 ) -> None:
   """Records the token spend of one workflow, across every agent in it.
 
@@ -408,6 +420,45 @@ def record_invoke_workflow_token_usage(
   _invoke_workflow_tool_input_tokens.record(
       totals.tool_input_tokens, attributes=attrs
   )
+
+
+def record_invoke_workflow_inference_calls(
+    *,
+    root_agent_name: str,
+    workflow_name: str | None,
+    count: int,
+    nested: bool,
+) -> None:
+  """Records the inference (model) calls made across one workflow.
+
+  Args:
+    root_agent_name: The runner's agent.
+    workflow_name: The workflow this datapoint covers.
+    count: Model calls made by every agent that ran inside it.
+    nested: Whether another workflow enclosed this one.
+  """
+  attrs = _invoke_workflow_attrs(root_agent_name, workflow_name, nested)
+  _invoke_workflow_inference_calls.record(count, attributes=attrs)
+
+
+def record_invoke_workflow_tool_calls(
+    *,
+    root_agent_name: str,
+    workflow_name: str | None,
+    count: int,
+    nested: bool,
+) -> None:
+  """Records the tool calls made across one workflow.
+
+  Args:
+    root_agent_name: The runner's agent.
+    workflow_name: The workflow this datapoint covers.
+    count: Tool calls made by every agent that ran inside it, including the
+      `transfer_to_agent` calls that route between them.
+    nested: Whether another workflow enclosed this one.
+  """
+  attrs = _invoke_workflow_attrs(root_agent_name, workflow_name, nested)
+  _invoke_workflow_tool_calls.record(count, attributes=attrs)
 
 
 def record_tool_execution_duration(

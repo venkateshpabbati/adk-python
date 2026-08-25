@@ -44,6 +44,8 @@ def _mock_meter_setup(monkeypatch):
   workflow_cache_read_input_tokens_hist = mock.MagicMock(spec=metrics.Histogram)
   workflow_reasoning_output_tokens_hist = mock.MagicMock(spec=metrics.Histogram)
   workflow_tool_input_tokens_hist = mock.MagicMock(spec=metrics.Histogram)
+  workflow_inference_calls_hist = mock.MagicMock(spec=metrics.Histogram)
+  workflow_tool_calls_hist = mock.MagicMock(spec=metrics.Histogram)
 
   agent_duration_hist.name = "agent_invocation_duration"
   workflow_duration_hist.name = "workflow_invocation_duration"
@@ -161,6 +163,14 @@ def _mock_meter_setup(monkeypatch):
       "_invoke_workflow_tool_input_tokens",
       workflow_tool_input_tokens_hist,
   )
+  monkeypatch.setattr(
+      _metrics,
+      "_invoke_workflow_inference_calls",
+      workflow_inference_calls_hist,
+  )
+  monkeypatch.setattr(
+      _metrics, "_invoke_workflow_tool_calls", workflow_tool_calls_hist
+  )
 
   return {
       "meter": mock_meter,
@@ -181,6 +191,8 @@ def _mock_meter_setup(monkeypatch):
       "workflow_cache_read_input_tokens": workflow_cache_read_input_tokens_hist,
       "workflow_reasoning_output_tokens": workflow_reasoning_output_tokens_hist,
       "workflow_tool_input_tokens": workflow_tool_input_tokens_hist,
+      "workflow_inference_calls": workflow_inference_calls_hist,
+      "workflow_tool_calls": workflow_tool_calls_hist,
   }
 
 
@@ -533,15 +545,16 @@ def test_record_invoke_workflow_token_usage(mock_meter_setup):
   reasoning_output_tokens = 400
   tool_input_tokens = 650
   _metrics.record_invoke_workflow_token_usage(
-      "root_agent",
-      "specialist",
-      _token_usage.InvocationTokenTotals(
+      root_agent_name="root_agent",
+      workflow_name="specialist",
+      totals=_token_usage.InvocationTokenTotals(
           input_tokens=input_tokens,
           output_tokens=output_tokens,
           cache_read_input_tokens=cache_read_input_tokens,
           reasoning_output_tokens=reasoning_output_tokens,
           tool_input_tokens=tool_input_tokens,
       ),
+      nested=False,
   )
 
   want = {
@@ -569,9 +582,12 @@ def test_record_invoke_workflow_token_usage_omits_unset_workflow_name(
 ):
   """An unstamped entrypoint drops the attribute rather than sending empty."""
   _metrics.record_invoke_workflow_token_usage(
-      "root_agent",
-      None,
-      _token_usage.InvocationTokenTotals(input_tokens=10, output_tokens=5),
+      root_agent_name="root_agent",
+      workflow_name=None,
+      totals=_token_usage.InvocationTokenTotals(
+          input_tokens=10, output_tokens=5
+      ),
+      nested=False,
   )
 
   hist = mock_meter_setup["workflow_input_tokens"]
@@ -579,3 +595,32 @@ def test_record_invoke_workflow_token_usage_omits_unset_workflow_name(
   assert kwargs["attributes"] == {
       "adk.experimental.root_agent.name": "root_agent"
   }
+
+
+def test_record_invoke_workflow_call_counts(mock_meter_setup):
+  """Call counts carry both names and record even at zero."""
+  _metrics.record_invoke_workflow_inference_calls(
+      root_agent_name="root_agent",
+      workflow_name="specialist",
+      count=4,
+      nested=False,
+  )
+  _metrics.record_invoke_workflow_tool_calls(
+      root_agent_name="root_agent",
+      workflow_name="specialist",
+      count=0,
+      nested=False,
+  )
+
+  want_attributes = {
+      "adk.experimental.root_agent.name": "root_agent",
+      "gen_ai.workflow.name": "specialist",
+  }
+  for hist, want_value in (
+      (mock_meter_setup["workflow_inference_calls"], 4),
+      (mock_meter_setup["workflow_tool_calls"], 0),
+  ):
+    hist.record.assert_called_once()
+    args, kwargs = hist.record.call_args
+    assert args[0] == want_value
+    assert kwargs["attributes"] == want_attributes

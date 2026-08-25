@@ -237,6 +237,16 @@ _PATCHED_HISTOGRAMS: tuple[HistogramSpec, ...] = (
         attr="_invoke_workflow_tool_input_tokens",
         metric_name="adk.experimental.invoke_workflow.tool.input_tokens",
     ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_inference_calls",
+        metric_name="adk.experimental.invoke_workflow.inference_calls",
+    ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_invoke_workflow_tool_calls",
+        metric_name="adk.experimental.invoke_workflow.tool_calls",
+    ),
 )
 
 

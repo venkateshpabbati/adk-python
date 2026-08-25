@@ -74,6 +74,10 @@ _OPERATION_BY_METRIC: dict[str, str] = {
         "invoke_workflow"
     ),
     "adk.experimental.invoke_workflow.tool.input_tokens": "invoke_workflow",
+    # The per-agent call counts summed over a whole workflow, so these cover
+    # `invoke_workflow` just as the token totals beside them do.
+    "adk.experimental.invoke_workflow.inference_calls": "invoke_workflow",
+    "adk.experimental.invoke_workflow.tool_calls": "invoke_workflow",
 }
 
 # Attributes that split a histogram into series rather than state a fact about

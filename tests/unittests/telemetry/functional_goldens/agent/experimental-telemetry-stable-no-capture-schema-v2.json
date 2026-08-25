@@ -269,6 +269,15 @@
         "value": 100
       }
     ],
+    "adk.experimental.invoke_workflow.inference_calls": [
+      {
+        "attributes": {
+          "adk.experimental.root_agent.name": "some_root_agent",
+          "gen_ai.workflow.name": "some_root_agent"
+        },
+        "value": 2
+      }
+    ],
     "adk.experimental.invoke_workflow.input_tokens": [
       {
         "attributes": {
@@ -303,6 +312,15 @@
           "gen_ai.workflow.name": "some_root_agent"
         },
         "value": 0
+      }
+    ],
+    "adk.experimental.invoke_workflow.tool_calls": [
+      {
+        "attributes": {
+          "adk.experimental.root_agent.name": "some_root_agent",
+          "gen_ai.workflow.name": "some_root_agent"
+        },
+        "value": 1
       }
     ],
     "adk.experimental.invoke_workflow.total_tokens": [

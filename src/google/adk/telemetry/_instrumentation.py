@@ -86,6 +86,24 @@ class _WorkflowScope:
   token_totals: _token_usage.InvocationTokenTotals | None = None
   """The accumulator, empty to begin with unlike the fields above."""
 
+  inference_call_count: int = 0
+  """Model calls made anywhere inside this workflow."""
+
+  tool_call_count: int = 0
+  """Tool calls made anywhere inside this workflow, including the
+  `transfer_to_agent` calls that route between its agents."""
+
+  def self_and_enclosing(self) -> Iterator[_WorkflowScope]:
+    """Yields this scope, then each one enclosing it, outermost last.
+
+    What a call spends belongs to every workflow it ran inside, so anything
+    accumulated per call walks this chain rather than stopping here.
+    """
+    scope: _WorkflowScope | None = self
+    while scope is not None:
+      yield scope
+      scope = scope.parent
+
 
 @contextlib.contextmanager
 def record_invocation(
@@ -267,16 +285,32 @@ def _flush_invoke_agent_metrics(
 
 
 def _flush_workflow_metrics(scope: _WorkflowScope) -> None:
-  """Flushes one workflow's token totals; called once, by the scope's owner."""
+  """Flushes one workflow's metrics; called once, by the scope's owner."""
   if not scope.telemetry_config.should_emit_experimental_telemetry:
     return
-  if scope.token_totals is None:
-    return
-  _metrics.record_invoke_workflow_token_usage(
-      scope.root_agent_name,
-      scope.workflow_name,
-      scope.token_totals,
-      nested=scope.parent is not None,
+  nested = scope.parent is not None
+  # We always record call counts because a count of 0 is a valid, accurate
+  # measurement. For tokens, `None` means usage just wasn't reported, which
+  # isn't the same as knowing the spend was exactly zero. So we skip tokens if
+  # they are `None`.
+  if scope.token_totals is not None:
+    _metrics.record_invoke_workflow_token_usage(
+        root_agent_name=scope.root_agent_name,
+        workflow_name=scope.workflow_name,
+        totals=scope.token_totals,
+        nested=nested,
+    )
+  _metrics.record_invoke_workflow_inference_calls(
+      root_agent_name=scope.root_agent_name,
+      workflow_name=scope.workflow_name,
+      count=scope.inference_call_count,
+      nested=nested,
+  )
+  _metrics.record_invoke_workflow_tool_calls(
+      root_agent_name=scope.root_agent_name,
+      workflow_name=scope.workflow_name,
+      count=scope.tool_call_count,
+      nested=nested,
   )
 
 
@@ -310,6 +344,32 @@ def _accumulate_invoke_agent_inference_call() -> None:
   span_tel_ctx = _invoke_agent_tel_ctx()
   if span_tel_ctx is not None:
     span_tel_ctx.increment_inference_calls()
+
+
+def _accumulate_invoke_workflow_tool_call(scope: _WorkflowScope | None) -> None:
+  """Counts one tool call against every workflow enclosing it.
+
+  Args:
+    scope: The workflow the call ran inside.
+  """
+  if scope is None:
+    return
+  for enclosing in scope.self_and_enclosing():
+    enclosing.tool_call_count += 1
+
+
+def _accumulate_invoke_workflow_inference_call(
+    scope: _WorkflowScope | None,
+) -> None:
+  """Counts one model call against every workflow enclosing it.
+
+  Args:
+    scope: The workflow the call ran inside.
+  """
+  if scope is None:
+    return
+  for enclosing in scope.self_and_enclosing():
+    enclosing.inference_call_count += 1
 
 
 def _active_tool_execution_tel_ctx() -> TelemetryContext | None:
@@ -377,19 +437,26 @@ def _accumulate_invoke_agent_tokens(usage: _token_usage.TokenUsage) -> None:
   span_tel_ctx.token_totals.add(usage)
 
 
-def _accumulate_invoke_workflow_tokens(usage: _token_usage.TokenUsage) -> None:
+def _accumulate_invoke_workflow_tokens(
+    usage: _token_usage.TokenUsage,
+    scope: _WorkflowScope | None,
+) -> None:
   """Adds one model call's token usage to every workflow enclosing the call.
 
   The turn included: several aggregations of one call, not double counting.
   Where an agent's total is exclusive to that agent, a workflow's is inclusive
   of everything that ran in it.
+
+  Args:
+    usage: What the call spent.
+    scope: The workflow the call ran inside.
   """
-  scope = _workflow_scope()
-  while scope is not None:
-    if scope.token_totals is None:
-      scope.token_totals = _token_usage.InvocationTokenTotals()
-    scope.token_totals.add(usage)
-    scope = scope.parent
+  if scope is None:
+    return
+  for enclosing in scope.self_and_enclosing():
+    if enclosing.token_totals is None:
+      enclosing.token_totals = _token_usage.InvocationTokenTotals()
+    enclosing.token_totals.add(usage)
 
 
 @contextlib.asynccontextmanager
@@ -433,6 +500,7 @@ async def record_tool_execution(
 ) -> AsyncIterator[TelemetryContext]:
   """Unified context manager for consolidated tool execution telemetry."""
   start_time = time.monotonic()
+  workflow_scope = _workflow_scope()
   caught_error: Exception | None = None
   detected_error_type: str | None = None
   span: trace.Span | None = None
@@ -472,6 +540,11 @@ async def record_tool_execution(
           )
   finally:
     _accumulate_invoke_agent_tool_call()
+    # Workflow-grain metrics are experimental, skip counting if not opted-in.
+    if tracing._telemetry_config_from_invocation_context(
+        invocation_context
+    ).should_emit_experimental_telemetry:
+      _accumulate_invoke_workflow_tool_call(workflow_scope)
     try:
       _metrics.record_tool_execution_duration(
           tool_name=tool.name,
@@ -495,6 +568,7 @@ async def record_inference_telemetry(
 ) -> AsyncIterator[TelemetryContext]:
   """Unified async context manager for consolidated inference metrics."""
   start_time = time.monotonic()
+  workflow_scope = _workflow_scope()
   tel_ctx: TelemetryContext = TelemetryContext()
   try:
     async with tracing.use_inference_span(
@@ -512,10 +586,11 @@ async def record_inference_telemetry(
     if tracing._telemetry_config_from_invocation_context(
         invocation_context
     ).should_emit_experimental_telemetry:
+      _accumulate_invoke_workflow_inference_call(workflow_scope)
       usage = _token_usage.TokenUsage.from_llm_responses(tel_ctx.llm_responses)
       if usage is not None:
         _accumulate_invoke_agent_tokens(usage)
-        _accumulate_invoke_workflow_tokens(usage)
+        _accumulate_invoke_workflow_tokens(usage, workflow_scope)
     agent = invocation_context.agent
     elapsed_s = _metrics.get_elapsed_s(tel_ctx.span, start_time)
     try:
