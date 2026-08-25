@@ -3513,5 +3513,80 @@ def test_find_user_message_for_invocation_requires_some_text():
   assert runner._find_user_message_for_invocation([image_only], "inv_1") is None
 
 
+def _fc_part(name: str, call_id: str) -> types.Part:
+  return types.Part(
+      function_call=types.FunctionCall(name=name, id=call_id, args={})
+  )
+
+
+def _fr_part(name: str, call_id: str) -> types.Part:
+  return types.Part(
+      function_response=types.FunctionResponse(
+          name=name, id=call_id, response={}
+      )
+  )
+
+
+@pytest.mark.asyncio
+async def test_resolve_invocation_id_rejects_responses_from_two_invocations():
+  """Every response is checked, not just the first one.
+
+  A message answering several calls at once must resolve to a single
+  invocation. Inspecting only `function_responses[0]` would attribute the
+  remaining responses to whichever invocation happened to come first.
+  """
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app=App(name="test_app", root_agent=MockLlmAgent("root")),
+      session_service=session_service,
+  )
+  session = await session_service.create_session(
+      app_name="test_app", user_id="u", session_id="s"
+  )
+  for inv, call_id in (("inv_a", "fc-a"), ("inv_b", "fc-b")):
+    await session_service.append_event(
+        session,
+        Event(
+            invocation_id=inv,
+            author="root",
+            content=types.Content(parts=[_fc_part("t", call_id)]),
+        ),
+    )
+
+  both = types.Content(
+      role="user", parts=[_fr_part("t", "fc-a"), _fr_part("t", "fc-b")]
+  )
+  with pytest.raises(ValueError, match="resolve to multiple invocations"):
+    runner._resolve_invocation_id(session, both, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_invocation_id_accepts_responses_from_one_invocation():
+  """Several responses to calls from the same invocation still resolve."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app=App(name="test_app", root_agent=MockLlmAgent("root")),
+      session_service=session_service,
+  )
+  session = await session_service.create_session(
+      app_name="test_app", user_id="u", session_id="s"
+  )
+  await session_service.append_event(
+      session,
+      Event(
+          invocation_id="inv_a",
+          author="root",
+          content=types.Content(
+              parts=[_fc_part("t", "fc-a"), _fc_part("t", "fc-b")]
+          ),
+      ),
+  )
+
+  both = types.Content(
+      role="user", parts=[_fr_part("t", "fc-a"), _fr_part("t", "fc-b")]
+  )
+  assert runner._resolve_invocation_id(session, both, None) == "inv_a"
+
+
 if __name__ == "__main__":
   pytest.main([__file__])

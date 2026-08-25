@@ -58,7 +58,6 @@ from .events.event_actions import EventActions
 from .flows.llm_flows import contents
 from .flows.llm_flows.agent_transfer import _get_transfer_targets
 from .flows.llm_flows.functions import _collect_function_call_ids
-from .flows.llm_flows.functions import find_event_by_function_call_id
 from .flows.llm_flows.functions import find_matching_function_call
 from .memory.base_memory_service import BaseMemoryService
 from .platform.thread import create_thread
@@ -539,36 +538,33 @@ class Runner:
       invocation_id: Optional[str],
   ) -> Optional[str]:
     """Infers invocation_id from new_message if it is a function response."""
+    if new_message is None:
+      return invocation_id
     function_responses = _get_function_responses_from_content(new_message)
     if not function_responses:
       return invocation_id
 
-    function_response_id = function_responses[0].id
-    if not function_response_id:
+    if not function_responses[0].id:
       raise ValueError(
           'Function response id is required to resume an invocation.'
       )
-    fc_event = find_event_by_function_call_id(
-        session.events, function_response_id
+    # Resolve through the shared helper so every response in the message is
+    # checked, not just the first one. A message answering several calls at
+    # once (parallel tool calls) must resolve to a single invocation; taking
+    # `function_responses[0]` alone would silently attribute the rest of the
+    # responses to whichever invocation happened to come first.
+    resolved_invocation_id = self._resolve_invocation_id_from_fr(
+        session, new_message
     )
-    if not fc_event:
-      fr_id = function_responses[0].id
-      fr_name = function_responses[0].name
-      raise ValueError(
-          'Function call event not found for function response'
-          f' (id={fr_id!r}, name={fr_name!r}). Ensure the function'
-          ' call ID matches an existing function call in the session'
-          ' history.'
-      )
 
-    if invocation_id and invocation_id != fc_event.invocation_id:
+    if invocation_id and invocation_id != resolved_invocation_id:
       logger.warning(
           'Provided invocation_id %s is ignored because new_message has a '
           'function response with invocation_id %s.',
           invocation_id,
-          fc_event.invocation_id,
+          resolved_invocation_id,
       )
-    return fc_event.invocation_id
+    return resolved_invocation_id
 
   def _format_session_not_found_message(self, session_id: str) -> str:
     message = f'Session not found: {session_id}'
