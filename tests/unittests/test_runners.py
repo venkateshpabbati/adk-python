@@ -3441,5 +3441,77 @@ async def test_run_async_with_mock_session_service_does_not_corrupt_branch():
   assert events[0].branch is None
 
 
+@pytest.mark.asyncio
+async def test_resume_finds_user_message_whose_text_is_not_the_first_part():
+  """A multimodal user turn can be resumed even when text is not `parts[0]`.
+
+  A user who attaches an image and then asks about it produces
+  `[image, text]`. Matching only `parts[0].text` misses that message, and the
+  resume path turns "not found" into a hard error.
+  """
+  session_service = InMemorySessionService()
+  root_agent = MockLlmAgent("coordinator")
+  app = App(
+      name="test_app",
+      root_agent=root_agent,
+      resumability_config=ResumabilityConfig(is_resumable=True),
+  )
+  runner = Runner(app=app, session_service=session_service)
+  session = await session_service.create_session(
+      app_name="test_app", user_id="user_1", session_id="session_1"
+  )
+  await session_service.append_event(
+      session,
+      Event(
+          invocation_id="inv_1",
+          author="user",
+          content=types.Content(
+              role="user",
+              parts=[
+                  types.Part(
+                      inline_data=types.Blob(
+                          mime_type="image/png", data=b"\x89PNG"
+                      )
+                  ),
+                  types.Part(text="what is in this picture?"),
+              ],
+          ),
+      ),
+  )
+
+  ic = await runner._setup_context_for_resumed_invocation(
+      session=session,
+      new_message=None,
+      invocation_id="inv_1",
+      run_config=RunConfig(),
+      state_delta=None,
+  )
+
+  assert ic.user_content is not None
+  assert ic.user_content.parts[1].text == "what is in this picture?"
+
+
+def test_find_user_message_for_invocation_requires_some_text():
+  """A message with no text at all is still not treated as the user message."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app=App(name="test_app", root_agent=MockLlmAgent("coordinator")),
+      session_service=session_service,
+  )
+  image_only = Event(
+      invocation_id="inv_1",
+      author="user",
+      content=types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  inline_data=types.Blob(mime_type="image/png", data=b"\x89PNG")
+              )
+          ],
+      ),
+  )
+  assert runner._find_user_message_for_invocation([image_only], "inv_1") is None
+
+
 if __name__ == "__main__":
   pytest.main([__file__])

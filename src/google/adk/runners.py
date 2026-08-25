@@ -646,8 +646,8 @@ class Runner:
         if resume_inputs or invocation_id:
           # Resume: recover the original user content. new_message here is a
           # function response (or None), so it can't populate user_content.
-          node_input = self._find_original_user_content(
-              ic.session, ic.invocation_id
+          node_input = self._find_user_message_for_invocation(
+              ic.session.events, ic.invocation_id
           )
           if node_input:
             ic.user_content = node_input
@@ -965,11 +965,18 @@ class Runner:
         session=ic.session, event=event
     )
 
-  def _find_original_user_content(
-      self, session: Session, invocation_id: str
+  def _find_user_message_for_invocation(
+      self, events: list[Event], invocation_id: str
   ) -> types.Content | None:
-    """Find the original user text message for a given invocation_id."""
-    for event in session.events:
+    """Finds the user message that started a specific invocation.
+
+    A part carrying text anywhere in the message qualifies, not just the first
+    one: a multimodal turn commonly leads with an image and puts the question
+    after it, and requiring text in ``parts[0]`` would miss it. Resuming such an
+    invocation used to fail outright, because the caller treats "not found" as
+    an error.
+    """
+    for event in events:
       if (
           event.invocation_id == invocation_id
           and event.author == 'user'
@@ -2462,21 +2469,6 @@ class Runner:
             invocation_id=invocation_context.invocation_id,
         )
     return invocation_context
-
-  def _find_user_message_for_invocation(
-      self, events: list[Event], invocation_id: str
-  ) -> Optional[types.Content]:
-    """Finds the user message that started a specific invocation."""
-    for event in events:
-      if (
-          event.invocation_id == invocation_id
-          and event.author == 'user'
-          and event.content
-          and event.content.parts
-          and event.content.parts[0].text
-      ):
-        return event.content
-    return None
 
   def _create_invocation_context(self, **kwargs: object) -> InvocationContext:
     """Creates an InvocationContext instance."""
