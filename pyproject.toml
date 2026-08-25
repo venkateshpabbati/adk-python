@@ -77,7 +77,7 @@ optional-dependencies.all = [
   "docker>=7",
   "e2b>=2,<3",
   "gepa>=0.1",
-  "google-antigravity>=0.1,<0.2",
+  "google-antigravity>=0.1.7,<0.2",
   "google-api-python-client>=2.157,<3",
   "google-cloud-agentidentitycredentials>=0.1,<0.2",
   "google-cloud-aiplatform[agent-engines,evaluation]>=1.148.1,<2",
@@ -134,7 +134,7 @@ optional-dependencies.all = [
   "xlrd>=2,<3",
 ]
 optional-dependencies.antigravity = [
-  "google-antigravity>=0.1,<0.2",
+  "google-antigravity>=0.1.7,<0.2",
   "protobuf>=6",
 ]
 optional-dependencies.benchmark = [
@@ -269,7 +269,7 @@ optional-dependencies.test = [
   "docker>=7",                                                       # For ContainerCodeExecutor tests
   "e2b>=2,<3",
   "gepa>=0.1",
-  "google-antigravity>=0.1,<0.2",
+  "google-antigravity>=0.1.7,<0.2",
   "google-api-python-client>=2.157,<3",
   "google-cloud-agentidentitycredentials>=0.1,<0.2",
   "google-cloud-aiplatform[agent-engines,evaluation]>=1.148.1,<2",
