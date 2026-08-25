@@ -21,6 +21,7 @@ import sys
 import textwrap
 from typing import AsyncGenerator
 from typing import Optional
+from unittest import mock
 from unittest.mock import AsyncMock
 from unittest.mock import create_autospec
 from unittest.mock import patch
@@ -43,6 +44,7 @@ from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.events.event import Event
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.runners import Runner
+from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
@@ -3408,6 +3410,35 @@ async def test_restore_keeps_sub_branch_keyed_by_function_call_id():
   )
   assert ic.agent == sub_agent
   assert ic.branch == "coordinator.worker@fc-1"
+
+
+@pytest.mark.asyncio
+async def test_run_async_with_mock_session_service_does_not_corrupt_branch():
+  """A mock session service returning a Mock from append_event does not corrupt ic.branch."""
+  mock_session_service = mock.AsyncMock(spec=BaseSessionService)
+  mock_session = Session(
+      id="session_1", app_name="test_app", user_id="user_1", events=[], state={}
+  )
+  mock_session_service.create_session.return_value = mock_session
+  mock_session_service.get_session.return_value = mock_session
+
+  root_agent = MockLlmAgent("coordinator")
+  runner = Runner(
+      app_name="test_app",
+      agent=root_agent,
+      session_service=mock_session_service,
+  )
+
+  events = []
+  async for event in runner.run_async(
+      user_id="user_1",
+      session_id="session_1",
+      new_message=types.Content(parts=[types.Part.from_text(text="hello")]),
+  ):
+    events.append(event)
+
+  assert len(events) == 1
+  assert events[0].branch is None
 
 
 if __name__ == "__main__":

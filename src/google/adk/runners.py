@@ -679,8 +679,6 @@ class Runner:
               user_event = await self._append_user_event(
                   ic, new_message, state_delta=state_delta
               )
-              if user_event.branch:
-                ic.branch = user_event.branch
               if yield_user_message and user_event:
                 yield user_event
 
@@ -961,6 +959,8 @@ class Runner:
         event.isolation_scope, _ = active_scope
     _apply_run_config_custom_metadata(event, ic.run_config)
     ic.stamp_event_branch_context(event)
+    if event.branch:
+      ic.branch = event.branch
     return await self.session_service.append_event(
         session=ic.session, event=event
     )
