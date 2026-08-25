@@ -291,3 +291,31 @@ MCP_CASE = FunctionalTestCase(
     capture_content="span_and_event",
     schema_version=1,
 )
+
+# The same agent, with the tool call also posted to a canned MCP server over
+# ADK's instrumented httpx client. Pins the transport record --
+# `adk.experimental.mcp.http.client.response.end` -- in full: the attributes
+# it carries, the payload the body opt-in admits, the one header the OTel
+# capture env var names, and that it lands on the `execute_tool` span. Fully
+# opted in, because everything about the record is off by default.
+MCP_HTTP_CASE = FunctionalTestCase(
+    test_id="http-exchange",
+    scenario="mcp",
+    semconv_opt_in=EXPERIMENTAL_OPT_IN,
+    capture_content="span_and_event",
+    schema_version=1,
+    experimental_telemetry=True,
+    mcp_over_http=True,
+    env={
+        "ADK_CAPTURE_MCP_HTTP_BODIES": "true",
+        # `authorization` is allowlisted deliberately: the golden then shows
+        # what asking for a credential header gets you, which is the redaction
+        # marker rather than the credential.
+        "OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_REQUEST": (
+            "authorization"
+        ),
+        "OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_RESPONSE": (
+            "content-type"
+        ),
+    },
+)

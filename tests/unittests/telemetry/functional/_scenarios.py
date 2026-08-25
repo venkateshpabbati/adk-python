@@ -49,6 +49,7 @@ from google.adk.telemetry import node_tracing
 from google.adk.telemetry import tracing
 from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.function_tool import FunctionTool
+from google.adk.tools.mcp_tool.mcp_session_manager import _DebugHttpxClientFactory
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.adk.tools.skill_toolset import SkillToolset
@@ -61,6 +62,7 @@ from google.genai.types import FinishReason
 from google.genai.types import GenerateContentResponse
 from google.genai.types import GenerateContentResponseUsageMetadata
 from google.genai.types import Part
+import httpx
 from mcp import ClientSession as McpClientSession
 from mcp import StdioServerParameters
 from mcp.shared.session import ProgressFnT
@@ -865,6 +867,22 @@ DEFAULT_MCP_TOOL = McpTool(
     },
 )
 
+# The (fake) streamable HTTP server a ``tools/call`` is posted to when the
+# scenario is asked for a session that talks over HTTP. Everything about the
+# exchange is pinned here, so what the record carries is a value a reader of
+# the golden can look up.
+MCP_SERVER_URL = "https://mcp.example.com/mcp"
+MCP_SESSION_ID = "mcp-session-1"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+# A credential on the request. The case allowlists `authorization`, so the
+# golden shows what asking for it gets you: the marker, never the secret.
+MCP_AUTHORIZATION = "Bearer some-secret-token"
+MCP_REQUEST_BODY = (
+    '{"jsonrpc": "2.0", "id": 1, "method": "tools/call",'
+    f' "params": {{"name": "{TOOL_NAME}"}}}}'
+)
+MCP_RESPONSE_BODY = '{"jsonrpc": "2.0", "id": 1, "result": {"isError": false}}'
+
 
 class FakeMcpSession(McpClientSession):
   """Minimal ``McpClientSession`` stand-in with a counted ``list_tools()``.
@@ -873,10 +891,16 @@ class FakeMcpSession(McpClientSession):
   every ``isinstance(x, McpClientSession)`` check in ADK and in the MCP
   Python client passes, without needing to wire up the underlying anyio
   memory streams + peer process.
+
+  With ``over_http``, ``call_tool`` additionally posts the JSON-RPC call
+  through the httpx client ADK builds for a streamable HTTP connection --
+  hook, redaction and all -- against a canned server. That is what makes the
+  transport itself observable: the exchange is recorded from inside the
+  ``execute_tool`` span, exactly where a real MCP tool call would record it.
   """
 
   def __init__(  # pyright: ignore[reportMissingSuperCall]
-      self, *, tools: list[McpTool] | None = None
+      self, *, tools: list[McpTool] | None = None, over_http: bool = False
   ) -> None:
     # Deliberately skip ``McpClientSession.__init__``: the real one wants
     # live anyio streams + a peer process. ``isinstance`` checks still
@@ -884,7 +908,38 @@ class FakeMcpSession(McpClientSession):
     self._tools: list[McpTool] = (
         tools if tools is not None else [DEFAULT_MCP_TOOL]
     )
+    self._over_http = over_http
     self.list_tools_call_count: int = 0
+
+  async def _post_tool_call(self) -> None:
+    """Posts one ``tools/call`` over ADK's instrumented httpx client."""
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+      return httpx.Response(
+          200,
+          headers={
+              "content-type": "application/json",
+              "mcp-session-id": MCP_SESSION_ID,
+              "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+          },
+          text=MCP_RESPONSE_BODY,
+      )
+
+    def base_factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+      del timeout, auth  # The canned server has neither to honour.
+      return httpx.AsyncClient(
+          headers=headers, transport=httpx.MockTransport(respond)
+      )
+
+    # The same wrapper `MCPSessionManager._create_client` puts around the
+    # connection's factory for an HTTP transport.
+    factory = _DebugHttpxClientFactory(base_factory)
+    async with factory(headers={"Authorization": MCP_AUTHORIZATION}) as client:
+      await client.post(MCP_SERVER_URL, content=MCP_REQUEST_BODY)
 
   @override
   async def list_tools(
@@ -907,6 +962,8 @@ class FakeMcpSession(McpClientSession):
       meta: dict[str, object] | None = None,
   ) -> CallToolResult:
     """Answers like the agent's own ``some_tool``, over MCP."""
+    if self._over_http:
+      await self._post_tool_call()
     argument = (arguments or {}).get("arg1", "")
     return CallToolResult(
         content=[

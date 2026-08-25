@@ -93,6 +93,12 @@ class FunctionalTestCase:
   experimental_telemetry: bool = False
   loaded_skills: list[SkillType] = field(default_factory=list)
   loaded_resources: list[SkillResourceType] = field(default_factory=list)
+  # The ``mcp`` scenario only: the tool call is also posted to a canned MCP
+  # server over ADK's instrumented httpx client, so the case records the
+  # transport as well as the tools it resolved.
+  mcp_over_http: bool = False
+  # Anything else the case needs in the environment, applied last.
+  env: dict[str, str] = field(default_factory=dict)
 
   @property
   def propagated_error(self) -> Exception | None:
@@ -132,6 +138,8 @@ class FunctionalTestCase:
     monkeypatch.setenv(
         ADK_EXPERIMENTAL_TELEMETRY, str(self.experimental_telemetry).lower()
     )
+    for name, value in self.env.items():
+      monkeypatch.setenv(name, value)
 
 
 @dataclass(frozen=True)
@@ -267,7 +275,11 @@ async def _run_scenario(
         )
       case "mcp":
         await run_agent_scenario(
-            build_mcp_test_runner(model, monkeypatch, FakeMcpSession()),
+            build_mcp_test_runner(
+                model,
+                monkeypatch,
+                FakeMcpSession(over_http=case.mcp_over_http),
+            ),
             event_sink=event_sink,
         )
       case "skill":
