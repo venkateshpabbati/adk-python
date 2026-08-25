@@ -30,6 +30,9 @@ This directory contains specific developer guides for the ADK Python implementat
 ### Flows
 * [Live model callbacks](flows/llm_flows/base_llm_flow/live_model_callbacks.md) - Inspecting or blocking content on a live bidirectional session.
 
+### Integrations
+* [Model Armor](integrations/model_armor/index.md) - Screening user input and model output with Google Cloud Model Armor.
+
 ### Memory
 * [BaseMemoryService](memory/memory_service/index.md) - Storing finished sessions and recalling them from later conversations.
 
