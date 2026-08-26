@@ -628,7 +628,7 @@ async def _execute_single_function_call_async(
         if inspect.isawaitable(callback_result):
           callback_result = await callback_result
         function_response = callback_result
-        if function_response:
+        if function_response is not None:
           break
 
     # Step 3: Otherwise, proceed calling the tool normally.
@@ -674,7 +674,7 @@ async def _execute_single_function_call_async(
         if inspect.isawaitable(callback_result):
           callback_result = await callback_result
         altered_function_response = callback_result
-        if altered_function_response:
+        if altered_function_response is not None:
           break
 
     # Step 6: If alternative response exists from after_tool_callback, use it
@@ -689,7 +689,9 @@ async def _execute_single_function_call_async(
       # injection) or defers its response by design (e.g., the LlmAgent
       # wrapper for task delegation synthesizes the FR after the
       # sub-agent completes).  Either way, skip the auto-FR build when
-      # the tool returned nothing.
+      # the tool returned nothing.  Truthiness is deliberate here, unlike
+      # the callback chains above: the real FR still arrives later, so an
+      # empty dict must not answer the call early.
       return None
 
     detected_error_type = _detect_error_type_for_telemetry(
@@ -890,7 +892,7 @@ async def _execute_single_function_call_live(
         if inspect.isawaitable(callback_result):
           callback_result = await callback_result
         function_response = callback_result
-        if function_response:
+        if function_response is not None:
           break
 
     # Step 3: Otherwise, proceed calling the tool normally.
@@ -941,7 +943,7 @@ async def _execute_single_function_call_live(
         if inspect.isawaitable(callback_result):
           callback_result = await callback_result
         altered_function_response = callback_result
-        if altered_function_response:
+        if altered_function_response is not None:
           break
 
     # Step 6: If alternative response exists from after_tool_callback, use it
@@ -954,7 +956,9 @@ async def _execute_single_function_call_live(
     ) and not function_response:
       # The tool either runs long (FR will arrive later via session
       # injection) or defers its response by design.  Skip the auto-FR
-      # build when the tool returned nothing.
+      # build when the tool returned nothing.  Truthiness is deliberate
+      # here, unlike the callback chains above: the real FR still arrives
+      # later, so an empty dict must not answer the call early.
       return None
 
     detected_error_type = _detect_error_type_for_telemetry(
