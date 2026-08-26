@@ -32,6 +32,7 @@ from ..auth.auth_credential import AuthCredential
 from ..auth.credential_service.base_credential_service import BaseCredentialService
 from ..events._branch_path import _BranchPath
 from ..events.event import Event
+from ..live.live_request_queue import LiveRequestQueue
 from ..memory.base_memory_service import BaseMemoryService
 from ..plugins.plugin_manager import PluginManager
 from ..sessions.base_session_service import BaseSessionService
@@ -42,7 +43,6 @@ from .active_streaming_tool import ActiveStreamingTool
 from .base_agent import BaseAgent
 from .base_agent import BaseAgentState
 from .context_cache_config import ContextCacheConfig
-from .live_request_queue import LiveRequestQueue
 from .run_config import RunConfig
 from .transcription_entry import TranscriptionEntry
 
