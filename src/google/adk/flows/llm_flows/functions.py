@@ -598,12 +598,12 @@ async def _execute_single_function_call_async(
         tool_context=tool_context,
         error=tool_error,
     )
-    if error_response is not None:
-      return __build_response_event(
-          tool, error_response, tool_context, invocation_context
-      )
-    else:
-      raise tool_error
+    if error_response is None:
+      logger.warning('%s', tool_error)
+      error_response = _build_tool_not_found_response(tool.name, tools_dict)
+    return __build_response_event(
+        tool, error_response, tool_context, invocation_context
+    )
 
   async def _run_with_trace() -> Event | None:
     nonlocal function_args, detected_error_type
@@ -849,11 +849,12 @@ async def _execute_single_function_call_live(
         tool_context=tool_context,
         error=tool_error,
     )
-    if error_response is not None:
-      return __build_response_event(
-          tool, error_response, tool_context, invocation_context
-      )
-    raise tool_error
+    if error_response is None:
+      logger.warning('%s', tool_error)
+      error_response = _build_tool_not_found_response(tool.name, tools_dict)
+    return __build_response_event(
+        tool, error_response, tool_context, invocation_context
+    )
 
   async def _run_with_trace() -> Event | None:
     """Executes the tool with full lifecycle management and telemetry.
@@ -1333,6 +1334,26 @@ def _get_tool(
     raise ValueError(error_msg)
 
   return tools_dict[tool_name]
+
+
+def _build_tool_not_found_response(
+    tool_name: str, tools_dict: dict[str, BaseTool]
+) -> dict[str, str]:
+  """Returns the error payload for a tool name the model made up.
+
+  A name the model invented is the model's own mistake to correct, so it is
+  reported back to the model the way a malformed argument list already is,
+  rather than raised out of the invocation.
+  """
+  available = ', '.join(tools_dict) or 'none'
+  return {
+      'error': (
+          f'Invoking `{tool_name}()` failed as no tool with that name is'
+          f' available. The tools you can call are: {available}. You could'
+          ' retry, but it is IMPORTANT that you only call a tool from that'
+          ' list.'
+      )
+  }
 
 
 def _create_tool_context(

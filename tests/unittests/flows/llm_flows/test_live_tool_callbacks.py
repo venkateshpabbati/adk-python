@@ -390,7 +390,7 @@ async def test_live_callback_compatibility_with_async():
 
 @pytest.mark.asyncio
 async def test_live_on_tool_error_callback_tool_not_found_noop():
-  """Test that on_tool_error_callback is a no-op when the tool is not found."""
+  """Test that a no-op on_tool_error_callback keeps the default error response."""
 
   def noop_on_tool_error_callback(tool, args, tool_context, error):
     return None
@@ -418,8 +418,13 @@ async def test_live_on_tool_error_callback_tool_not_found_noop():
   )
   tools_dict = {tool.name: tool}
 
-  with pytest.raises(ValueError):
-    await handle_function_calls_live(invocation_context, event, tools_dict)
+  result = await handle_function_calls_live(
+      invocation_context, event, tools_dict
+  )
+
+  function_response = result.content.parts[0].function_response
+  assert function_response.name == "nonexistent_function"
+  assert "nonexistent_function" in function_response.response["error"]
 
 
 @pytest.mark.asyncio
