@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -34,6 +35,8 @@ from google.adk.tools.mcp_tool.mcp_session_manager import _SESSION_IDLE_TTL_SECO
 from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
 from google.adk.tools.mcp_tool.mcp_tool import MCPTool
+from google.adk.tools.mcp_tool.mcp_tool import ProgressCallbackFactory
+from google.adk.tools.mcp_tool.mcp_tool import ProgressFnT
 from google.adk.tools.tool_context import ToolContext
 from google.genai.types import FunctionDeclaration
 from mcp.types import CallToolResult
@@ -1378,6 +1381,46 @@ class TestMCPTool:
     assert factory_calls[0][1] is tool_context
 
   @pytest.mark.asyncio
+  async def test_run_async_impl_with_progress_callback_object(self):
+    """An instance whose __call__ is async is a callback, not a factory.
+
+    `iscoroutinefunction` is False for such an instance, so it used to reach
+    the factory branch and get called with the wrong arguments.
+    """
+
+    class ProgressCallback:
+
+      async def __call__(
+          self, progress: float, total: float | None, message: str | None
+      ) -> None:
+        pass
+
+    my_progress_callback = ProgressCallback()
+
+    tool = MCPTool(
+        mcp_tool=self.mock_mcp_tool,
+        mcp_session_manager=self.mock_session_manager,
+        progress_callback=my_progress_callback,
+    )
+
+    mcp_response = CallToolResult(
+        content=[TextContent(type="text", text="success")]
+    )
+    self.mock_session.call_tool = AsyncMock(return_value=mcp_response)
+
+    args = {"param1": "test_value"}
+    await tool._run_async_impl(
+        args=args, tool_context=Mock(spec=ToolContext), credential=None
+    )
+
+    self.mock_session.call_tool.assert_called_once_with(
+        "test_tool",
+        arguments=args,
+        progress_callback=my_progress_callback,
+        meta=None,
+    )
+
+  @pytest.mark.asyncio
   async def test_run_async_require_confirmation_callable_with_context_type(
       self,
   ):
@@ -2061,3 +2104,53 @@ class TestVendorExtensionFields:
 
     assert "_meta" not in result
     assert result["meta"] == {"acme.com/trace": "trace-1"}
+
+
+class TestProgressFnT:
+  """Tests for the progress-callback protocol ADK declares."""
+
+  def test_no_sdk_class_in_the_protocol_ancestry(self):
+    """The protocol must not be built on the SDK's.
+
+    `mcp.shared.session` exists to hold the session base class. A release that
+    reorganizes it takes a subclass down with it, and with it every MCP tool.
+    """
+    sdk_ancestors = [
+        klass
+        for klass in ProgressFnT.__mro__
+        if klass.__module__ == "mcp" or klass.__module__.startswith("mcp.")
+    ]
+    assert not sdk_ancestors
+
+  def test_same_call_signature_as_the_sdk_protocol(self):
+    """ADK's protocol must keep describing what the SDK actually calls.
+
+    The callback is handed to `ClientSession.call_tool`, which invokes it
+    positionally. A rename or a changed default here would mislead everyone
+    who writes a callback against the annotation.
+    """
+    sdk_protocol = pytest.importorskip("mcp.shared.session").ProgressFnT
+
+    ours = inspect.signature(ProgressFnT.__call__)
+    theirs = inspect.signature(sdk_protocol.__call__)
+    assert [p.name for p in ours.parameters.values()] == [
+        p.name for p in theirs.parameters.values()
+    ]
+    assert [p.kind for p in ours.parameters.values()] == [
+        p.kind for p in theirs.parameters.values()
+    ]
+    assert [p.default for p in ours.parameters.values()] == [
+        p.default for p in theirs.parameters.values()
+    ]
+
+  def test_factory_protocol_stays_runtime_checkable(self):
+    """`isinstance` against the factory must not raise.
+
+    The decorator sits on the line above the class, so inserting anything
+    between the two silently moves it to the new class.
+    """
+
+    def factory(tool_name, *, callback_context=None, **kwargs):
+      return None
+
+    assert isinstance(factory, ProgressCallbackFactory)

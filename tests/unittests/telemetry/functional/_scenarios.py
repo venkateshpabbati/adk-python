@@ -51,6 +51,7 @@ from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool.mcp_session_manager import _DebugHttpxClientFactory
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.tools.mcp_tool.mcp_tool import ProgressFnT
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.adk.tools.skill_toolset import SkillToolset
 from google.adk.workflow._base_node import START
@@ -65,7 +66,6 @@ from google.genai.types import Part
 import httpx
 from mcp import ClientSession as McpClientSession
 from mcp import StdioServerParameters
-from mcp.shared.session import ProgressFnT
 from mcp.types import CallToolResult
 from mcp.types import ListToolsResult
 from mcp.types import PaginatedRequestParams
