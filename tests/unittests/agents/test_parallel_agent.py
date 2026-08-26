@@ -417,12 +417,18 @@ class _TestingAgentFailingAfterDelay(_TestingAgent):
     raise ValueError('simulated sub-agent failure')
 
 
-def _flatten(error: BaseException) -> list[BaseException]:
-  """Flattens exception groups, which only the Python 3.11+ merge raises."""
-  nested = getattr(error, 'exceptions', None)
-  if not nested:
-    return [error]
-  return [leaf for e in nested for leaf in _flatten(e)]
+class _TestingAgentFailingBeforeAnyEvent(_TestingAgent):
+  """Fails without emitting an event."""
+
+  failure: type[Exception] = ValueError
+
+  @override
+  async def _run_async_impl(
+      self, ctx: InvocationContext
+  ) -> AsyncGenerator[Event, None]:
+    await asyncio.sleep(self.delay)
+    raise self.failure('simulated sub-agent failure')
+    yield  # pragma: no cover
 
 
 @pytest.mark.asyncio
@@ -447,14 +453,79 @@ async def test_sub_agent_failure_reaches_busy_caller(
       request.function.__name__, parallel_agent
   )
 
-  with pytest.raises(BaseException) as exc_info:
+  with pytest.raises(ValueError, match='simulated sub-agent failure'):
     async for _ in parallel_agent.run_async(parent_ctx):
       await asyncio.sleep(0.1)
 
-  assert any(
-      isinstance(e, ValueError) and 'simulated sub-agent failure' in str(e)
-      for e in _flatten(exc_info.value)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('use_pre_3_11_merge', [False, True])
+async def test_sub_agent_failure_keeps_its_type(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    use_pre_3_11_merge: bool,
+):
+  """The caller catches the error the sub-agent raised, not a wrapper."""
+  if use_pre_3_11_merge:
+    monkeypatch.setattr(
+        parallel_agent_module,
+        'sys',
+        SimpleNamespace(version_info=(3, 10)),
+    )
+
+  parallel_agent = ParallelAgent(
+      name=f'{request.function.__name__}_test_parallel_agent',
+      sub_agents=[
+          _TestingAgentFailingBeforeAnyEvent(
+              name=f'{request.function.__name__}_test_agent_1'
+          ),
+      ],
   )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, parallel_agent
+  )
+
+  with pytest.raises(ValueError, match='simulated sub-agent failure'):
+    async for _ in parallel_agent.run_async(parent_ctx):
+      pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('use_pre_3_11_merge', [False, True])
+async def test_earliest_of_several_sub_agent_failures_keeps_its_type(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    use_pre_3_11_merge: bool,
+):
+  """Several branches failing surfaces the earliest error, still unwrapped."""
+  if use_pre_3_11_merge:
+    monkeypatch.setattr(
+        parallel_agent_module,
+        'sys',
+        SimpleNamespace(version_info=(3, 10)),
+    )
+
+  parallel_agent = ParallelAgent(
+      name=f'{request.function.__name__}_test_parallel_agent',
+      sub_agents=[
+          _TestingAgentFailingBeforeAnyEvent(
+              name=f'{request.function.__name__}_test_agent_1',
+              delay=0.01,
+          ),
+          _TestingAgentFailingBeforeAnyEvent(
+              name=f'{request.function.__name__}_test_agent_2',
+              delay=0.2,
+              failure=TypeError,
+          ),
+      ],
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, parallel_agent
+  )
+
+  with pytest.raises(ValueError, match='simulated sub-agent failure'):
+    async for _ in parallel_agent.run_async(parent_ctx):
+      pass
 
 
 @pytest.mark.asyncio
