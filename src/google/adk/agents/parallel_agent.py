@@ -222,13 +222,18 @@ async def _merge_agent_run_pre_3_11(
     ' a future version. Workflow cannot yet be used as an LlmAgent sub-agent.'
 )
 class ParallelAgent(BaseAgent):
-  """A shell agent that runs its sub-agents in parallel in an isolated manner.
+  """A shell agent that runs its sub-agents in parallel on separate branches.
 
   This approach is beneficial for scenarios requiring multiple perspectives or
   attempts on a single task, such as:
 
   - Running different algorithms simultaneously.
   - Generating multiple responses for review by a subsequent evaluation agent.
+
+  Only conversation history is isolated between branches: a sub-agent sees the
+  events that led to the fan-out and its own, but not those of a sibling.
+  Session state is shared by every branch, so branches writing the same key
+  leave only the value written last.
 
   .. deprecated::
     ParallelAgent is deprecated in favor of Workflow and will be removed in a
