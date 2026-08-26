@@ -38,6 +38,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai.types import FunctionDeclaration
 from mcp.types import CallToolResult
 from mcp.types import TextContent
+from mcp.types import Tool as McpBaseTool
 import pytest
 
 
@@ -1991,3 +1992,72 @@ class TestResultDictKeys:
     )
 
     assert "is_error" not in result
+
+
+class TestVendorExtensionFields:
+  """Pins what happens to fields the SDK does not declare.
+
+  A server can add its own fields. Today the SDK keeps them and they reach
+  ADK's callers. These tests say so, so a change shows up as a failure.
+  """
+
+  def setup_method(self):
+    self.mock_session_manager = Mock(spec=MCPSessionManager)
+    self.mock_session = AsyncMock()
+    self.mock_session_manager.create_session = AsyncMock(
+        return_value=self.mock_session
+    )
+
+  async def _run(self, mcp_response):
+    tool = MCPTool(
+        mcp_tool=MockMCPTool(name="test_tool"),
+        mcp_session_manager=self.mock_session_manager,
+    )
+    self.mock_session.call_tool = AsyncMock(return_value=mcp_response)
+    tool_context = ToolContext(invocation_context=Mock())
+    tool_context.function_call_id = "test-call-id"
+    return await tool._run_async_impl(
+        args={}, tool_context=tool_context, credential=None
+    )
+
+  @pytest.mark.asyncio
+  async def test_unknown_result_field_reaches_the_caller(self):
+    """A field the SDK does not declare still arrives in the result dict."""
+    response = CallToolResult.model_validate({
+        "content": [{"type": "text", "text": "hi"}],
+        "acmeTraceId": "trace-1",
+    })
+
+    result = await self._run(response)
+
+    assert result["acmeTraceId"] == "trace-1"
+
+  def test_unknown_tool_field_survives_on_the_raw_tool(self):
+    """The same holds for a tool declaration, which callers read directly."""
+    raw = McpBaseTool.model_validate({
+        "name": "test_tool",
+        "description": "d",
+        "inputSchema": {"type": "object"},
+        "acmeVisibility": "internal",
+    })
+
+    tool = MCPTool(mcp_tool=raw, mcp_session_manager=self.mock_session_manager)
+
+    assert getattr(tool.raw_mcp_tool, "acmeVisibility", None) == "internal"
+
+  @pytest.mark.asyncio
+  async def test_the_meta_block_reaches_the_caller(self):
+    """`_meta` is the spec's extension point, and a declared field.
+
+    So it survives even if undeclared fields stop arriving. It lands under
+    `meta`, not `_meta`, because the dump is not taken by alias.
+    """
+    response = CallToolResult.model_validate({
+        "content": [{"type": "text", "text": "hi"}],
+        "_meta": {"acme.com/trace": "trace-1"},
+    })
+
+    result = await self._run(response)
+
+    assert "_meta" not in result
+    assert result["meta"] == {"acme.com/trace": "trace-1"}
