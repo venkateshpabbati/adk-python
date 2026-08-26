@@ -171,6 +171,7 @@ async def test_langgraph_agent(
 
   mock_parent_context = MagicMock(spec=InvocationContext)
   mock_parent_context._state_schema = None
+  mock_parent_context.run_config = None
   mock_session = MagicMock()
   mock_session.app_name = "test_app"
   mock_session.user_id = "test_user"
@@ -232,6 +233,7 @@ async def test_langgraph_agent_runs_real_compiled_state_graph():
 
   parent_context = MagicMock(spec=InvocationContext)
   parent_context._state_schema = None
+  parent_context.run_config = None
   mock_session = MagicMock()
   mock_session.app_name = "test_app"
   mock_session.user_id = "test_user"
@@ -294,6 +296,7 @@ def _make_parent_context(app_name, user_id, session_id):
   """Builds a mock invocation context for the given session triple."""
   parent_context = MagicMock(spec=InvocationContext)
   parent_context._state_schema = None
+  parent_context.run_config = None
   mock_session = MagicMock()
   mock_session.app_name = app_name
   mock_session.user_id = user_id
