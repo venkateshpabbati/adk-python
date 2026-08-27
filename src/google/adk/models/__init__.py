@@ -67,10 +67,11 @@ _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {
     # Gemma 3 only (function-calling workarounds). Gemma 4+ resolves to Gemini.
     'Gemma': ([r'gemma-.*'], 'gemma_llm'),
     'ApigeeLlm': ([r'apigee\/.*'], 'apigee_llm'),
-    'Claude': (
-        [r'claude-3-.*', r'claude-.*-4.*', r'claude-.*-5.*'],
-        'anthropic_llm',
-    ),
+    # Every Claude id belongs to this class, so match the family rather than
+    # its generations. Enumerating generations meant each new one was
+    # unusable until someone added a pattern, and the ids do not follow one
+    # order anyway: claude-opus-4 and claude-4-opus are both real.
+    'Claude': ([r'claude-.*'], 'anthropic_llm'),
     'Gemma3Ollama': ([r'ollama/gemma3.*'], 'gemma_llm'),
     'OpenAILlm': (
         [r'gpt-.*', r'o\d+-.*'],
