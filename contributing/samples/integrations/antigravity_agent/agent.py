@@ -53,7 +53,7 @@ in a browser).""",
     save_dir=_trajectories,
 )
 
-# 2. Wrap the SDK config as a standalone ADK root agent.
+# 2. Wrap the Antigravity SDK config as a standalone ADK root agent.
 root_agent = AntigravityAgent(
     name="antigravity_game_developer",
     description=(
