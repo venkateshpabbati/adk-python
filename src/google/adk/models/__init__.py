@@ -30,6 +30,7 @@ if TYPE_CHECKING:
   from google.adk.integrations.oci._oci_genai_llm import OCIGenAILlm
   from google.adk.labs.openai import OpenAILlm
 
+  from ._fallback_model import FallbackModel
   from .anthropic_llm import AnthropicGenerateContentConfig
   from .anthropic_llm import Claude
   from .apigee_llm import ApigeeLlm
@@ -43,6 +44,7 @@ __all__ = [
     'ApigeeLlm',
     'BaseLlm',
     'Claude',
+    'FallbackModel',
     'Gemini',
     'Gemma',
     'Gemma3Ollama',
@@ -121,6 +123,7 @@ for _name, (_patterns, _module) in _LAZY_PROVIDERS.items():
 
 _OTHER_LAZY_IMPORTS: dict[str, str] = {
     'AnthropicGenerateContentConfig': 'anthropic_llm',
+    'FallbackModel': '_fallback_model',
 }
 
 
