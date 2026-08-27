@@ -27,7 +27,6 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.telemetry import _instrumentation
 from google.adk.telemetry import _metrics
 from google.adk.telemetry import tracing
-from google.adk.telemetry.context import TelemetryConfig
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 from google.adk.workflow._workflow import Workflow
@@ -283,9 +282,7 @@ def _agent(name: str = "root_agent", description: str = "") -> LlmAgent:
   )
 
 
-async def _invocation_context(
-    agent: LlmAgent, experimental_telemetry: bool = False
-) -> InvocationContext:
+async def _invocation_context(agent: LlmAgent) -> InvocationContext:
   session_service = InMemorySessionService()
   session = await session_service.create_session(
       app_name="test_app", user_id="test_user"
@@ -295,11 +292,7 @@ async def _invocation_context(
       agent=agent,
       session=session,
       session_service=session_service,
-      run_config=RunConfig(
-          telemetry=TelemetryConfig(
-              adk_experimental_telemetry_opt_in=experimental_telemetry
-          )
-      ),
+      run_config=RunConfig(),
   )
 
 
@@ -384,9 +377,10 @@ async def test_record_agent_invocation_flushes_inference_and_tool_counts(
   agent = _agent()
   ctx = await _invocation_context(agent)
 
-  async with _instrumentation.record_agent_invocation(ctx, agent) as scope:
-    scope.inference_call_count += 2
-    scope.tool_call_count += 1
+  async with _instrumentation.record_agent_invocation(ctx, agent) as tel_ctx:
+    tel_ctx.increment_inference_calls()
+    tel_ctx.increment_inference_calls()
+    tel_ctx.increment_tool_calls()
 
   assert telemetry.points("gen_ai.invoke_agent.inference_calls") == [
       ({"gen_ai.agent.name": "root_agent"}, 2)
@@ -405,49 +399,13 @@ async def test_record_agent_invocation_flushes_counts_even_when_body_fails(
   ctx = await _invocation_context(agent)
 
   with pytest.raises(ValueError):
-    async with _instrumentation.record_agent_invocation(ctx, agent) as scope:
-      scope.tool_call_count += 1
+    async with _instrumentation.record_agent_invocation(ctx, agent) as tel_ctx:
+      tel_ctx.increment_tool_calls()
       raise ValueError("agent blew up")
 
   assert telemetry.points("gen_ai.invoke_agent.tool_calls") == [
       ({"gen_ai.agent.name": "root_agent"}, 1)
   ]
-
-
-@pytest.mark.asyncio
-async def test_record_agent_invocation_without_the_opt_in_emits_no_tokens(
-    telemetry: _Telemetry,
-):
-  """A run that never opted in sees no token metrics, not even a zero one."""
-  agent = _agent()
-  ctx = await _invocation_context(agent)
-
-  async with _instrumentation.record_agent_invocation(ctx, agent):
-    pass
-
-  assert not telemetry.points("adk.experimental.invoke_agent.total_tokens")
-  # The call counts are stable, so they report regardless.
-  assert telemetry.points("gen_ai.invoke_agent.inference_calls") == [
-      ({"gen_ai.agent.name": "root_agent"}, 0)
-  ]
-
-
-@pytest.mark.asyncio
-async def test_record_agent_invocation_that_reported_no_usage_emits_no_tokens(
-    telemetry: _Telemetry,
-):
-  """An opted-in invocation no model reported usage for emits no token metrics.
-
-  Nothing reported and a reported zero are different answers, and the totals
-  sit at zero for both, so the flush goes by whether usage ever arrived.
-  """
-  agent = _agent()
-  ctx = await _invocation_context(agent, experimental_telemetry=True)
-
-  async with _instrumentation.record_agent_invocation(ctx, agent):
-    pass
-
-  assert not telemetry.points("adk.experimental.invoke_agent.total_tokens")
 
 
 @pytest.mark.asyncio
@@ -616,7 +574,7 @@ async def test_record_tool_execution_reported_error_labels_span_and_metric(
   }]
 
 
-# --- record_inference_telemetry + InferenceScope.record_llm_response ---
+# --- record_inference_telemetry + TelemetryContext.record_llm_response ------
 
 
 def _llm_response(**overrides) -> LlmResponse:
@@ -773,7 +731,7 @@ async def test_record_llm_response_keeps_every_response_in_arrival_order(
   """
   agent = _agent()
   ctx = await _invocation_context(agent)
-  tel_ctx = _instrumentation.InferenceScope()
+  tel_ctx = _instrumentation.TelemetryContext()
   first = _llm_response(partial=True, finish_reason=None)
   second = _llm_response()
 
@@ -795,7 +753,7 @@ async def test_record_llm_response_traces_the_result_onto_the_carried_span(
   """
   agent = _agent()
   ctx = await _invocation_context(agent)
-  tel_ctx = _instrumentation.InferenceScope()
+  tel_ctx = _instrumentation.TelemetryContext()
 
   with tracing.tracer.start_as_current_span("test_span") as span:
     tel_ctx.span = span
