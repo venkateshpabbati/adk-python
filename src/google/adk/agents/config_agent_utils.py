@@ -151,6 +151,34 @@ def _is_sub_agents_type(annotation: Any) -> bool:
   return False
 
 
+def _is_workflow_edges_type(annotation: Any) -> bool:
+  """Checks if the type annotation is a list of EdgeItem."""
+  origin = typing.get_origin(annotation)
+  args = typing.get_args(annotation)
+
+  if _is_union(origin):
+    return any(_is_workflow_edges_type(arg) for arg in args)
+
+  if origin is list:
+    for arg in args:
+      from ..workflow._graph import Edge
+      from ..workflow._graph import EdgeItem
+
+      if arg is EdgeItem or arg == EdgeItem:
+        return True
+      if isinstance(arg, type) and issubclass(arg, Edge):
+        return True
+      arg_origin = typing.get_origin(arg)
+      arg_args = typing.get_args(arg)
+      if _is_union(arg_origin):
+        if any(
+            (a is EdgeItem or (isinstance(a, type) and issubclass(a, Edge)))
+            for a in arg_args
+        ):
+          return True
+  return False
+
+
 def _is_llm_type(annotation: Any) -> bool:
   """Checks if the type annotation involves a BaseLlm type."""
   origin = typing.get_origin(annotation)
@@ -176,6 +204,11 @@ class _AgentConfigMapper:
     # which are real fields on it. Applied after construction by `from_config`
     # rather than dropped, so a key the YAML sets is never silently ignored.
     self.deferred_fields: dict[str, Any] = {}
+    # Nodes are cached by name and by the reference that produced them, so a
+    # node named once in a chain is the same object when a later edge refers
+    # to it again -- which is what keeps START and shared sub-graphs
+    # identity-stable across edges.
+    self._resolved_nodes_cache: dict[Any, Any] = {}
 
   def _resolve_tools(self, tool_configs: list[ToolConfig]) -> list[Any]:
     """Resolve tools from configuration."""
@@ -215,12 +248,211 @@ class _AgentConfigMapper:
 
     return resolved_tools
 
+  def _resolve_edges(self, value: list[Any]) -> list[Any]:
+    """Resolve edges to support agent references and graph chains."""
+    from ..workflow._graph import Edge
+
+    processed_edges: List[Any] = []
+    for edge_item in value:
+      if isinstance(edge_item, list):
+        # A chain of elements in YAML: [START, node1, node2, ...] -> tuple(...)
+        processed_chain = []
+        for element in edge_item:
+          processed_chain.append(self._resolve_chain_element(element))
+        processed_edges.append(tuple(processed_chain))
+      elif isinstance(edge_item, tuple):
+        processed_chain = []
+        for element in edge_item:
+          processed_chain.append(self._resolve_chain_element(element))
+        processed_edges.append(tuple(processed_chain))
+      elif isinstance(edge_item, dict):
+        edge_fields = Edge.model_fields
+        if (
+            all(k in edge_fields for k in edge_item.keys())
+            and "from_node" in edge_item
+            and "to_node" in edge_item
+        ):
+          from_node = self._resolve_node_like(edge_item["from_node"])
+          to_node = self._resolve_node_like(edge_item["to_node"])
+          route = edge_item.get("route")
+          processed_edges.append(
+              Edge(from_node=from_node, to_node=to_node, route=route)
+          )
+        else:
+          # Assume RoutingMap or NodeLike
+          processed_edges.append(self._resolve_chain_element(edge_item))
+      elif isinstance(edge_item, Edge):
+        processed_edges.append(edge_item)
+      else:
+        processed_edges.append(edge_item)
+    return processed_edges
+
+  def _resolve_chain_element(self, element: Any) -> Any:
+    """Resolve a chain element in an edge."""
+    if isinstance(element, list):
+      # Fan-out in a chain: [node1, node2] -> tuple(node1, node2)
+      return tuple(self._resolve_node_like(e) for e in element)
+    elif isinstance(element, tuple):
+      return tuple(self._resolve_node_like(e) for e in element)
+    elif isinstance(element, dict):
+      if self._looks_like_a_node(element):
+        return self._resolve_node_like(element)
+      else:
+        # Assume RoutingMap: {route_key: destination}
+        processed_map = {}
+        for k, v in element.items():
+          if isinstance(v, (list, tuple)):
+            processed_map[k] = tuple(self._resolve_node_like(e) for e in v)
+          else:
+            processed_map[k] = self._resolve_node_like(v)
+        return processed_map
+    else:
+      return self._resolve_node_like(element)
+
+  def _looks_like_a_node(self, element: dict[str, Any]) -> bool:
+    """Decides whether a mapping in a chain is an inline node or a routing map.
+
+    `agent_class`, `config_path` and `func_code` only ever name a node. `name`
+    is ambiguous -- it is how an inline node is spelled, but it is also a
+    perfectly good route value -- so it counts only when every other key is a
+    field an agent actually has. That keeps `{name: a, other: b}` a routing map
+    instead of an LlmAgent missing its required keys.
+    """
+    from .llm_agent import LlmAgent
+
+    if any(k in element for k in ("agent_class", "config_path", "func_code")):
+      return True
+    # `{code: "my.module.agent"}` is an AgentRefConfig. A single-entry routing
+    # map keyed `code` looks identical until you check the value: a reference
+    # is a string, a route destination is a node.
+    if len(element) == 1 and isinstance(element.get("code"), str):
+      return True
+    return "name" in element and all(
+        _names_a_field(key, LlmAgent.model_fields) for key in element
+    )
+
+  def _resolve_node_like(self, node_like: Any) -> Any:
+    """Resolve a NodeLike item, handling agent references and FunctionNodes."""
+    from ..workflow._base_node import BaseNode
+    from ..workflow._base_node import START
+    from ..workflow._function_node import FunctionNode
+
+    if node_like is START or node_like == "START":
+      return START
+
+    if isinstance(node_like, BaseNode):
+      if node_like.name:
+        self._resolved_nodes_cache[node_like.name] = node_like
+      return node_like
+
+    if isinstance(node_like, str):
+      if node_like in self._resolved_nodes_cache:
+        return self._resolved_nodes_cache[node_like]
+
+      if node_like.endswith(".yaml") or node_like.endswith(".yml"):
+        ref = AgentRefConfig(config_path=node_like)
+        resolved = resolve_agent_reference(ref, self.abs_path)
+        self._resolved_nodes_cache[node_like] = resolved
+        if hasattr(resolved, "name") and resolved.name:
+          self._resolved_nodes_cache[resolved.name] = resolved
+        return resolved
+      else:
+        if "." not in node_like:
+          # A bare word is a node name, not a code path. Reaching here means no
+          # earlier edge defined it: forward references are not supported, and
+          # reporting this as a bad module path sends the reader looking in the
+          # wrong place entirely.
+          raise ValueError(
+              f"Unknown node {node_like!r}. A node has to be defined by an"
+              " earlier edge before another edge can name it."
+          )
+        # Check if it's a function reference or module reference
+        func_path = node_like
+        if func_path.startswith("."):
+          dir_path = os.path.dirname(self.abs_path)
+          pkg_name = os.path.basename(dir_path)
+          func_path = pkg_name + func_path
+
+        func = resolve_fully_qualified_name(func_path)
+        if callable(func) and not inspect.isclass(func):
+          node_name = func_path.rsplit(".", 1)[-1]
+          resolved = FunctionNode(name=node_name, func=func)
+        elif isinstance(func, BaseNode):
+          resolved = func
+        else:
+          # Mirrors `_resolve_agent_code_reference`: refusing here names the
+          # offending reference, where accepting it surfaces much later as a
+          # graph error that does not mention the config at all.
+          raise ValueError(
+              f"Invalid node reference {node_like!r}: resolved to a"
+              f" {type(func).__name__}, which is neither a callable nor a node."
+          )
+
+        self._resolved_nodes_cache[node_like] = resolved
+        if hasattr(resolved, "name") and resolved.name:
+          self._resolved_nodes_cache[resolved.name] = resolved
+        return resolved
+
+    elif isinstance(node_like, dict):
+      # Keyed by identity because an inline node definition has no name to key
+      # on until it is built. Sound only because the parsed YAML that owns
+      # these dicts outlives the mapper: `from_config` holds `config_data`
+      # across the whole `map()` call, so no id can be recycled mid-load.
+      node_id = id(node_like)
+      if node_id in self._resolved_nodes_cache:
+        return self._resolved_nodes_cache[node_id]
+      if (
+          "name" in node_like
+          and node_like["name"] in self._resolved_nodes_cache
+      ):
+        return self._resolved_nodes_cache[node_like["name"]]
+
+      if "config_path" in node_like or (
+          "code" in node_like
+          and "agent_class" not in node_like
+          and "func_code" not in node_like
+      ):
+        ref = AgentRefConfig(**node_like)
+        resolved = resolve_agent_reference(ref, self.abs_path)
+        self._resolved_nodes_cache[node_id] = resolved
+        if "config_path" in node_like:
+          self._resolved_nodes_cache[node_like["config_path"]] = resolved
+        if hasattr(resolved, "name") and resolved.name:
+          self._resolved_nodes_cache[resolved.name] = resolved
+        return resolved
+
+      cls_name = node_like.get("agent_class", "LlmAgent")
+      if not isinstance(cls_name, str):
+        raise ValueError(f"agent_class must be a string, got {type(cls_name)}")
+      cls = _resolve_agent_class(cls_name)
+
+      # No FunctionNode-shaped branch here: `map` already resolves `func_code`
+      # like any other `*_code` key, onto the `func` constructor parameter and
+      # with the same leading-dot handling. Going through it also means the
+      # remaining keys get their fields resolved instead of passed in raw, and
+      # that a FunctionNode *subclass* named in `agent_class` is the class that
+      # actually gets built.
+      resolved = self._build(cls, node_like)
+
+      self._resolved_nodes_cache[node_id] = resolved
+      if hasattr(resolved, "name") and resolved.name:
+        self._resolved_nodes_cache[resolved.name] = resolved
+      if "name" in node_like:
+        self._resolved_nodes_cache[node_like["name"]] = resolved
+      return resolved
+
+    return node_like
+
   def map(
       self,
       data: dict[str, Any],
       agent_class: Optional[type[Any]] = None,
   ) -> dict[str, Any]:
     """Map configuration dictionary to constructor keyword arguments."""
+    # Reset first: `deferred_fields` is per-call state kept on the mapper, and
+    # resolving an inline node re-enters `map`, so a stale set from a nested
+    # call must not leak out as this one's.
+    self.deferred_fields = {}
     cls = agent_class
 
     if not cls:
@@ -336,12 +568,46 @@ class _AgentConfigMapper:
 
     return kwargs
 
+  def _build(self, cls: type[Any], data: dict[str, Any]) -> Any:
+    """Maps `data` onto `cls`, constructs it, and applies deferred fields.
+
+    `deferred_fields` is consumed here rather than left on the mapper, because
+    the next `map` call -- including one nested inside this construction --
+    would otherwise overwrite it before the caller looked.
+    """
+    from .base_agent import BaseAgent
+
+    # A subclass owning its own construction owns it here as well. Reaching it
+    # only through `config_path` and not through an inline mapping would make
+    # the two spellings of the same node behave differently.
+    if (
+        inspect.isclass(cls)
+        and issubclass(cls, BaseAgent)
+        and _underlying(cls.from_config)
+        is not _underlying(BaseAgent.from_config)
+    ):
+      return cls.from_config(_config_as_model(cls, data), self.abs_path)
+
+    kwargs = self.map(data, cls)
+    deferred = self.deferred_fields
+    self.deferred_fields = {}
+    node = cls(**kwargs)
+    for field_name, field_value in deferred.items():
+      node.__pydantic_validator__.validate_assignment(
+          node, field_name, field_value
+      )
+    return node
+
   def _map_field(self, name: str, value: Any, fields: dict[str, Any]) -> Any:
     """Map a specific field value based on its Pydantic type annotation."""
     field = fields.get(name)
     if not field:
       return value
     annotation = field.annotation
+
+    # Rule 1: Workflow Edges
+    if _is_workflow_edges_type(annotation) and isinstance(value, (list, tuple)):
+      return self._resolve_edges(list(value))
 
     # Rule 2: Sub Agents
     if _is_sub_agents_type(annotation) and isinstance(value, list):
@@ -391,6 +657,22 @@ class _AgentConfigMapper:
       return resolve_code_reference(CodeConfig(**value))
 
     return value
+
+
+def _names_a_field(key: str, fields: dict[str, Any]) -> bool:
+  """Whether a YAML key addresses a field, directly or through a suffix.
+
+  `model_code` and `before_agent_callbacks` are spellings of `model` and
+  `before_agent_callback`; neither appears in `model_fields`, so a check
+  against that alone would not recognise them.
+  """
+  if key in fields:
+    return True
+  if key.endswith("_code") and key.removesuffix("_code") in fields:
+    return True
+  if key.endswith("_callbacks") and key.removesuffix("s") in fields:
+    return True
+  return False
 
 
 def _underlying(method: Any) -> Any:

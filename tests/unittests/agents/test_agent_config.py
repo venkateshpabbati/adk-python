@@ -1279,3 +1279,327 @@ def test_from_config_validates_a_deferred_field(tmp_path: Path):
 
   with pytest.raises(ValidationError, match="description"):
     config_agent_utils.from_config(str(config_file))
+
+
+def test_from_config_loads_workflow_with_routing_map(tmp_path: Path):
+  """Workflow can be loaded from YAML with conditional routing maps."""
+  from google.adk.workflow import Workflow
+
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: routing_pipeline\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: classifier\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: classify\n"
+      "    - tech:\n"
+      "        agent_class: LlmAgent\n"
+      "        name: tech_agent\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: tech\n"
+      "      other:\n"
+      "        agent_class: LlmAgent\n"
+      "        name: other_agent\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: other\n"
+  )
+
+  wf = config_agent_utils.from_config(str(wf_file))
+  assert isinstance(wf, Workflow)
+  assert wf.name == "routing_pipeline"
+  assert len(wf.graph.edges) == 3
+  routes = {e.route: e.to_node.name for e in wf.graph.edges if e.route}
+  assert routes == {"tech": "tech_agent", "other": "other_agent"}
+
+
+def test_from_config_loads_workflow_with_fan_out_and_join(tmp_path: Path):
+  """Workflow can be loaded from YAML with fan-out and join edges."""
+  from google.adk.workflow import Workflow
+
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: fan_out_pipeline\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - - agent_class: LlmAgent\n"
+      "        name: worker_1\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: worker 1\n"
+      "      - agent_class: LlmAgent\n"
+      "        name: worker_2\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: worker 2\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: aggregator\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: aggregate\n"
+  )
+
+  wf = config_agent_utils.from_config(str(wf_file))
+  assert isinstance(wf, Workflow)
+  assert wf.name == "fan_out_pipeline"
+  assert len(wf.graph.edges) == 4
+  to_nodes = [e.to_node.name for e in wf.graph.edges]
+  assert to_nodes.count("aggregator") == 2
+
+
+def test_from_config_loads_workflow_with_linear_chain(tmp_path: Path):
+  """Workflow can be loaded from YAML with linear edge chains."""
+  from google.adk.workflow import Workflow
+
+  sub_agent_file = tmp_path / "processor.yaml"
+  sub_agent_file.write_text(
+      "agent_class: LlmAgent\n"
+      "name: processor\n"
+      "model: gemini-2.5-flash\n"
+      "instruction: process input\n"
+  )
+
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: linear_pipeline\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - processor.yaml\n"
+  )
+
+  wf = config_agent_utils.from_config(str(wf_file))
+  assert isinstance(wf, Workflow)
+  assert wf.name == "linear_pipeline"
+  assert wf.graph is not None
+  assert len(wf.graph.edges) == 1
+  assert wf.graph.edges[0].from_node.name == "__START__"
+  assert wf.graph.edges[0].to_node.name == "processor"
+
+
+def test_from_config_workflow_node_caching_across_edges(tmp_path: Path):
+  """Subsequent edges referencing the same node name use the same instance."""
+  from google.adk.workflow import Workflow
+
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: looping_workflow\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: loop_node\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: loop\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: checker\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: check\n"
+      "  - - checker\n"
+      "    - repeat: loop_node\n"
+  )
+
+  wf = config_agent_utils.from_config(str(wf_file))
+  assert isinstance(wf, Workflow)
+  # Find loop_node from first chain and from repeat route
+  loop_node_from_start = next(
+      e.to_node for e in wf.graph.edges if e.from_node.name == "__START__"
+  )
+  loop_node_from_repeat = next(
+      e.to_node for e in wf.graph.edges if e.route == "repeat"
+  )
+  assert loop_node_from_start is loop_node_from_repeat
+
+
+def test_from_config_keeps_a_function_node_subclass(tmp_path: Path):
+  """`agent_class` naming a FunctionNode subclass builds that class.
+
+  Constructing `FunctionNode` directly downgraded the node, and skipping the
+  mapper left the other keys unresolved -- `description` here never landed.
+  """
+
+  from google.adk.workflow import FunctionNode
+
+  class MyFuncNode(FunctionNode):
+    pass
+
+  def a_func(x):
+    return x
+
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: mylib.MyFuncNode\n"
+      "      name: fn1\n"
+      "      description: from yaml\n"
+      "      func_code: mylib.a_func\n"
+  )
+
+  def fake_resolve(name):
+    return {"mylib.MyFuncNode": MyFuncNode, "mylib.a_func": a_func}[name]
+
+  with mock.patch.object(
+      config_agent_utils, "resolve_fully_qualified_name", fake_resolve
+  ):
+    with mock.patch.object(
+        config_agent_utils,
+        "resolve_code_reference",
+        lambda cc: fake_resolve(cc.name),
+    ):
+      wf = config_agent_utils.from_config(str(wf_file))
+
+  node = wf.graph.edges[0].to_node
+  assert type(node) is MyFuncNode
+  assert node.description == "from yaml"
+
+
+def test_from_config_reads_a_routing_map_whose_route_is_called_name(
+    tmp_path: Path,
+):
+  """`name` is a legal route value, not only an inline-node key."""
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: classifier\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: classify\n"
+      "    - name:\n"
+      "        agent_class: LlmAgent\n"
+      "        name: target_a\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: a\n"
+      "      other:\n"
+      "        agent_class: LlmAgent\n"
+      "        name: target_b\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: b\n"
+  )
+
+  wf = config_agent_utils.from_config(str(wf_file))
+
+  routes = {e.route: e.to_node.name for e in wf.graph.edges if e.route}
+  assert routes == {"name": "target_a", "other": "target_b"}
+
+
+def test_from_config_names_an_undefined_node_plainly(tmp_path: Path):
+  """A bare word is a node name; saying "invalid fully qualified name" misleads."""
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: checker\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: check\n"
+      "  - - checker\n"
+      "    - later_node\n"
+  )
+
+  with pytest.raises(ValueError, match="Unknown node 'later_node'"):
+    config_agent_utils.from_config(str(wf_file))
+
+
+def test_from_config_reads_an_inline_node_spelled_with_a_code_key(
+    tmp_path: Path,
+):
+  """`model_code` names the `model` field even though it is not a field itself.
+
+  Testing keys against `model_fields` alone sent this to the routing-map branch,
+  where `name` then failed to resolve as a node.
+  """
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - name: n1\n"
+      "      model_code:\n"
+      "        name: mylib.a_model\n"
+      "      instruction: i\n"
+  )
+
+  with mock.patch.object(
+      config_agent_utils,
+      "resolve_code_reference",
+      lambda cc: "gemini-2.5-flash",
+  ):
+    wf = config_agent_utils.from_config(str(wf_file))
+
+  assert [(e.from_node.name, e.to_node.name) for e in wf.graph.edges] == [
+      ("__START__", "n1")
+  ]
+
+
+def test_from_config_reads_a_single_route_map_keyed_code(tmp_path: Path):
+  """`{code: <node>}` is a routing map; `{code: "a.b.c"}` is a reference.
+
+  The two are told apart by the value, since only a reference is a string.
+  """
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: LlmAgent\n"
+      "      name: cls\n"
+      "      model: gemini-2.5-flash\n"
+      "      instruction: i\n"
+      "    - code:\n"
+      "        agent_class: LlmAgent\n"
+      "        name: tgt\n"
+      "        model: gemini-2.5-flash\n"
+      "        instruction: i\n"
+  )
+
+  wf = config_agent_utils.from_config(str(wf_file))
+
+  assert {e.route: e.to_node.name for e in wf.graph.edges if e.route} == {
+      "code": "tgt"
+  }
+
+
+def test_from_config_lets_an_inline_node_reach_a_from_config_override(
+    tmp_path: Path,
+):
+  """The same class inlined or referenced by path has to build the same way.
+
+  An inline node was constructed directly, so a subclass owning its own
+  construction was silently skipped in that spelling only.
+  """
+  ran = []
+
+  class OwnBuild(BaseAgent):
+
+    @classmethod
+    def from_config(cls, config, config_abs_path):
+      ran.append(True)
+      return cls(name="built_by_override")
+
+  wf_file = tmp_path / "root_agent.yaml"
+  wf_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "edges:\n"
+      "  - - START\n"
+      "    - agent_class: mylib.OwnBuild\n"
+      "      name: ignored_by_the_override\n"
+  )
+
+  with mock.patch.object(
+      config_agent_utils, "resolve_fully_qualified_name", lambda n: OwnBuild
+  ):
+    wf = config_agent_utils.from_config(str(wf_file))
+
+  assert ran
+  assert wf.graph.edges[0].to_node.name == "built_by_override"
