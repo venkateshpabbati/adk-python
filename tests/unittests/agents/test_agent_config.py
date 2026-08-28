@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import ntpath
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 from typing import Literal
 from typing import Type
 from unittest import mock
+import warnings
 
 from google.adk.agents import config_agent_utils
 from google.adk.agents.agent_config import agent_config_discriminator
@@ -35,6 +37,7 @@ from google.adk.agents.parallel_agent import ParallelAgent
 from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 from pydantic import BaseModel
+from pydantic import ValidationError
 import pytest
 import yaml
 
@@ -504,6 +507,27 @@ def test_resolve_code_reference_blocks_os_when_enforced():
     config_agent_utils.resolve_code_reference(CodeConfig(name="os.system"))
 
 
+def test_resolve_code_reference_wraps_a_name_that_does_not_resolve():
+  """An unresolvable reference raises ValueError, as the docstring promises.
+
+  The mapper routes `Callable`-typed fields through here, so a bad name in
+  YAML must not surface as a raw ModuleNotFoundError to callers that have
+  always been told to expect ValueError.
+  """
+  with pytest.raises(ValueError, match="Invalid fully qualified name"):
+    config_agent_utils.resolve_code_reference(
+        CodeConfig(name="invalid.tool.name")
+    )
+
+
+def test_resolve_code_reference_wraps_a_missing_attribute():
+  """A real module with no such symbol is unresolvable in the same way."""
+  with pytest.raises(ValueError, match="Invalid fully qualified name"):
+    config_agent_utils.resolve_code_reference(
+        CodeConfig(name="google.adk.agents.config_agent_utils.no_such_symbol")
+    )
+
+
 def test_resolve_fully_qualified_name_blocks_subprocess_when_enforced():
   """Verify resolve_fully_qualified_name blocks subprocess module.
 
@@ -564,23 +588,24 @@ def test_resolve_agent_code_reference_blocks_when_enforced(
 )
 def test_resolve_tools_blocks_dangerous_modules(blocked_ref: str):
   """Verify _resolve_tools blocks dangerous modules for user-defined tools."""
-  from google.adk.agents.llm_agent import LlmAgent
   from google.adk.tools.tool_configs import ToolConfig
 
   tool_config = ToolConfig(name=blocked_ref)
   with pytest.raises(ValueError, match="Blocked module reference"):
-    LlmAgent._resolve_tools([tool_config], "/fake/path.yaml")
+    config_agent_utils._AgentConfigMapper("/fake/path.yaml")._resolve_tools(
+        [tool_config]
+    )
 
 
 def test_resolve_tools_allows_builtin_adk_tools():
   """Verify _resolve_tools allows ADK built-in tools (no dot in name)."""
-  from google.adk.agents.llm_agent import LlmAgent
   from google.adk.tools.tool_configs import ToolConfig
 
   # Built-in tools have no dot — they import from google.adk.tools
   tool_config = ToolConfig(name="google_search")
   # Should NOT raise — this is a safe, hardcoded import path
-  resolved = LlmAgent._resolve_tools([tool_config], "/fake/path.yaml")
+  mapper = config_agent_utils._AgentConfigMapper("/fake/path.yaml")
+  resolved = mapper._resolve_tools([tool_config])
   assert len(resolved) == 1
 
 
@@ -653,7 +678,9 @@ def test_resolve_tools_blocks_exec_capable_stdlib(blocked_ref: str):
 
   tool_config = ToolConfig(name=blocked_ref)
   with pytest.raises(ValueError, match="Blocked module reference"):
-    LlmAgent._resolve_tools([tool_config], "/fake/path.yaml")
+    config_agent_utils._AgentConfigMapper("/fake/path.yaml")._resolve_tools(
+        [tool_config]
+    )
 
 
 @pytest.mark.parametrize(
@@ -731,7 +758,9 @@ def test_resolve_tools_blocks_yaml_and_ruamel_deserialization(blocked_ref: str):
 
   tool_config = ToolConfig(name=blocked_ref)
   with pytest.raises(ValueError, match="Blocked module reference"):
-    LlmAgent._resolve_tools([tool_config], "/fake/path.yaml")
+    config_agent_utils._AgentConfigMapper("/fake/path.yaml")._resolve_tools(
+        [tool_config]
+    )
 
 
 _YAML_SAFE_LOOKING_REFS = [
@@ -773,14 +802,14 @@ def test_denylist_can_be_disabled():
     config_agent_utils._set_enforce_denylist(True)
 
 
-def test_load_config_from_path_blocks_args_when_enforced(tmp_path: Path):
-  """_load_config_from_path blocks the 'args' key when enforcement is on."""
+def test_from_config_blocks_args_key_when_enforced(tmp_path: Path):
+  """Loading blocks the 'args' key when enforcement is on."""
   config_file = tmp_path / "agent.yaml"
   config_file.write_text("name: my_agent\nargs:\n  key: value\n")
   config_agent_utils._set_enforce_yaml_key_denylist(True)
   try:
     with pytest.raises(ValueError) as exc_info:
-      config_agent_utils._load_config_from_path(str(config_file))
+      config_agent_utils.from_config(str(config_file))
     assert "Blocked key 'args' found" in str(exc_info.value)
   finally:
     config_agent_utils._set_enforce_yaml_key_denylist(False)
@@ -823,13 +852,13 @@ def test_agent_config_discriminator_rejects_non_mapping(malformed_config: Any):
     agent_config_discriminator(malformed_config)
 
 
-def test_load_config_from_path_rejects_empty_yaml_file(tmp_path: Path):
+def test_from_config_rejects_empty_yaml_file(tmp_path: Path):
   """An empty YAML file loads as None; it must not be treated as an LlmAgent."""
   config_file = tmp_path / "empty.yaml"
   config_file.write_text("")
 
   with pytest.raises(ValueError, match="Invalid agent config"):
-    config_agent_utils._load_config_from_path(str(config_file))
+    config_agent_utils.from_config(str(config_file))
 
 
 # --- AgentRefConfig exactly-one-of validation ---------------------------
@@ -977,3 +1006,276 @@ def test_resolve_callbacks_preserves_config_order(
 def test_resolve_callbacks_with_no_configs_returns_empty_list():
   """No configured callbacks means no callbacks, not None."""
   assert config_agent_utils.resolve_callbacks([]) == []
+
+
+# --- Workflow & FunctionNode YAML Configuration Tests ---------------------
+
+
+def test_from_config_loads_function_node_with_func_code(tmp_path: Path):
+  """FunctionNode can be loaded from YAML specifying func_code."""
+  from google.adk.workflow import FunctionNode
+
+  config_file = tmp_path / "func_node.yaml"
+  config_file.write_text(
+      "agent_class: FunctionNode\n"
+      "name: my_func_node\n"
+      "description: A function node\n"
+      "func_code: google.adk.agents.config_agent_utils.from_config\n"
+  )
+
+  node = config_agent_utils.from_config(str(config_file))
+  assert isinstance(node, FunctionNode)
+  assert node.name == "my_func_node"
+  assert node._func == config_agent_utils.from_config
+  # FunctionNode's constructor takes no `description` (it derives one from the
+  # function docstring), so this is the field the mapper has to apply after
+  # construction rather than drop -- the YAML sets it, so it must win.
+  assert node.description == "A function node"
+
+
+def test_from_config_invokes_overridden_parse_config(tmp_path: Path):
+  """A subclass overriding `_parse_config` still gets the last word on kwargs.
+
+  Reflection replaced the per-class parsers, not this hook, so a subclass that
+  overrides it keeps working -- and keeps being handed a parsed config model
+  rather than the raw mapping.
+  """
+  received = {}
+
+  class MyCustomAgent(BaseAgent):
+    custom_field: str = ""
+
+    @classmethod
+    def _parse_config(cls, config, config_abs_path, kwargs):
+      received["config"] = config
+      kwargs["custom_field"] = "set by _parse_config"
+      return kwargs
+
+  yaml_content = """\
+agent_class: mylib.agents.MyCustomAgent
+name: custom_agent
+custom_field: from yaml
+"""
+  config_file = tmp_path / "custom_agent.yaml"
+  config_file.write_text(yaml_content)
+
+  with mock.patch.object(
+      config_agent_utils,
+      "resolve_fully_qualified_name",
+      return_value=MyCustomAgent,
+  ):
+    agent = config_agent_utils.from_config(str(config_file))
+
+  assert agent.custom_field == "set by _parse_config"
+  assert isinstance(received["config"], BaseAgentConfig)
+  assert received["config"].name == "custom_agent"
+
+
+def test_from_config_warns_when_parse_config_is_overridden(tmp_path: Path):
+  """The override is what is deprecated, so the warning has to name it.
+
+  The `@deprecated` on the base implementation cannot do this: an override is
+  a different, undecorated function, and the base one is never called.
+  """
+
+  class MyCustomAgent(BaseAgent):
+
+    @classmethod
+    def _parse_config(cls, config, config_abs_path, kwargs):
+      return kwargs
+
+  yaml_content = """\
+agent_class: mylib.agents.MyCustomAgent
+name: custom_agent
+"""
+  config_file = tmp_path / "custom_agent.yaml"
+  config_file.write_text(yaml_content)
+
+  with mock.patch.object(
+      config_agent_utils,
+      "resolve_fully_qualified_name",
+      return_value=MyCustomAgent,
+  ):
+    with pytest.warns(
+        DeprecationWarning, match=r"MyCustomAgent\._parse_config is deprecated"
+    ):
+      config_agent_utils.from_config(str(config_file))
+
+
+def test_from_config_does_not_warn_without_a_parse_config_override(
+    tmp_path: Path,
+):
+  """Inheriting the no-op hook is not deprecated usage and must stay quiet."""
+  yaml_content = """\
+name: search_agent
+model: gemini-2.5-flash
+instruction: search
+"""
+  config_file = tmp_path / "root_agent.yaml"
+  config_file.write_text(yaml_content)
+
+  with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    agent = config_agent_utils.from_config(str(config_file))
+
+  assert isinstance(agent, LlmAgent)
+  assert not [
+      w for w in caught if "_parse_config is deprecated" in str(w.message)
+  ]
+
+
+def test_from_config_warns_about_a_key_a_node_class_cannot_take(
+    tmp_path: Path, caplog
+):
+  """A node class declares no `config_type`, so reflection is the only gate.
+
+  Without this the misspelled key is skipped in silence and the node comes back
+  missing whatever it was meant to set.
+  """
+  config_file = tmp_path / "root_agent.yaml"
+  config_file.write_text("agent_class: Workflow\nname: wf\nmax_concurrncy: 3\n")
+
+  with caplog.at_level(logging.WARNING, logger="google_adk"):
+    wf = config_agent_utils.from_config(str(config_file))
+
+  assert wf.max_concurrency is None
+  assert "does not accept ['max_concurrncy']" in caplog.text
+
+
+def test_from_config_stays_quiet_for_keys_the_class_accepts(
+    tmp_path: Path, caplog
+):
+  """Only keys reflection could not place are reported."""
+  config_file = tmp_path / "root_agent.yaml"
+  config_file.write_text(
+      "name: search_agent\nmodel: gemini-2.5-flash\ninstruction: search\n"
+  )
+
+  with caplog.at_level(logging.WARNING, logger="google_adk"):
+    config_agent_utils.from_config(str(config_file))
+
+  assert "does not accept" not in caplog.text
+
+
+def test_from_config_keeps_a_raw_json_schema_on_a_node(tmp_path: Path):
+  """`BaseNode.input_schema` is a `SchemaUnion`, whose first member is `dict`.
+
+  Treating every mapping as a code reference to import made a valid config die
+  with a CodeConfig validation error instead.
+  """
+  config_file = tmp_path / "root_agent.yaml"
+  config_file.write_text(
+      "agent_class: Workflow\n"
+      "name: wf\n"
+      "input_schema:\n"
+      "  type: object\n"
+      "  properties:\n"
+      "    x:\n"
+      "      type: string\n"
+  )
+
+  wf = config_agent_utils.from_config(str(config_file))
+
+  assert wf.input_schema == {
+      "type": "object",
+      "properties": {"x": {"type": "string"}},
+  }
+
+
+def test_from_config_delegates_to_a_subclass_that_overrides_from_config(
+    tmp_path: Path,
+):
+  """A subclass owning its construction is handed the config, not built here.
+
+  The mapper path would build the class itself and never reach the override.
+  """
+  seen = {}
+
+  class OwnBuildAgent(BaseAgent):
+
+    @classmethod
+    def from_config(cls, config, config_abs_path):
+      seen["config"] = config
+      seen["path"] = config_abs_path
+      return cls(name="built_by_override")
+
+  config_file = tmp_path / "root_agent.yaml"
+  config_file.write_text(
+      "agent_class: mylib.OwnBuildAgent\nname: ignored_by_the_override\n"
+  )
+
+  with mock.patch.object(
+      config_agent_utils,
+      "resolve_fully_qualified_name",
+      return_value=OwnBuildAgent,
+  ):
+    agent = config_agent_utils.from_config(str(config_file))
+
+  assert agent.name == "built_by_override"
+  assert isinstance(seen["config"], BaseAgentConfig)
+  assert seen["path"] == str(config_file)
+
+
+def test_from_config_resolves_a_leading_dot_against_the_config_directory(
+    tmp_path: Path,
+):
+  """A `*_code` value starting with `.` is relative to the config's own package.
+
+  `.my_model` inside `<...>/mypkg/root_agent.yaml` means `mypkg.my_model`.
+  """
+  pkg_dir = tmp_path / "mypkg"
+  pkg_dir.mkdir()
+  config_file = pkg_dir / "root_agent.yaml"
+  config_file.write_text(
+      "name: dotted\ninstruction: hi\nmodel_code:\n  name: .my_model\n"
+  )
+
+  seen = {}
+
+  def fake_resolve(code_config):
+    seen["name"] = code_config.name
+    return "resolved-model"
+
+  with mock.patch.object(
+      config_agent_utils, "resolve_code_reference", fake_resolve
+  ):
+    agent = config_agent_utils.from_config(str(config_file))
+
+  assert seen["name"] == "mypkg.my_model"
+  assert agent.model == "resolved-model"
+
+
+def test_resolve_code_reference_keeps_a_missing_dependency_as_itself(
+    tmp_path: Path, monkeypatch
+):
+  """A module that imports something missing is not a bad reference.
+
+  Rewriting its ModuleNotFoundError into "invalid fully qualified name" would
+  point the reader at the config instead of at the absent package.
+  """
+  (tmp_path / "userpkg.py").write_text(
+      "import a_dependency_that_is_not_installed\nthing = 1\n"
+  )
+  monkeypatch.syspath_prepend(str(tmp_path))
+
+  with pytest.raises(ModuleNotFoundError) as exc_info:
+    config_agent_utils.resolve_code_reference(CodeConfig(name="userpkg.thing"))
+  assert "a_dependency_that_is_not_installed" in str(exc_info.value)
+
+
+def test_from_config_validates_a_deferred_field(tmp_path: Path):
+  """Fields held back from the constructor are still type-checked.
+
+  They are applied after construction, so a plain `setattr` would be the one
+  path into the node that pydantic never sees.
+  """
+  config_file = tmp_path / "root_agent.yaml"
+  config_file.write_text(
+      "agent_class: FunctionNode\n"
+      "name: fn\n"
+      "description: [1, 2, 3]\n"
+      "func_code: google.adk.agents.config_agent_utils.from_config\n"
+  )
+
+  with pytest.raises(ValidationError, match="description"):
+    config_agent_utils.from_config(str(config_file))

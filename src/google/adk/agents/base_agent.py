@@ -715,89 +715,62 @@ class BaseAgent(BaseNode, abc.ABC):
   @classmethod
   @deprecated(
       'BaseAgent.from_config is deprecated and will be removed in future'
-      ' versions.'
+      ' versions. Use `google.adk.agents.config_agent_utils.from_config`'
+      ' instead.'
   )
   @experimental(FeatureName.AGENT_CONFIG)
   def from_config(
       cls: Type[SelfAgent],
-      config: BaseAgentConfig,
+      config: Union[BaseModel, dict[str, Any]],
       config_abs_path: str,
   ) -> SelfAgent:
     """Creates an agent from a config.
 
-    If sub-classes use a custom agent config, override `_parse_config` to
-    return updated kwargs for the agent constructor.
-
     Args:
-      config: The config to create the agent from.
-      config_abs_path: The absolute path to the config file that contains the
-        agent config.
-
-    Returns:
-      The created agent.
+      config: The agent's config, either as its config model or as the raw
+        mapping parsed from YAML.
+      config_abs_path: Absolute path of the config file, used to resolve
+        references it makes to sibling files.
     """
-    kwargs = cls.__create_kwargs(config, config_abs_path)
-    kwargs = cls._parse_config(config, config_abs_path, kwargs)
+    from .config_agent_utils import _AgentConfigMapper
+    from .config_agent_utils import _underlying
+
+    if isinstance(config, BaseModel):
+      data = config.model_dump(exclude_unset=True)
+      if hasattr(config, 'model_extra') and config.model_extra:
+        data.update(config.model_extra)
+    elif isinstance(config, dict):
+      data = config
+    else:
+      raise ValueError(
+          'Invalid config type: expected Pydantic model or dict, got'
+          f' {type(config)}'
+      )
+
+    mapper = _AgentConfigMapper(config_abs_path)
+    kwargs = mapper.map(data, cls)
+
+    # Invoke _parse_config only where it is actually overridden. Comparing the
+    # bound classmethods would compare their __self__ too, which differs for
+    # every subclass, so the underlying functions are compared instead.
+    if getattr(cls, '_parse_config', None) is not None and _underlying(
+        cls._parse_config
+    ) is not _underlying(BaseAgent._parse_config):
+      kwargs = cls._parse_config(config, config_abs_path, kwargs)
     return cls(**kwargs)
 
   @classmethod
+  @deprecated(
+      'BaseAgent._parse_config is deprecated and will be removed in future'
+      ' versions. Please define fields directly on the class or use the dynamic'
+      ' YAML loader.'
+  )
   @experimental(FeatureName.AGENT_CONFIG)
   def _parse_config(
       cls: Type[SelfAgent],
-      config: BaseAgentConfig,
+      config: Any,
       config_abs_path: str,
       kwargs: Dict[str, Any],
   ) -> Dict[str, Any]:
-    """Parses the config and returns updated kwargs to construct the agent.
-
-    Sub-classes should override this method to use a custom agent config class.
-
-    Args:
-      config: The config to parse.
-      config_abs_path: The absolute path to the config file that contains the
-        agent config.
-      kwargs: The keyword arguments used for agent constructor.
-
-    Returns:
-      The updated keyword arguments used for agent constructor.
-    """
-    return kwargs
-
-  @classmethod
-  def __create_kwargs(
-      cls,
-      config: BaseAgentConfig,
-      config_abs_path: str,
-  ) -> Dict[str, Any]:
-    """Creates kwargs for the fields of BaseAgent."""
-
-    from .config_agent_utils import resolve_agent_reference
-    from .config_agent_utils import resolve_callbacks
-
-    kwargs: Dict[str, Any] = {
-        'name': config.name,
-        'description': config.description,
-    }
-    if config.sub_agents:
-      sub_agents = []
-      for sub_agent_config in config.sub_agents:
-        sub_agent = resolve_agent_reference(sub_agent_config, config_abs_path)
-        sub_agents.append(sub_agent)
-      kwargs['sub_agents'] = sub_agents
-
-    if config.before_agent_callbacks:
-      kwargs['before_agent_callback'] = resolve_callbacks(
-          config.before_agent_callbacks
-      )
-    if config.after_agent_callbacks:
-      kwargs['after_agent_callback'] = resolve_callbacks(
-          config.after_agent_callbacks
-      )
-
-    # Preserves 1.x AgentConfigMapper behavior: extra YAML fields that match
-    # a constructor parameter pass through automatically.
-    if config.model_extra:
-      for key, value in config.model_extra.items():
-        if key in cls.model_fields and key not in kwargs:
-          kwargs[key] = value
+    """Parses the config and returns updated kwargs to construct the agent."""
     return kwargs
