@@ -231,10 +231,50 @@ async def _convert_tool_union_to_tools(
     return []
 
 
+# GenerateContentConfig fields that already have a dedicated LlmAgent argument.
+# Passing them as LlmAgent kwargs should point at that argument.
+_GENERATE_CONTENT_FIELDS_OWNED_BY_AGENT: dict[str, str] = {
+    'system_instruction': 'instruction',
+    'response_schema': 'output_schema',
+    'base_url': 'model',
+}
+
+# Snake-case field names and camelCase aliases used by GenerateContentConfig.
+_GENERATE_CONTENT_FIELD_NAMES: dict[str, str] = {
+    name: name for name in types.GenerateContentConfig.model_fields
+} | {
+    field.alias: name
+    for name, field in types.GenerateContentConfig.model_fields.items()
+    if field.alias is not None
+}
+
+
+def _http_options_has_base_url(value: Any) -> bool:
+  if isinstance(value, dict):
+    return bool(value.get('base_url') or value.get('baseUrl'))
+  return bool(getattr(value, 'base_url', None))
+
+
 # TODO: drop the explicit abc.ABC base once BaseNode surfaces ABCMeta to
 # static type checkers.
 class LlmAgent(BaseAgent, abc.ABC):
-  """LLM-based Agent."""
+  """LLM-based Agent.
+
+  Generation settings such as ``temperature``, ``top_p``, and
+  ``max_output_tokens`` belong on ``generate_content_config``:
+
+    ```python
+    from google.adk.agents import LlmAgent
+    from google.genai import types
+
+    agent = LlmAgent(
+        name='grader',
+        model='gemini-3.5-flash',
+        instruction='Grade the exam.',
+        generate_content_config=types.GenerateContentConfig(temperature=0.1),
+    )
+    ```
+  """
 
   DEFAULT_MODEL: ClassVar[str] = 'gemini-3.5-flash'
   """System default model used when no model is set on an agent."""
@@ -1085,6 +1125,95 @@ class LlmAgent(BaseAgent, abc.ABC):
     accumulator += text
     event.actions.state_delta[self.output_key] = accumulator
     return accumulator
+
+  @model_validator(mode='before')
+  @classmethod
+  def _reject_misplaced_generate_content_kwargs(cls, data: Any) -> Any:
+    """Redirect GenerateContentConfig fields passed as LlmAgent kwargs.
+
+    Unknown keys that match a GenerateContentConfig field get an error
+    that names ``generate_content_config``. Reserved fields that already
+    have an LlmAgent argument (system_instruction, response_schema) point
+    at that argument. Other unknown keys are left for extra_forbidden
+    unless they arrive together with a config-field error, in which case
+    they are included in the same ValueError.
+    """
+    if not isinstance(data, dict):
+      return data
+
+    agent_names = set(cls.model_fields) | {
+        f.alias for f in cls.model_fields.values() if f.alias is not None
+    }
+    redirected: list[tuple[str, str]] = []
+    misplaced: dict[str, None] = {}
+    extras: list[str] = []
+    transport_errors: list[str] = []
+    for key, value in data.items():
+      # Known LlmAgent fields, including tools (which is also a
+      # GenerateContentConfig name), must not be hijacked.
+      if key in agent_names:
+        continue
+      if key in ('http_options', 'httpOptions') and _http_options_has_base_url(
+          value
+      ):
+        transport_errors.append(
+            'Base URL is a transport setting and must be set via'
+            f' LlmAgent.model, not via LlmAgent({key}=...).'
+        )
+        continue
+      agent_field = _GENERATE_CONTENT_FIELDS_OWNED_BY_AGENT.get(key)
+      if agent_field is not None:
+        redirected.append((key, agent_field))
+        continue
+      gcc_field = _GENERATE_CONTENT_FIELD_NAMES.get(key)
+      if gcc_field is None:
+        extras.append(key)
+        continue
+      agent_field = _GENERATE_CONTENT_FIELDS_OWNED_BY_AGENT.get(gcc_field)
+      if agent_field is not None:
+        redirected.append((key, agent_field))
+        continue
+      misplaced[gcc_field] = None
+
+    parts: list[str] = []
+    if 'name' not in data or not data.get('name'):
+      parts.append("Field 'name' is required.")
+    if transport_errors:
+      parts.extend(transport_errors)
+    if redirected:
+      parts.append(
+          '. '.join(
+              f'`{src}` must be set via LlmAgent.{dest}, not via'
+              f' LlmAgent({src}=...)'
+              for src, dest in redirected
+          )
+          + '.'
+      )
+    if misplaced:
+      fields = list(misplaced)
+      verb = 'is a' if len(fields) == 1 else 'are'
+      suffix = '' if len(fields) == 1 else 's'
+      example = ', '.join(f'{name}=...' for name in fields)
+      parts.append(
+          f"{', '.join(fields)} {verb} GenerateContentConfig field{suffix}."
+          ' Pass'
+          f' generate_content_config=types.GenerateContentConfig({example})'
+          ' instead.'
+      )
+    if parts:
+      if (
+          not redirected
+          and not misplaced
+          and not extras
+          and not transport_errors
+      ):
+        return data
+      if extras:
+        parts.append(
+            'Extra inputs are not permitted: ' + ', '.join(extras) + '.'
+        )
+      raise ValueError(' '.join(parts))
+    return data
 
   @model_validator(mode='before')
   @classmethod
