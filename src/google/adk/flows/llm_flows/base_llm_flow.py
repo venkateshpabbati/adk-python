@@ -36,12 +36,12 @@ from ...agents._streaming_mode import StreamingMode
 from ...agents.base_agent import BaseAgent
 from ...agents.callback_context import CallbackContext
 from ...agents.invocation_context import InvocationContext
-from ...agents.live_request_queue import LiveRequestQueue
 from ...agents.readonly_context import ReadonlyContext
 from ...auth.auth_tool import AuthConfig
 from ...events.event import Event
 from ...events.event_actions import EventActions
 from ...live._audio_cache_manager import AudioCacheManager
+from ...live.live_request_queue import LiveRequestQueue
 from ...models.base_llm_connection import BaseLlmConnection
 from ...models.google_llm import Gemini
 from ...models.llm_request import LlmRequest

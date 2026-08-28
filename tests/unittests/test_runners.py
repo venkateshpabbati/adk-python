@@ -717,7 +717,7 @@ async def test_run_live_auto_create_session():
   )
 
   # An empty LiveRequestQueue is sufficient for our mock agent.
-  from google.adk.agents.live_request_queue import LiveRequestQueue
+  from google.adk.live import LiveRequestQueue
 
   live_queue = LiveRequestQueue()
 
@@ -944,7 +944,7 @@ async def test_run_live_persists_event_callback_modifications():
       app_name="live_app", user_id="user", session_id="live_session"
   )
 
-  from google.adk.agents.live_request_queue import LiveRequestQueue
+  from google.adk.live import LiveRequestQueue
 
   live_queue = LiveRequestQueue()
   agen = runner.run_live(
@@ -2369,7 +2369,7 @@ async def test_run_async_teardown_on_aclose():
 @pytest.mark.asyncio
 async def test_run_live_passes_get_session_config():
   """run_live should forward RunConfig.get_session_config to get_session."""
-  from google.adk.agents.live_request_queue import LiveRequestQueue
+  from google.adk.live import LiveRequestQueue
   from google.adk.sessions.base_session_service import GetSessionConfig
 
   session_service = InMemorySessionService()
@@ -2869,7 +2869,7 @@ async def test_run_async_does_not_leak_context_llm_agent():
 @pytest.mark.asyncio
 async def test_run_live_does_not_leak_context():
   """Caller OpenTelemetry context is preserved during run_live iteration."""
-  from google.adk.agents.live_request_queue import LiveRequestQueue
+  from google.adk.live import LiveRequestQueue
   from opentelemetry import context as otel_context
 
   session_service = InMemorySessionService()
@@ -3381,7 +3381,7 @@ async def test_run_live_restores_branch_for_non_root_agent():
       ),
   )
 
-  from google.adk.agents.live_request_queue import LiveRequestQueue
+  from google.adk.live import LiveRequestQueue
 
   live_queue = LiveRequestQueue()
   agen = runner.run_live(
