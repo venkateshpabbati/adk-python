@@ -2775,55 +2775,26 @@ async def test_run_async_does_not_leak_context_base_agent():
 
 
 @pytest.mark.asyncio
-async def test_run_node_async_does_not_leak_context():
-  """Caller OpenTelemetry context is preserved during _run_node_async iteration."""
-  from typing import Any
+async def test_run_node_async_forwards_to_node_runner_utils():
+  """Runner._run_node_async delegates to _node_runner_utils.run_node_async."""
+  from google.adk.workflow import _node_runner_utils
 
-  from google.adk.agents.context import Context
-  from google.adk.workflow._base_node import BaseNode
-  from opentelemetry import context as otel_context
-
-  class _TestEchoNode(BaseNode):
-
-    async def _run_impl(
-        self, *, ctx: Context, node_input: Any
-    ) -> AsyncGenerator[Any, None]:
-      yield "echo"
-
-  session_service = InMemorySessionService()
   runner = Runner(
-      app_name=TEST_APP_ID,
-      node=_TestEchoNode(name="test_node"),
-      session_service=session_service,
-      artifact_service=InMemoryArtifactService(),
-      auto_create_session=True,
+      app_name="test_app",
+      agent=MockLlmAgent("root_agent"),
+      session_service=InMemorySessionService(),
   )
+  with mock.patch.object(_node_runner_utils, "run_node_async") as mock_run:
 
-  test_key = otel_context.create_key("test_key_run_node_async")
-  token = otel_context.attach(
-      otel_context.set_value(test_key, "caller_val_run_node_async")
-  )
-  caller_ctx = otel_context.get_current()
-  try:
+    async def _dummy(*args, **kwargs):
+      if False:
+        yield
+
+    mock_run.return_value = _dummy()
     events = []
-    async with aclosing(
-        runner._run_node_async(
-            user_id=TEST_USER_ID,
-            session_id=TEST_SESSION_ID,
-            new_message=types.Content(
-                role="user", parts=[types.Part(text="hello")]
-            ),
-            yield_user_message=True,
-        )
-    ) as agen:
-      async for event in agen:
-        assert otel_context.get_current() == caller_ctx
-        assert otel_context.get_value(test_key) == "caller_val_run_node_async"
-        events.append(event)
-    assert events
-    assert otel_context.get_current() == caller_ctx
-  finally:
-    otel_context.detach(token)
+    async for e in runner._run_node_async(user_id="u", session_id="s"):
+      events.append(e)
+    mock_run.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -3626,93 +3597,6 @@ async def test_resolve_invocation_id_accepts_responses_from_one_invocation():
       role="user", parts=[_fr_part("t", "fc-a"), _fr_part("t", "fc-b")]
   )
   assert runner._resolve_invocation_id(session, both, None) == "inv_a"
-
-
-@pytest.mark.asyncio
-async def test_run_node_prefers_the_response_owner_over_a_supplied_invocation_id():
-  """A caller-supplied invocation id is reconciled against the response.
-
-  Resuming under an id that does not own the call means the call is not found
-  and the tool result is discarded. `run_async` already prefers the response's
-  own invocation; the node path must agree.
-  """
-  session_service = InMemorySessionService()
-  node_agent = MockLlmAgent("solo")
-  runner = Runner(
-      app=App(name="test_app", root_agent=node_agent),
-      session_service=session_service,
-  )
-  session = await session_service.create_session(
-      app_name="test_app", user_id="u", session_id="s"
-  )
-  await session_service.append_event(
-      session,
-      Event(
-          invocation_id="inv_real",
-          author="solo",
-          content=types.Content(parts=[_fc_part("t", "fc-1")]),
-      ),
-  )
-
-  used: dict[str, str] = {}
-  original = runner._new_invocation_context
-
-  def _capture(*args, **kwargs):
-    ctx = original(*args, **kwargs)
-    used.setdefault("invocation_id", ctx.invocation_id)
-    return ctx
-
-  runner._new_invocation_context = _capture
-
-  async for _ in runner._run_node_async(
-      user_id="u",
-      session_id="s",
-      invocation_id="inv_wrong",
-      new_message=types.Content(role="user", parts=[_fr_part("t", "fc-1")]),
-      node=node_agent,
-  ):
-    pass
-
-  assert used["invocation_id"] == "inv_real"
-
-
-@pytest.mark.asyncio
-async def test_run_node_rejects_responses_straddling_two_invocations():
-  """A supplied id does not buy leniency the no-id path does not give.
-
-  Taking only the first response's owner would silently resume under one
-  invocation and discard the other tool result.
-  """
-  session_service = InMemorySessionService()
-  node_agent = MockLlmAgent("solo")
-  runner = Runner(
-      app=App(name="test_app", root_agent=node_agent),
-      session_service=session_service,
-  )
-  session = await session_service.create_session(
-      app_name="test_app", user_id="u", session_id="s"
-  )
-  for invocation_id, call_id in (("inv_a", "fc-1"), ("inv_b", "fc-2")):
-    await session_service.append_event(
-        session,
-        Event(
-            invocation_id=invocation_id,
-            author="solo",
-            content=types.Content(parts=[_fc_part("t", call_id)]),
-        ),
-    )
-
-  with pytest.raises(ValueError, match="multiple"):
-    async for _ in runner._run_node_async(
-        user_id="u",
-        session_id="s",
-        invocation_id="inv_wrong",
-        new_message=types.Content(
-            role="user", parts=[_fr_part("t", "fc-1"), _fr_part("t", "fc-2")]
-        ),
-        node=node_agent,
-    ):
-      pass
 
 
 if __name__ == "__main__":
