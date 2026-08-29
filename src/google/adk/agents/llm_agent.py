@@ -52,6 +52,7 @@ from ..tools.base_tool import BaseTool
 from ..tools.base_toolset import BaseToolset
 from ..tools.function_tool import FunctionTool
 from ..tools.tool_context import ToolContext
+from ..utils._callback_pipeline import _normalize_callbacks
 from ..utils._schema_utils import SchemaType
 from ..utils._schema_utils import validate_schema
 from ..utils.context_utils import Aclosing
@@ -841,11 +842,7 @@ class LlmAgent(BaseAgent, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.before_model_callback:
-      return []
-    if isinstance(self.before_model_callback, list):
-      return self.before_model_callback
-    return [self.before_model_callback]
+    return _normalize_callbacks(self.before_model_callback)
 
   @property
   def canonical_after_model_callbacks(self) -> list[_SingleAfterModelCallback]:
@@ -853,11 +850,7 @@ class LlmAgent(BaseAgent, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.after_model_callback:
-      return []
-    if isinstance(self.after_model_callback, list):
-      return self.after_model_callback
-    return [self.after_model_callback]
+    return _normalize_callbacks(self.after_model_callback)
 
   @property
   def canonical_on_model_error_callbacks(
@@ -867,11 +860,7 @@ class LlmAgent(BaseAgent, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.on_model_error_callback:
-      return []
-    if isinstance(self.on_model_error_callback, list):
-      return self.on_model_error_callback
-    return [self.on_model_error_callback]
+    return _normalize_callbacks(self.on_model_error_callback)
 
   @property
   def canonical_before_tool_callbacks(
@@ -881,11 +870,7 @@ class LlmAgent(BaseAgent, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.before_tool_callback:
-      return []
-    if isinstance(self.before_tool_callback, list):
-      return self.before_tool_callback
-    return [self.before_tool_callback]
+    return _normalize_callbacks(self.before_tool_callback)
 
   @property
   def canonical_after_tool_callbacks(
@@ -895,11 +880,7 @@ class LlmAgent(BaseAgent, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.after_tool_callback:
-      return []
-    if isinstance(self.after_tool_callback, list):
-      return self.after_tool_callback
-    return [self.after_tool_callback]
+    return _normalize_callbacks(self.after_tool_callback)
 
   @property
   def canonical_on_tool_error_callbacks(
@@ -909,11 +890,7 @@ class LlmAgent(BaseAgent, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.on_tool_error_callback:
-      return []
-    if isinstance(self.on_tool_error_callback, list):
-      return self.on_tool_error_callback
-    return [self.on_tool_error_callback]
+    return _normalize_callbacks(self.on_tool_error_callback)
 
   @property
   def _llm_flow(self) -> BaseLlmFlow:
