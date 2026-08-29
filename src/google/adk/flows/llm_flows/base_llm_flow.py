@@ -1977,10 +1977,14 @@ async def _finalize_dynamic_instructions(
   # TODO: Deprecate system_instruction fallback and make user content routing standard.
   if is_feature_enabled(FeatureName.DYNAMIC_INSTRUCTION_ROUTING):
     from .contents import _add_instructions_to_user_content
+    from .instructions import _label_dynamic_instruction
 
+    # Same user-role carrier as the agent's instruction, so same label.
     instruction_content = types.Content(
         role='user',
-        parts=[types.Part.from_text(text=combined_text)],
+        parts=[
+            types.Part.from_text(text=_label_dynamic_instruction(combined_text))
+        ],
     )
     await _add_instructions_to_user_content(
         invocation_context,
