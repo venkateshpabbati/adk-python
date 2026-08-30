@@ -719,7 +719,7 @@ class Runner:
           and event.author == 'user'
           and event.content
           and event.content.parts
-          and any(p.text for p in event.content.parts)
+          and not any(p.function_response for p in event.content.parts)
       ):
         return event.content
     return None
@@ -2114,6 +2114,15 @@ class Runner:
       run_config: The run config of the agent.
       state_delta: Optional state changes to apply to the session.
     """
+    is_function_response = bool(
+        new_message.parts
+        and any(p.function_response for p in new_message.parts)
+    )
+    if not is_function_response and self._find_user_message_for_invocation(
+        invocation_context.session.events, invocation_context.invocation_id
+    ):
+      return
+
     modified_user_message = (
         await invocation_context.plugin_manager.run_on_user_message_callback(
             invocation_context=invocation_context, user_message=new_message
