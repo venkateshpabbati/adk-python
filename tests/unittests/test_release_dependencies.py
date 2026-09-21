@@ -267,6 +267,43 @@ def test_langgraph_extras_exclude_unsafe_checkpoint_releases(
   )
 
 
+@pytest.mark.parametrize(
+    ('extra', 'reason'),
+    [
+        (
+            'mcp',
+            (
+                'google.auth.aio builds no default transport without aiohttp,'
+                ' so the MCP session manager logs a warning and falls back from'
+                ' mTLS to plain TLS'
+            ),
+        ),
+        (
+            'slack',
+            (
+                "SlackRunner reaches socket mode through slack_bolt's aiohttp"
+                ' adapter, and neither slack-bolt nor slack-sdk declares'
+                ' aiohttp'
+            ),
+        ),
+    ],
+)
+def test_extras_that_reach_aiohttp_indirectly_declare_it(
+    pyproject: dict, extra: str, reason: str
+) -> None:
+  """Every extra needing aiohttp says so, now that the base install drops it.
+
+  No ADK module imports aiohttp, so a tree-wide grep reads the requirement as
+  dead. It is not. Each of these extras reaches it through a third-party
+  package that does not declare it, and used to get it only because every
+  install carried it.
+  """
+  names = _requirement_names(
+      pyproject['project']['optional-dependencies'][extra]
+  )
+  assert 'aiohttp' in names, f'The {extra!r} extra needs aiohttp: {reason}.'
+
+
 def test_main_deps_require_lazy_mcp_google_genai_release(
     pyproject: dict,
 ) -> None:
@@ -477,3 +514,24 @@ def test_injection_config_validation_raises_pydantic_validation_error() -> None:
   with pytest.raises(ValidationError):
     # Both required fields missing — pydantic must reject the construction.
     InjectedError()  # type: ignore[call-arg]
+
+
+def test_packages_distributions_not_mocked_to_empty() -> None:
+  """packages_distributions must return installed packages, not an empty mock."""
+  distributions = importlib.metadata.packages_distributions()
+  assert 'pytest' in distributions, (
+      'packages_distributions() returned an empty mapping because it was'
+      ' mocked globally in conftest.py.'
+  )
+
+
+def test_vizier_service_not_prepopulated_with_mock_in_sys_modules() -> None:
+  """sys.modules must not be prepopulated with MagicMock for vizier services."""
+  import sys
+  from unittest.mock import MagicMock
+
+  module = sys.modules.get('google.cloud.aiplatform_v1.services.vizier_service')
+  assert module is None or not isinstance(module, MagicMock), (
+      'google.cloud.aiplatform_v1.services.vizier_service was prepopulated with'
+      ' a MagicMock in conftest.py.'
+  )
