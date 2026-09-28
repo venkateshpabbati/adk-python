@@ -30,7 +30,6 @@ from ..agents.context import Context
 from ..events.event import Event
 from ..platform import uuid as platform_uuid
 from ..tools.base_tool import BaseTool
-from ..tools.tool_context import ToolContext
 from ..utils.content_utils import extract_text_from_content
 from ._base_node import BaseNode
 from ._retry_config import RetryConfig
@@ -65,10 +64,10 @@ class _ToolNode(BaseNode):
       ctx: Context,
       node_input: Any,
   ) -> AsyncGenerator[Any, None]:
-    tool_context = ToolContext(
-        invocation_context=ctx.get_invocation_context(),
-        function_call_id=platform_uuid.new_uuid(),
-    )
+    # Run the tool with the node's own context (ToolContext is Context) so
+    # state and artifact deltas recorded by the tool on ctx.actions are emitted
+    # with this node.
+    ctx.function_call_id = platform_uuid.new_uuid()
 
     args = node_input
     if isinstance(args, types.Content):
@@ -115,16 +114,9 @@ class _ToolNode(BaseNode):
         if param_name not in args and param_name in ctx.state:
           args[param_name] = ctx.state[param_name]
 
-    response = await self.tool.run_async(args=args, tool_context=tool_context)
-    state_delta = (
-        dict(tool_context.actions.state_delta)
-        if tool_context.actions.state_delta
-        else None
-    )
+    response = await self.tool.run_async(args=args, tool_context=ctx)
+
+    # State and artifact deltas recorded on ctx.actions by the tool are
+    # attached to emitted events by the node runner.
     if response is not None:
-      yield Event(
-          output=response,
-          state=state_delta,
-      )
-    elif state_delta:
-      yield Event(state=state_delta)
+      yield Event(output=response)

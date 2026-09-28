@@ -360,3 +360,59 @@ async def test_tool_node_does_not_override_optional_parameters_with_ctx_state():
       "tool_node_optional_state_wf@1/mock_tool_with_decl@1",
       {"output": {"city": "Paris"}},
   ) in simplified
+
+
+class _ArtifactAndStateTool(BaseTool):
+  """A tool that saves an artifact and writes state through its context."""
+
+  def __init__(self):
+    super().__init__(name="artifact_tool", description="Saves an artifact")
+
+  async def run_async(self, *, args: dict[str, Any], tool_context) -> Any:
+    await tool_context.save_artifact(
+        "report.txt", types.Part.from_text(text="hello")
+    )
+    tool_context.state["report_status"] = "saved"
+    return {"saved": True}
+
+
+@pytest.mark.asyncio
+async def test_tool_node_propagates_artifact_and_state_delta():
+  """Tests that artifact and state deltas recorded by the tool are emitted."""
+  seen_downstream: list[Any] = []
+
+  def start_node():
+    return Event(output={})
+
+  async def after(ctx: Context, node_input: Any):
+    artifact = await ctx.load_artifact("report.txt")
+    seen_downstream.append(
+        (node_input, ctx.state.get("report_status"), artifact.text)
+    )
+    return node_input
+
+  tool_node = ToolNode(tool=_ArtifactAndStateTool())
+  wf = Workflow(
+      name="tool_node_artifact_wf",
+      edges=[
+          (START, start_node),
+          (start_node, tool_node),
+          (tool_node, after),
+      ],
+  )
+  app_instance = testing_utils.App(name="test_app", root_agent=wf)
+  runner = testing_utils.InMemoryRunner(app=app_instance)
+  events = await runner.run_async("start")
+
+  tool_events = [
+      e
+      for e in events
+      if e.node_info.path == "tool_node_artifact_wf@1/artifact_tool@1"
+  ]
+  artifact_deltas = [e.actions.artifact_delta for e in tool_events]
+  state_deltas = [e.actions.state_delta for e in tool_events]
+  assert any("report.txt" in d for d in artifact_deltas), artifact_deltas
+  assert any(
+      d.get("report_status") == "saved" for d in state_deltas
+  ), state_deltas
+  assert seen_downstream == [({"saved": True}, "saved", "hello")]
