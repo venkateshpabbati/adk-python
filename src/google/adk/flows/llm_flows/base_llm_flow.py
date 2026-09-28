@@ -324,11 +324,19 @@ class BaseLlmFlow(ABC):
   ) -> AsyncGenerator[Event, None]:
     """Runs the flow."""
     while True:
+      # `is True` rather than truthiness: tests drive agents with mocked
+      # contexts, whose is_aborted is a truthy Mock rather than False.
+      if invocation_context.is_aborted is True:
+        break
       last_event = None
       async with Aclosing(self._run_one_step_async(invocation_context)) as agen:
         async for event in agen:
           last_event = event
           yield event
+          if invocation_context.is_aborted is True:
+            break
+      if invocation_context.is_aborted is True:
+        break
       if not last_event or last_event.is_final_response() or last_event.partial:
         if last_event and last_event.partial:
           logger.warning('The last event is partial, which is not expected.')
