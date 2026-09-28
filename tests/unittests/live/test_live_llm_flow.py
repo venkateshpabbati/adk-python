@@ -346,3 +346,33 @@ async def test_send_to_model_uses_flow_audio_cache_manager():
       pass
 
   mock_cache_audio.assert_called_once()
+
+
+async def test_send_to_model_caches_only_audio_blobs():
+  """Non-audio blobs such as video frames are sent but not cached."""
+  flow = _TestBaseLlmFlow()
+  queue = LiveRequestQueue()
+  audio_blob = types.Blob(mime_type='audio/pcm', data=b'audio_bytes')
+  video_blob = types.Blob(mime_type='image/jpeg', data=b'video_frame')
+  queue.send_realtime(video_blob)
+  queue.send_realtime(audio_blob)
+  context = _create_test_context(
+      live_request_queue=queue, run_config=RunConfig(save_live_blob=True)
+  )
+  mock_connection = mock.AsyncMock()
+
+  send_task = asyncio.create_task(
+      _live_llm_flow.send_to_model(flow, mock_connection, context, LlmRequest())
+  )
+  await asyncio.sleep(0.01)
+  send_task.cancel()
+  try:
+    await send_task
+  except asyncio.CancelledError:
+    pass
+
+  assert [entry.data for entry in context.input_realtime_cache] == [audio_blob]
+  assert mock_connection.send_realtime.await_args_list == [
+      mock.call(video_blob),
+      mock.call(audio_blob),
+  ]

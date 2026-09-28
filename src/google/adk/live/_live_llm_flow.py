@@ -152,8 +152,14 @@ async def send_to_model(
           types.LiveClientRealtimeInput(audio_stream_end=True)  # type: ignore[arg-type]
       )
     elif live_request.blob:
-      # Cache input audio chunks before flushing
-      if run_config.save_live_blob:
+      # Cache input audio chunks before flushing. The cache concatenates
+      # every chunk into one audio file, so other blobs (e.g. video frames)
+      # must stay out of it.
+      if (
+          run_config.save_live_blob
+          and live_request.blob.mime_type
+          and live_request.blob.mime_type.startswith('audio/')
+      ):
         audio_cache_manager.cache_audio(
             invocation_context, live_request.blob, cache_type='input'
         )
