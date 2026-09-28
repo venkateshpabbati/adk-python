@@ -36,12 +36,12 @@ from google.adk.features import FeatureName
 from google.adk.features._feature_registry import temporary_feature_override
 from google.adk.flows.llm_flows.base_llm_flow import _finalize_dynamic_instructions
 from google.adk.flows.llm_flows.base_llm_flow import _process_agent_tools
-from google.adk.flows.llm_flows.base_llm_flow import _ReconnectSentinel
 from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 from google.adk.flows.llm_flows.core._finalizer import handle_after_model_callback
 from google.adk.flows.llm_flows.core._utils import copy_http_options
-from google.adk.flows.llm_flows.core._utils import run_config_for_new_live_session
 from google.adk.live import LiveRequestQueue
+from google.adk.live._flow_utils import _ReconnectSentinel
+from google.adk.live._flow_utils import run_config_for_new_live_session
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.base_llm_connection import BaseLlmConnection
 from google.adk.models.google_llm import Gemini
@@ -1938,7 +1938,7 @@ async def test_run_live_transfer_is_independent_of_response_order(
   with (
       mock.patch('google.adk.models.google_llm.Gemini.connect') as mock_connect,
       mock.patch(
-          'google.adk.flows.llm_flows._live_llm_flow.DEFAULT_TRANSFER_AGENT_DELAY',
+          'google.adk.live._live_llm_flow.DEFAULT_TRANSFER_AGENT_DELAY',
           0,
       ),
   ):
@@ -2032,7 +2032,7 @@ async def test_run_live_task_completion_is_independent_of_response_order(
   with (
       mock.patch('google.adk.models.google_llm.Gemini.connect') as mock_connect,
       mock.patch(
-          'google.adk.flows.llm_flows._live_llm_flow.DEFAULT_TASK_COMPLETION_DELAY',
+          'google.adk.live._live_llm_flow.DEFAULT_TASK_COMPLETION_DELAY',
           0,
       ),
   ):

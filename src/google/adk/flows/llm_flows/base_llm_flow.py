@@ -26,21 +26,16 @@ from google.adk.platform import time as platform_time
 from google.genai import types
 from opentelemetry import trace
 
-from . import _live_llm_flow
 from . import functions as functions
 from ...agents.base_agent import BaseAgent
 from ...agents.invocation_context import InvocationContext
 from ...events.event import Event
+from ...live import _live_llm_flow
 from ...live._audio_cache_manager import AudioCacheManager
-from ...live._flow_utils import _ReconnectMode as _ReconnectMode
-from ...live._flow_utils import _ReconnectSentinel as _ReconnectSentinel
-from ...live._flow_utils import _TOOL_SHUTDOWN_TIMEOUT_SECONDS as _TOOL_SHUTDOWN_TIMEOUT_SECONDS
 from ...live._flow_utils import DEFAULT_ENABLE_CACHE_STATISTICS as DEFAULT_ENABLE_CACHE_STATISTICS
 from ...live._flow_utils import DEFAULT_MAX_RECONNECT_ATTEMPTS as DEFAULT_MAX_RECONNECT_ATTEMPTS
 from ...live._flow_utils import DEFAULT_TASK_COMPLETION_DELAY as DEFAULT_TASK_COMPLETION_DELAY
 from ...live._flow_utils import DEFAULT_TRANSFER_AGENT_DELAY as DEFAULT_TRANSFER_AGENT_DELAY
-from ...live._flow_utils import handle_control_event_flush as _handle_control_event_flush_impl
-from ...live._flow_utils import stop_background_tool_tasks as _stop_background_tool_tasks_impl
 from ...models.base_llm_connection import BaseLlmConnection
 from ...models.llm_request import LlmRequest
 from ...models.llm_response import LlmResponse
@@ -286,31 +281,6 @@ class BaseLlmFlow(ABC):
     ) as agen:
       async for event in agen:
         yield event
-
-  async def _stop_background_tool_tasks(
-      self, invocation_context: InvocationContext
-  ) -> None:
-    """Cancels the background tool tasks this live run started.
-
-    A live run starts two kinds of tools as bare asyncio tasks: streaming
-    tools (``active_streaming_tools``) and non-blocking tools
-    (``active_non_blocking_tool_tasks``). Nothing tied either to the lifetime
-    of the run that started it — only an explicit ``stop_streaming`` call ever
-    cancelled one — so a tool kept running after its agent was done, feeding
-    function responses into a live request queue that by then belonged to
-    another agent, or to nobody at all.
-
-    The tools stop when the run that started them ends, whether that is a
-    handoff to another agent, ``task_completed``, the connection closing, or
-    the caller walking away. Tying this to the agent run rather than to the
-    whole invocation is what keeps a tool from reaching the model of the
-    agent that comes after it.
-
-    Cancellation is best effort: a task that does not stop within
-    ``_TOOL_SHUTDOWN_TIMEOUT_SECONDS`` is logged and left behind rather than
-    stalling the handoff or the caller's teardown on it.
-    """
-    await _stop_background_tool_tasks_impl(self, invocation_context)
 
   async def _screen_live_user_content(
       self,
@@ -678,22 +648,6 @@ class BaseLlmFlow(ABC):
     ) as agen:
       async for response in agen:
         yield response
-
-  async def _handle_control_event_flush(
-      self, invocation_context: InvocationContext, llm_response: LlmResponse
-  ) -> list[Event]:
-    """Handle audio cache flushing based on control events.
-
-    Args:
-      invocation_context: The invocation context containing audio caches.
-      llm_response: The LLM response containing control event information.
-
-    Returns:
-      A list of Event objects created from the flushed caches.
-    """
-    return await _handle_control_event_flush_impl(
-        self, invocation_context, llm_response
-    )
 
   async def _get_llm(self, invocation_context: InvocationContext) -> BaseLlm:
     """Resolves the model this invocation should call."""

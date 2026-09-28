@@ -27,34 +27,34 @@ from google.genai import types
 from websockets.exceptions import ConnectionClosed
 from websockets.exceptions import ConnectionClosedOK
 
-from ...agents.invocation_context import InvocationContext
-from ...events.event import Event
-from ...events.event_actions import EventActions
-from ...live._flow_utils import _ReconnectMode as _ReconnectMode
-from ...live._flow_utils import _ReconnectSentinel as _ReconnectSentinel
-from ...live._flow_utils import DEFAULT_MAX_RECONNECT_ATTEMPTS
-from ...live._flow_utils import DEFAULT_TASK_COMPLETION_DELAY
-from ...live._flow_utils import DEFAULT_TRANSFER_AGENT_DELAY
-from ...live._flow_utils import handle_control_event_flush as handle_control_event_flush
-from ...live._flow_utils import require_live_request_queue as require_live_request_queue
-from ...live._flow_utils import stop_background_tool_tasks as stop_background_tool_tasks
-from ...models.base_llm_connection import BaseLlmConnection
-from ...models.google_llm import Gemini
-from ...models.llm_request import LlmRequest
-from ...models.llm_response import LlmResponse
-from ...telemetry.tracing import trace_send_data
-from ...telemetry.tracing import tracer
-from ...utils.context_utils import Aclosing
-from ...utils.variant_utils import GoogleLLMVariant
-from .core._utils import as_llm_agent as _as_llm_agent
-from .core._utils import require_run_config as _require_run_config
-from .core._utils import run_config_for_new_live_session
-from .prompt import _schema as _output_schema_processor
-from .tools import _functions as functions
+from ..agents.invocation_context import InvocationContext
+from ..events.event import Event
+from ..events.event_actions import EventActions
+from ..flows.llm_flows.core._utils import as_llm_agent as _as_llm_agent
+from ..flows.llm_flows.core._utils import require_run_config as _require_run_config
+from ..flows.llm_flows.prompt import _schema as _output_schema_processor
+from ..flows.llm_flows.tools import _functions as functions
+from ..models.base_llm_connection import BaseLlmConnection
+from ..models.google_llm import Gemini
+from ..models.llm_request import LlmRequest
+from ..models.llm_response import LlmResponse
+from ..telemetry.tracing import trace_send_data
+from ..telemetry.tracing import tracer
+from ..utils.context_utils import Aclosing
+from ..utils.variant_utils import GoogleLLMVariant
+from ._flow_utils import _ReconnectMode as _ReconnectMode
+from ._flow_utils import _ReconnectSentinel as _ReconnectSentinel
+from ._flow_utils import DEFAULT_MAX_RECONNECT_ATTEMPTS
+from ._flow_utils import DEFAULT_TASK_COMPLETION_DELAY
+from ._flow_utils import DEFAULT_TRANSFER_AGENT_DELAY
+from ._flow_utils import handle_control_event_flush as handle_control_event_flush
+from ._flow_utils import require_live_request_queue as require_live_request_queue
+from ._flow_utils import run_config_for_new_live_session
+from ._flow_utils import stop_background_tool_tasks as stop_background_tool_tasks
 
 if TYPE_CHECKING:
-  from ...agents.llm_agent import LlmAgent
-  from .base_llm_flow import BaseLlmFlow
+  from ..agents.llm_agent import LlmAgent
+  from ..flows.llm_flows.base_llm_flow import BaseLlmFlow
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -446,8 +446,8 @@ async def postprocess_live_flow(
 
   # Flush audio caches based on control events using configurable settings
   if run_config.save_live_blob:
-    flushed_events = await flow._handle_control_event_flush(
-        invocation_context, llm_response
+    flushed_events = await handle_control_event_flush(
+        flow, invocation_context, llm_response
     )
     for event in flushed_events:
       yield event
@@ -689,7 +689,7 @@ async def run_live_flow(
                   #    during the delay while the request queue drains.
                   # 2. Function responses are not sent to the sub-agent after
                   #    the transfer occurs.
-                  await flow._stop_background_tool_tasks(invocation_context)
+                  await stop_background_tool_tasks(invocation_context)
                   await asyncio.sleep(DEFAULT_TRANSFER_AGENT_DELAY)
                   # cancel the tasks that belongs to the closed connection.
                   send_task.cancel()
@@ -822,4 +822,4 @@ async def run_live_flow(
         )
         raise
   finally:
-    await flow._stop_background_tool_tasks(invocation_context)
+    await stop_background_tool_tasks(invocation_context)
