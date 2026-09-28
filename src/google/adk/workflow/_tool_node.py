@@ -114,9 +114,41 @@ class _ToolNode(BaseNode):
         if param_name not in args and param_name in ctx.state:
           args[param_name] = ctx.state[param_name]
 
-    response = await self.tool.run_async(args=args, tool_context=ctx)
+    response = await self._run_tool_with_plugin_callbacks(ctx=ctx, args=args)
 
     # State and artifact deltas recorded on ctx.actions by the tool are
     # attached to emitted events by the node runner.
     if response is not None:
       yield Event(output=response)
+
+  async def _run_tool_with_plugin_callbacks(
+      self, *, ctx: Context, args: dict[str, Any]
+  ) -> Any:
+    """Runs the tool between the plugin tool callbacks.
+
+    Mirrors the plugin steps of the LlmAgent tool pipeline: a before-tool
+    callback may answer the call instead of the tool, an on-tool-error
+    callback may answer a failed call, and an after-tool callback may replace
+    the result. Agent-level tool callbacks do not apply because no agent owns
+    a tool node.
+    """
+    plugin_manager = ctx.get_invocation_context().plugin_manager
+    response = await plugin_manager.run_before_tool_callback(
+        tool=self.tool, tool_args=args, tool_context=ctx
+    )
+    if response is None:
+      try:
+        response = await self.tool.run_async(args=args, tool_context=ctx)
+      except Exception as error:
+        response = await plugin_manager.run_on_tool_error_callback(
+            tool=self.tool, tool_args=args, tool_context=ctx, error=error
+        )
+        if response is None:
+          raise
+
+    altered_response = await plugin_manager.run_after_tool_callback(
+        tool=self.tool, tool_args=args, tool_context=ctx, result=response
+    )
+    if altered_response is not None:
+      response = altered_response
+    return response
