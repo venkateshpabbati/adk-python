@@ -1826,3 +1826,102 @@ async def test_node_tool_non_dict_input_schema_happy_path(
 
   responses = _function_responses(events)
   assert responses == [{'result': 42}]
+
+
+@pytest.mark.asyncio
+async def test_node_tool_skip_summarization_returns_workflow_output_directly(
+    request: pytest.FixtureRequest,
+):
+  """Setting ctx.actions.skip_summarization=True inside a workflow node tool emits output directly as final text without a second LLM turn."""
+
+  def run_parallel_report(node_input: GreetRequest, ctx: Context) -> str:
+    ctx.actions.skip_summarization = True
+    return f'Exact workflow report for {node_input.request}'
+
+  sub_workflow = Workflow(
+      name='report_workflow',
+      description='Generates an exact report.',
+      input_schema=GreetRequest,
+      edges=[(START, run_parallel_report)],
+  )
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          types.Part.from_function_call(
+              name='report_workflow',
+              args={'request': 'Project X'},
+          ),
+          types.Part.from_text(
+              text='Should never be reached because summarization is skipped.'
+          ),
+      ]
+  )
+
+  parent_agent = LlmAgent(
+      name='parent_agent',
+      model=mock_model,
+      tools=[sub_workflow],
+  )
+
+  app = App(name=request.function.__name__, root_agent=parent_agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  events = await runner.run_async(testing_utils.get_user_content('Report X'))
+
+  parent_final_events = [
+      e for e in events if e.author == 'parent_agent' and e.is_final_response()
+  ]
+  assert len(parent_final_events) == 1
+  last_event = events[-1]
+  assert last_event == parent_final_events[0]
+  assert last_event.actions.skip_summarization is True
+  assert any(p.function_response for p in last_event.content.parts)
+  text_parts = [p.text for p in last_event.content.parts if p.text]
+  assert text_parts == ['Exact workflow report for Project X']
+  assert len(mock_model.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_function_node_tool_skip_summarization_returns_output_directly(
+    request: pytest.FixtureRequest,
+):
+  """Setting ctx.actions.skip_summarization=True inside a @node tool emits output directly as final text."""
+
+  @node
+  def generate_report(project: str, ctx: Context) -> str:
+    """Generates a report for a project."""
+    ctx.actions.skip_summarization = True
+    return f'Report for {project}: Ready'
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          types.Part.from_function_call(
+              name='generate_report',
+              args={'project': 'Apollo'},
+          ),
+          types.Part.from_text(
+              text='Should never be reached because summarization is skipped.'
+          ),
+      ]
+  )
+
+  parent_agent = LlmAgent(
+      name='parent_agent',
+      model=mock_model,
+      tools=[generate_report],
+  )
+
+  app = App(name=request.function.__name__, root_agent=parent_agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  events = await runner.run_async(
+      testing_utils.get_user_content('Report Apollo')
+  )
+
+  last_event = events[-1]
+  assert last_event.author == 'parent_agent'
+  assert last_event.is_final_response()
+  assert last_event.actions.skip_summarization is True
+  text_parts = [p.text for p in last_event.content.parts if p.text]
+  assert text_parts == ['Report for Apollo: Ready']
+  assert len(mock_model.requests) == 1
