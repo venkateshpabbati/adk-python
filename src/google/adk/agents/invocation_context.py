@@ -104,6 +104,7 @@ class _AbortState:
     self.signal = signal if signal is not None else asyncio.Event()
     self.loop = loop
     self.aborted = False
+    self.event_synthesized = False
 
   def __deepcopy__(self, memo: dict[int, Any] | None) -> _AbortState:
     # Preserve single-instance sharing across deepcopies and avoid traversing
