@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import json
 from typing import Any
+from typing import Literal
 from typing import TYPE_CHECKING
 
 from google.genai import types
@@ -37,6 +38,8 @@ from ...events._rewind_events import _apply_rewinds
 
 if TYPE_CHECKING:
   from ...events.event import Event
+
+ContextMode = Literal['events', 'transcript']
 
 _ROLE_LABELS = {'user': 'USER', 'model': 'AGENT'}
 # How much more room plain text gets than a rendered tool payload. Documented
@@ -50,7 +53,15 @@ _OMISSION_MARKER = (
 class ModelConsultContextConfig(BaseModel):
   """Controls how much of the executor's session reaches the advisor."""
 
-  model_config = ConfigDict(extra='forbid')
+  model_config = ConfigDict(extra='forbid', use_attribute_docstrings=True)
+
+  mode: ContextMode = 'events'
+  """How the session is shaped for the advisor.
+
+  `'events'` hands over multi-turn `types.Content` objects; `'transcript'`
+  collapses the session into one labelled plain-text block inside the final
+  user message.
+  """
 
   include_session: bool = True
   """Whether to send the session at all.
@@ -196,9 +207,10 @@ def _convert_part(
     return types.Part(text=text)
 
   if part.inline_data is not None or part.file_data is not None:
-    if config.include_media:
+    if config.include_media and config.mode != 'transcript':
       return part
-    description = _describe_media_part(part, reason='omitted')
+    reason = '' if config.include_media else 'omitted'
+    description = _describe_media_part(part, reason=reason)
     return None if description is None else types.Part(text=description)
 
   if part.executable_code is not None:
