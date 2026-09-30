@@ -43,6 +43,8 @@ from google.adk.apps.app import ResumabilityConfig
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.adk.cli.utils.agent_loader import AgentLoader
 from google.adk.errors.session_not_found_error import SessionNotFoundError
+from google.adk.events._internal_metadata import INTERNAL_METADATA_PREFIX
+from google.adk.events._internal_metadata import RESTORED_EVENT_KEY
 from google.adk.events.event import Event
 from google.adk.events.event import EventActions
 from google.adk.plugins.base_plugin import BasePlugin
@@ -1103,6 +1105,132 @@ async def test_run_config_custom_metadata_propagates_to_events():
   )
   user_event = next(event for event in session.events if event.author == "user")
   assert user_event.custom_metadata == {"request_id": "req-1"}
+
+
+class MockAgentWithInternalMetadata(BaseAgent):
+  """Mock agent that sets an ADK-internal key on its own event."""
+
+  def __init__(self, name: str):
+    super().__init__(name=name, sub_agents=[])
+
+  async def _run_async_impl(
+      self, invocation_context: InvocationContext
+  ) -> AsyncGenerator[Event, None]:
+    yield Event(
+        invocation_id=invocation_context.invocation_id,
+        author=self.name,
+        content=types.Content(
+            role="model", parts=[types.Part(text="Test response")]
+        ),
+        custom_metadata={
+            "event_key": "event_value",
+            INTERNAL_METADATA_PREFIX + "agent": "kept",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_config_custom_metadata_drops_internal_keys():
+  """Callers cannot set ADK-internal keys through RunConfig; agents can."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name=TEST_APP_ID,
+      agent=MockAgentWithInternalMetadata("metadata_agent"),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+  )
+  await session_service.create_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID, session_id=TEST_SESSION_ID
+  )
+
+  run_config = RunConfig(
+      custom_metadata={
+          "request_id": "req-1",
+          INTERNAL_METADATA_PREFIX + "planted": "x",
+          RESTORED_EVENT_KEY: True,
+      }
+  )
+  events = [
+      event
+      async for event in runner.run_async(
+          user_id=TEST_USER_ID,
+          session_id=TEST_SESSION_ID,
+          new_message=types.Content(role="user", parts=[types.Part(text="hi")]),
+          run_config=run_config,
+      )
+  ]
+
+  assert events[0].custom_metadata == {
+      "request_id": "req-1",
+      "event_key": "event_value",
+      INTERNAL_METADATA_PREFIX + "agent": "kept",
+  }
+  session = await session_service.get_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID, session_id=TEST_SESSION_ID
+  )
+  user_event = next(event for event in session.events if event.author == "user")
+  assert user_event.custom_metadata == {"request_id": "req-1"}
+
+
+class _ReplacingPlugin(BasePlugin):
+  """Returns a replacement event with its own custom_metadata."""
+
+  async def on_event_callback(
+      self, *, invocation_context: InvocationContext, event: Event
+  ) -> Optional[Event]:
+    del invocation_context
+    return Event(
+        invocation_id=event.invocation_id,
+        author=event.author,
+        content=event.content,
+        custom_metadata={"plugin_key": 1},
+    )
+
+
+@pytest.mark.parametrize(
+    "run_metadata, expected_public",
+    [
+        (None, {"plugin_key": 1}),
+        ({"request_id": "req-1"}, {"request_id": "req-1", "plugin_key": 1}),
+    ],
+    ids=["no_run_metadata", "run_metadata"],
+)
+@pytest.mark.asyncio
+async def test_plugin_replacement_event_keeps_internal_metadata(
+    run_metadata, expected_public
+):
+  """A plugin's replacement event cannot drop ADK-internal keys."""
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name=TEST_APP_ID,
+      agent=MockAgentWithInternalMetadata("metadata_agent"),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+      plugins=[_ReplacingPlugin(name="replacing")],
+  )
+  await session_service.create_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID, session_id=TEST_SESSION_ID
+  )
+
+  events = [
+      event
+      async for event in runner.run_async(
+          user_id=TEST_USER_ID,
+          session_id=TEST_SESSION_ID,
+          new_message=types.Content(role="user", parts=[types.Part(text="hi")]),
+          run_config=RunConfig(custom_metadata=run_metadata),
+      )
+  ]
+
+  assert events[0].custom_metadata == {
+      **expected_public,
+      INTERNAL_METADATA_PREFIX + "agent": "kept",
+  }
+  session = await session_service.get_session(
+      app_name=TEST_APP_ID, user_id=TEST_USER_ID, session_id=TEST_SESSION_ID
+  )
+  agent_event = next(e for e in session.events if e.author == "metadata_agent")
+  assert agent_event.custom_metadata == events[0].custom_metadata
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,8 @@ from .artifacts.base_artifact_service import BaseArtifactService
 from .auth.credential_service.base_credential_service import BaseCredentialService
 from .errors._stale_session_error import StaleSessionError
 from .errors.session_not_found_error import SessionNotFoundError
+from .events._internal_metadata import internal_metadata
+from .events._internal_metadata import without_internal_metadata
 from .events._rewind_events import _apply_rewinds
 from .events.event import Event
 from .events.event_actions import EventActions
@@ -162,12 +164,15 @@ def _get_function_responses_from_content(
 def _apply_run_config_custom_metadata(
     event: Event, run_config: RunConfig | None
 ) -> None:
-  """Merges run-level custom metadata into the event, if present."""
+  """Merges run-level custom metadata, minus ADK-internal keys, into the event."""
   if not run_config or not run_config.custom_metadata:
+    return
+  run_metadata = without_internal_metadata(run_config.custom_metadata)
+  if not run_metadata:
     return
 
   event.custom_metadata = {
-      **run_config.custom_metadata,
+      **run_metadata,
       **(event.custom_metadata or {}),
   }
 
@@ -1452,6 +1457,13 @@ class Runner:
       if field_name in {'id', 'invocation_id', 'timestamp'}:
         continue
       update[field_name] = modified_event.__dict__[field_name]
+    internal = internal_metadata(original_event.custom_metadata)
+    if 'custom_metadata' in update and internal:
+      # ADK-internal keys belong to ADK, so a replacement cannot drop them.
+      update['custom_metadata'] = {
+          **(update['custom_metadata'] or {}),
+          **internal,
+      }
     output_event = original_event.model_copy(update=update)
     if not output_event.author:
       output_event.author = original_event.author

@@ -31,6 +31,7 @@ from ..artifacts.base_artifact_service import BaseArtifactService
 from ..auth.auth_credential import AuthCredential
 from ..auth.credential_service.base_credential_service import BaseCredentialService
 from ..events._branch_path import _BranchPath
+from ..events._internal_metadata import without_internal_metadata
 from ..events.event import Event
 from ..live._active_streaming_tool import ActiveStreamingTool
 from ..live._audio_cache_manager import RealtimeCacheEntry as RealtimeCacheEntry
@@ -291,7 +292,9 @@ class InvocationContext(BaseModel):
   def model_post_init(self, __context: Any) -> None:
     super().model_post_init(__context)
     if self.run_config and self.run_config.custom_metadata:
-      self._custom_metadata.update(self.run_config.custom_metadata)
+      self._custom_metadata.update(
+          without_internal_metadata(self.run_config.custom_metadata) or {}
+      )
     try:
       self._abort_state.loop = asyncio.get_running_loop()
     except RuntimeError:
