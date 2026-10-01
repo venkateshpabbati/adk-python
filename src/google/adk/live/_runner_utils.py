@@ -85,7 +85,8 @@ async def run_node_live(
   from ..workflow._workflow import _LoopState
   from ..workflow._workflow import Workflow
 
-  ic = runner._new_invocation_context_for_live(  # pylint: disable=protected-access
+  ic = new_invocation_context_for_live(
+      runner,
       session,
       live_request_queue=live_request_queue,
       run_config=run_config or RunConfig(),
@@ -204,7 +205,8 @@ async def run_live(
         yield event
     return
   root_agent = runner._require_root_agent()  # pylint: disable=protected-access
-  invocation_context = runner._new_invocation_context_for_live(  # pylint: disable=protected-access
+  invocation_context = new_invocation_context_for_live(
+      runner,
       session,
       live_request_queue=live_request_queue,
       run_config=run_config,

@@ -266,8 +266,8 @@ async def test_merge_live_event_streams_interleaves_agent_and_queued_events():
   session = await runner.session_service.create_session(
       user_id="u1", session_id="s1", app_name=runner.app_name
   )
-  ic = runner._new_invocation_context_for_live(
-      session, live_request_queue=LiveRequestQueue()
+  ic = _runner_utils.new_invocation_context_for_live(
+      runner, session, live_request_queue=LiveRequestQueue()
   )
   ic._event_queue = asyncio.Queue()
 
