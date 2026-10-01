@@ -167,9 +167,8 @@ def _process_rehydrated_output(node: BaseNode, output: object) -> object:
     if node.output_schema is str:
       return text
     try:
-      type_adapter = TypeAdapter[Any](node.output_schema)
-      validated: Any = type_adapter.validate_json(text)
-      return type_adapter.dump_python(validated, mode='json')
+      validated: Any = TypeAdapter[Any](node.output_schema).validate_json(text)
+      return node._to_serializable(validated)
     except ValidationError as e:
       # Fallback to unvalidated JSON parsing on validation failure
       # to prevent blocking resumption on schema drift.
@@ -246,7 +245,7 @@ def _validate_resume_response(response_data: object, schema: object) -> object:
         model_instance = TypeAdapter(DynamicModel).validate_python(
             response_data
         )
-        return model_instance.model_dump(mode='json')
+        return model_instance.model_dump()
       except ValidationError as e:
         raise WorkflowDataError(
             f'Validation failed for object schema: {e}'
