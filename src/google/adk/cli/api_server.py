@@ -112,6 +112,10 @@ logger = logging.getLogger("google_adk." + __name__)
 
 _REGEX_PREFIX = "regex:"
 
+# Pre-built avatar used for VIDEO live sessions when no avatar config is set.
+# The Live API rejects VIDEO output without an avatar config.
+_DEFAULT_AVATAR_NAME = "Kai"
+
 
 def _parse_cors_origins(
     allow_origins: list[str],
@@ -2228,6 +2232,13 @@ class ApiServer:
 
       async def forward_events():
         runner = await self.get_runner_async(app_name)
+        # Avatars are rendered as video, so only VIDEO sessions get an avatar
+        # config, falling back to a pre-built avatar when none is configured.
+        avatar_config = None
+        if "VIDEO" in modalities:
+          avatar_config = self.avatar_config or types.AvatarConfig(
+              avatar_name=_DEFAULT_AVATAR_NAME
+          )
         run_config = RunConfig(
             response_modalities=modalities,
             proactivity=(
@@ -2245,11 +2256,7 @@ class ApiServer:
             ),
             save_live_blob=save_live_blob,
             explicit_vad_signal=explicit_vad_signal,
-            # Avatars are rendered as video, so only apply the server-wide
-            # avatar config to sessions that request VIDEO output.
-            avatar_config=(
-                self.avatar_config if "VIDEO" in modalities else None
-            ),
+            avatar_config=avatar_config,
             **(
                 {"max_llm_calls": self.max_llm_calls}
                 if self.max_llm_calls is not None
