@@ -296,7 +296,14 @@ async def _merge_live_event_streams(
       ) as agen:
         async for event in agen:
           await merged.put(event)
-    finally:
+    except asyncio.CancelledError:
+      # Only the merge's own teardown cancels this pump, and by then nothing
+      # reads `merged`: a blocking put of the sentinel would never return.
+      raise
+    except BaseException:
+      await merged.put(done_sentinel)
+      raise
+    else:
       await merged.put(done_sentinel)
 
   agent_task = asyncio.create_task(_pump_agent_events())
