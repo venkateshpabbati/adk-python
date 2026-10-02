@@ -919,6 +919,45 @@ async def test_function_node_ctx_state_delta_sync(
 
 
 @pytest.mark.asyncio
+async def test_function_node_injects_ctx_by_name_with_non_context_annotation(
+    request: pytest.FixtureRequest,
+):
+  """Tests that a param named `ctx` gets the Context even if typed `Any`."""
+
+  def set_state_via_ctx(ctx: Any = None) -> str:
+    ctx.state['user_request'] = 'build a tracker app'
+    return 'done'
+
+  def read_state(user_request: str) -> str:
+    return f'request={user_request}'
+
+  agent = Workflow(
+      name='test_ctx_any_annotation',
+      edges=[
+          (START, set_state_via_ctx),
+          (set_state_via_ctx, read_state),
+      ],
+  )
+  events, _, _ = await run_workflow(agent)
+  simplified = simplify_events_with_node(events, include_state_delta=True)
+  assert simplified == [
+      (
+          'test_ctx_any_annotation@1/set_state_via_ctx@1',
+          {
+              'output': 'done',
+              'state_delta': {'user_request': 'build a tracker app'},
+          },
+      ),
+      (
+          'test_ctx_any_annotation@1/read_state@1',
+          {
+              'output': 'request=build a tracker app',
+          },
+      ),
+  ]
+
+
+@pytest.mark.asyncio
 async def test_function_node_ctx_state_delta_async(
     request: pytest.FixtureRequest,
 ):
@@ -1815,3 +1854,82 @@ async def test_function_node_directly_after_start_coerces_json_content(
       and e.output is not None
   ]
   assert outputs == [[10, 20]]
+
+
+@pytest.mark.asyncio
+async def test_function_node_var_keyword_binds_from_node_input(
+    request: pytest.FixtureRequest,
+) -> None:
+  """FunctionNode in node_input mode validates and binds extra dict keys into **kwargs."""
+
+  def produce_input() -> dict[str, Any]:
+    return {'required_key': 'base', 'alpha': 1, 'beta': 'two'}
+
+  def collect_extras(
+      required_key: str, *args: Any, **kwargs: Any
+  ) -> dict[str, Any]:
+    return {'required': required_key, 'args': list(args), 'extra': kwargs}
+
+  fn_node = FunctionNode(
+      func=collect_extras,
+      name='collect_extras',
+      parameter_binding='node_input',
+  )
+  validated = fn_node._validate_input_data(
+      {'required_key': 'base', 'alpha': 1, 'beta': 'two'}
+  )
+  assert validated == {'required_key': 'base', 'alpha': 1, 'beta': 'two'}
+
+  wf = Workflow(
+      name='var_kw_wf',
+      edges=[(START, produce_input), (produce_input, fn_node)],
+  )
+  events, _, _ = await run_workflow(wf)
+  outputs = [
+      e.output
+      for e in events
+      if e.node_info
+      and e.node_info.path == 'var_kw_wf@1/collect_extras@1'
+      and e.output is not None
+  ]
+  assert outputs == [
+      {'required': 'base', 'args': [], 'extra': {'alpha': 1, 'beta': 'two'}}
+  ]
+
+
+@pytest.mark.asyncio
+async def test_function_node_wraps_decorator_dispatches_on_wrapper(
+    request: pytest.FixtureRequest,
+) -> None:
+  """A non-generator wrapper decorated with @functools.wraps(generator) dispatches as a regular function."""
+  import functools
+
+  def produce_input() -> dict[str, int]:
+    return {'x': 10}
+
+  def inner_gen(x: int) -> Generator[int, None, None]:
+    yield x
+    yield x + 1
+
+  @functools.wraps(inner_gen)
+  def collect_as_list(x: int) -> list[int]:
+    return list(inner_gen(x))
+
+  fn_node = FunctionNode(
+      func=collect_as_list,
+      name='collect_as_list',
+      parameter_binding='node_input',
+  )
+  wf = Workflow(
+      name='wraps_wf',
+      edges=[(START, produce_input), (produce_input, fn_node)],
+  )
+  events, _, _ = await run_workflow(wf)
+  outputs = [
+      e.output
+      for e in events
+      if e.node_info
+      and e.node_info.path == 'wraps_wf@1/collect_as_list@1'
+      and e.output is not None
+  ]
+  assert outputs == [[10, 11]]
