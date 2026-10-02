@@ -3210,30 +3210,32 @@ def test_list_metrics_info(builder_test_client):
     assert "metricValueInfo" in metric
 
 
-def test_list_metrics_info_omits_metrics_that_need_no_threshold(
+def test_list_metrics_info_includes_metrics_that_need_no_threshold(
     builder_test_client,
 ):
-  """Always-on informational metrics are not offered for threshold selection.
+  """Informational metrics are listed too, flagged as needing no threshold.
 
-  This surface asks the user to pick metrics and set a threshold for each, and
-  bounds the threshold control by the metric's value interval. Metrics that
-  need no threshold have neither, so listing them leaves consumers with nothing
-  to render.
+  A caller that asks the user to pick metrics and set a threshold for each
+  filters on `requiresThreshold`; a caller that only describes metrics, such
+  as the Dev UI's result tooltips, needs every registered metric present.
   """
   response = builder_test_client.get("/dev/apps/test_app/metrics-info")
 
   assert response.status_code == 200
-  listed = [metric["metricName"] for metric in response.json()["metricsInfo"]]
-  assert "tool_trajectory_avg_score" in listed
+  by_name = {
+      metric["metricName"]: metric for metric in response.json()["metricsInfo"]
+  }
+  assert by_name["tool_trajectory_avg_score"]["requiresThreshold"] is True
   for informational in (
       "tool_call_count_v1",
       "inference_call_count_v1",
       "token_usage_v1",
+      "invocation_duration_v1",
   ):
-    assert informational not in listed
-  # Everything that is listed can be rendered as a bounded threshold control.
-  for metric in response.json()["metricsInfo"]:
-    assert metric["metricValueInfo"]["interval"]
+    assert by_name[informational]["requiresThreshold"] is False
+    # Nothing bounds an informational value, so a threshold control has no
+    # interval to size itself by. That is why the caller filters instead.
+    assert "interval" not in by_name[informational]["metricValueInfo"]
 
 
 def test_debug_trace(test_app):
