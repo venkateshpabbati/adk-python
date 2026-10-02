@@ -1988,6 +1988,45 @@ def test_list_sessions(test_app, create_test_session):
   logger.info(f"Listed {len(data)} sessions")
 
 
+async def test_list_sessions_filters_eval_sessions(
+    test_app, test_session_info, mock_session_service
+):
+  """Test that eval sessions (both old and new prefixes) are filtered from list."""
+  # Create a normal session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="normal-session",
+      state={},
+  )
+  # Create a new style eval session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="adk-eval-session-new-style",
+      state={},
+  )
+  # Create an old style eval session
+  await mock_session_service.create_session(
+      app_name=test_session_info["app_name"],
+      user_id=test_session_info["user_id"],
+      session_id="___eval___session___old-style",
+      state={},
+  )
+
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = test_app.get(url)
+
+  assert response.status_code == 200
+  data = response.json()
+  assert isinstance(data, list)
+
+  session_ids = [session["id"] for session in data]
+  assert "normal-session" in session_ids
+  assert "adk-eval-session-new-style" not in session_ids
+  assert "___eval___session___old-style" not in session_ids
+
+
 def test_delete_session(test_app, create_test_session):
   """Test deleting a session."""
   info = create_test_session
