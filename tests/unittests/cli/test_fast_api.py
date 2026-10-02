@@ -748,6 +748,46 @@ def test_api_server_get_runner_async_rejects_internal_special_agent_name(
   )
 
 
+@pytest.mark.parametrize(
+    ("web", "bind_host", "expected"),
+    [
+        (True, "127.0.0.1", True),
+        (True, "localhost", True),
+        (True, "::1", True),
+        (True, "0.0.0.0", False),
+        (True, "::", False),
+        (True, "192.168.1.10", False),
+        (True, None, False),
+        (False, "127.0.0.1", False),
+    ],
+)
+def test_special_agents_allowed_only_on_loopback_web_server(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    web,
+    bind_host,
+    expected,
+):
+  # The agent builder assistant writes files the server imports, and the dev
+  # server is unauthenticated, so it must not be reachable off the machine.
+  _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      web=web,
+      bind_host=bind_host,
+  )
+
+  assert mock_agent_loader._allow_special_agents is expected
+
+
 @pytest.fixture
 def test_app(
     mock_session_service,

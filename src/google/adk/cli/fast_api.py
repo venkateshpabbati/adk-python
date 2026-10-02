@@ -50,6 +50,7 @@ from ..runners import Runner
 from ..telemetry._agent_engine import get_propagated_context
 from ..telemetry._agent_engine import maybe_install_request_metrics_middleware
 from ..telemetry._agent_engine import TopSpanProcessor
+from .api_server import _is_loopback_address
 from .api_server import ApiServer
 from .cli_deploy import _AGENT_ENGINE_CLASS_METHODS
 from .service_registry import load_services_module
@@ -248,7 +249,14 @@ def get_fast_api_app(
     if is_single_agent and isinstance(agent_loader, this_module.AgentLoader):
       if single_agent_name is not None:
         agent_loader._set_single_agent_mode(single_agent_name, agents_dir)
-  agent_loader._allow_special_agents = web
+  # The built-in agents include the agent builder assistant, which writes
+  # arbitrary files -- Python included -- that the server then imports. The
+  # dev server has no authentication, so they are only safe where nobody else
+  # can reach it: a loopback bind, which the DNS-rebinding and Origin guards
+  # also cover. An unknown bind (None) is treated as exposed.
+  agent_loader._allow_special_agents = (
+      web and bind_host is not None and _is_loopback_address(bind_host)
+  )
 
   # Load services.py from agents_dir for custom service registration.
   load_services_module(agents_dir)
