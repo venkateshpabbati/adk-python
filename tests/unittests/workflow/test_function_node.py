@@ -1564,6 +1564,100 @@ class TestAuthConfig:
     )
     assert node.rerun_on_resume is True
 
+  @pytest.mark.parametrize('resumable', [False, True])
+  @pytest.mark.asyncio
+  async def test_auth_function_node_returning_none_not_rerun_on_downstream_resume(
+      self,
+      request: pytest.FixtureRequest,
+      resumable: bool,
+  ):
+    """A FunctionNode with auth_config that returns None does not rerun when a downstream node resumes."""
+    from fastapi.openapi.models import APIKey
+    from fastapi.openapi.models import APIKeyIn
+    from google.adk.auth.auth_credential import AuthCredential
+    from google.adk.auth.auth_credential import AuthCredentialTypes
+    from google.adk.auth.auth_tool import AuthConfig
+    from google.adk.workflow.utils._workflow_hitl_utils import REQUEST_CREDENTIAL_FUNCTION_CALL_NAME
+
+    from .workflow_testing_utils import find_function_call_event
+    from .workflow_testing_utils import get_auth_request_events
+
+    auth_config = AuthConfig(
+        auth_scheme=APIKey(**{'in': APIKeyIn.header, 'name': 'X-Api-Key'}),
+        raw_auth_credential=AuthCredential(
+            auth_type=AuthCredentialTypes.API_KEY,
+            api_key='placeholder',
+        ),
+        credential_key='fn_auth_key',
+    )
+    call_count = 0
+
+    def side_effect_fn(ctx: Context) -> None:
+      del ctx
+      nonlocal call_count
+      call_count += 1
+      return None
+
+    def review_node(node_input: Any):
+      del node_input
+      return RequestInput(interrupt_id='review', message='Please review')
+
+    auth_fn_node = FunctionNode(
+        func=side_effect_fn,
+        name='side_effect_fn',
+        auth_config=auth_config,
+        rerun_on_resume=True,
+    )
+    wf = Workflow(
+        name='auth_fn_no_output_wf',
+        edges=[
+            (START, auth_fn_node),
+            (auth_fn_node, review_node),
+        ],
+    )
+    app = App(
+        name=f'{request.function.__name__}_{resumable}',
+        root_agent=wf,
+        resumability_config=(
+            ResumabilityConfig(is_resumable=True) if resumable else None
+        ),
+    )
+    runner = testing_utils.InMemoryRunner(app=app)
+
+    # Turn 1: pauses for auth on auth_fn_node.
+    events1 = await runner.run_async(testing_utils.get_user_content('start'))
+    auth_events = get_auth_request_events(events1)
+    assert len(auth_events) == 1
+    fc = auth_events[0].content.parts[0].function_call
+    assert call_count == 0
+
+    # Turn 2: supply credential -> auth_fn_node runs once and returns None,
+    # then review_node pauses.
+    resume_auth_part = types.Part(
+        function_response=types.FunctionResponse(
+            id=fc.id,
+            name=REQUEST_CREDENTIAL_FUNCTION_CALL_NAME,
+            response={'result': 'my-secret-api-key'},
+        )
+    )
+    events2 = await runner.run_async(
+        new_message=testing_utils.UserContent(resume_auth_part),
+        invocation_id=auth_events[0].invocation_id,
+    )
+    assert call_count == 1
+    review_req = find_function_call_event(events2, 'adk_request_input')
+    assert review_req is not None
+
+    # Turn 3: answer review_node -> auth_fn_node must NOT run a second time.
+    review_id = get_request_input_interrupt_ids(review_req)[0]
+    await runner.run_async(
+        new_message=testing_utils.UserContent(
+            create_request_input_response(review_id, {'approved': True})
+        ),
+        invocation_id=review_req.invocation_id,
+    )
+    assert call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # parameter_binding='node_input' tests
