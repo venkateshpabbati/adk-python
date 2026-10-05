@@ -282,6 +282,9 @@ class InvocationContext(BaseModel):
   _custom_metadata: dict[str, Any] = PrivateAttr(default_factory=dict)
   """Custom metadata for attaching low-level execution telemetry."""
 
+  _private_metadata: dict[str, Any] = PrivateAttr(default_factory=dict)
+  """Private metadata for internal caching, not exposed to user code."""
+
   _invocation_cost_manager: _InvocationCostManager = PrivateAttr(
       default_factory=_InvocationCostManager
   )
