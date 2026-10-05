@@ -19,6 +19,8 @@ import logging
 from typing import AsyncGenerator
 
 from google.genai import types
+from opentelemetry.trace import Status
+from opentelemetry.trace import StatusCode
 
 from ..events._rewind_events import _apply_rewinds
 from ..events.event import Event
@@ -59,9 +61,21 @@ async def _summarize_events_with_trace(
 
   with tracer.start_as_current_span(f'compact_events {trigger}') as span:
     span.set_attributes(attributes)
-    compaction_event = await config.summarizer.maybe_summarize_events(
-        events=events_to_compact
-    )
+    try:
+      compaction_event = await config.summarizer.maybe_summarize_events(
+          events=events_to_compact
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      # The full history is still usable, so a failure must not end the turn.
+      # Nothing unwinds past the span, so without an explicit status it would
+      # be recorded as a successful compaction.
+      span.record_exception(e)
+      span.set_status(Status(StatusCode.ERROR, type(e).__name__))
+      logger.warning(
+          'Event compaction failed; continuing with the uncompacted history.',
+          exc_info=True,
+      )
+      return None
     span.set_attributes(_build_compaction_result_attributes(compaction_event))
     return compaction_event
 
