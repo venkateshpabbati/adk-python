@@ -55,6 +55,7 @@ from typing import Callable
 from typing import ClassVar
 from typing import Literal
 from typing import Optional
+import uuid
 
 from fastapi import FastAPI
 from fastapi import HTTPException
@@ -784,7 +785,7 @@ async def _spawn_deploy(
   would block forever once an undrained pipe buffer filled. A file has no such
   limit, and it leaves the full log behind for debugging.
   """
-  stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+  stamp = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
   base = os.path.join(tempfile.gettempdir(), "adk_deploy")
   staging_dir = os.path.join(base, f"{app_name}_{request.target}_{stamp}")
   log_path = os.path.join(base, f"{app_name}_{request.target}_{stamp}.log")
