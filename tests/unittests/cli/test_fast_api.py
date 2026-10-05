@@ -573,6 +573,47 @@ def _create_test_client(
     return TestClient(app)
 
 
+@pytest.mark.parametrize(
+    "bind_host, expect_warning",
+    [
+        (None, False),
+        ("127.0.0.1", False),
+        ("localhost", False),
+        ("::1", False),
+        ("0.0.0.0", True),
+        ("::", True),
+        ("192.168.1.10", True),
+    ],
+)
+def test_no_auth_warning_on_non_loopback_bind(
+    bind_host,
+    expect_warning,
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    caplog,
+):
+  """Warns about missing auth only when bound to a reachable (non-loopback) address."""
+  with caplog.at_level(logging.WARNING):
+    _create_test_client(
+        mock_session_service,
+        mock_artifact_service,
+        mock_memory_service,
+        mock_agent_loader,
+        mock_eval_sets_manager,
+        mock_eval_set_results_manager,
+        bind_host=bind_host,
+    )
+  warned = any(
+      "has no authentication" in record.getMessage()
+      for record in caplog.records
+  )
+  assert warned is expect_warning
+
+
 def test_agent_with_bigquery_analytics_plugin(
     tmp_path,
     mock_session_service,
