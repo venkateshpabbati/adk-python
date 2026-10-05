@@ -484,8 +484,6 @@ async def _run_compaction_for_sliding_window(
     app: App,
     session: Session,
     session_service: BaseSessionService,
-    *,
-    skip_token_compaction: bool = False,
 ) -> AsyncGenerator[Event, None]:
   """Runs sliding-window compaction over the session's events.
 
@@ -511,7 +509,6 @@ async def _run_compaction_for_sliding_window(
     session: The session containing events to compact.
     session_service: The session service, used by the token-threshold path,
       which appends its own event directly.
-    skip_token_compaction: Whether to skip token-threshold compaction.
 
   Yields:
     The sliding-window compaction event, if one is produced. The caller (the
@@ -531,7 +528,7 @@ async def _run_compaction_for_sliding_window(
     return
 
   # Prefer token-threshold compaction if configured and triggered.
-  if not skip_token_compaction and _has_token_threshold_config(config):
+  if _has_token_threshold_config(config):
     token_compacted = await _run_compaction_for_token_threshold(
         app, session, session_service
     )

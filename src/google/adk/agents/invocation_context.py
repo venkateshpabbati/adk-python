@@ -250,7 +250,10 @@ class InvocationContext(BaseModel):
   """The compaction config for this invocation."""
 
   token_compaction_checked: bool = False
-  """Whether token-threshold compaction ran during this invocation."""
+  """Whether the compaction request processor compacted before a model call.
+
+  Set on the context that call used, so parent contexts do not see it.
+  """
 
   plugin_manager: PluginManager = Field(default_factory=PluginManager)
   """The manager for keeping track of plugins in this invocation."""

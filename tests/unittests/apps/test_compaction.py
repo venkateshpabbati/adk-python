@@ -743,38 +743,6 @@ class TestCompaction(unittest.IsolatedAsyncioTestCase):
         session=session, event=mock_compacted_event
     )
 
-  async def test_run_compaction_skip_token_compaction(self):
-    app = App(
-        name='test',
-        root_agent=Mock(spec=BaseAgent),
-        events_compaction_config=EventsCompactionConfig(
-            summarizer=self.mock_compactor,
-            compaction_interval=999,
-            overlap_size=0,
-            token_threshold=50,
-            event_retention_size=1,
-        ),
-    )
-    session = Session(
-        app_name='test',
-        user_id='u1',
-        id='s1',
-        events=[
-            self._create_event(1.0, 'inv1', 'e1'),
-            self._create_event(2.0, 'inv2', 'e2', prompt_token_count=100),
-        ],
-    )
-
-    await self._run_sliding_window(
-        app,
-        session,
-        self.mock_session_service,
-        skip_token_compaction=True,
-    )
-
-    self.mock_compactor.maybe_summarize_events.assert_not_called()
-    self.mock_session_service.append_event.assert_not_called()
-
   async def test_run_compaction_for_token_threshold_seeds_previous_compaction(
       self,
   ):
