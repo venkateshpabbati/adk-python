@@ -471,9 +471,17 @@ $(function() {
    */
   function appendMessage(text, type) {
     const $messageDiv = $('<div>').addClass(`message ${type}`);
-    const $contentDiv = $('<div>')
-                            .addClass('message-content')
-                            .html(text ? text.replace(/\n/g, '<br>') : '');
+    const $contentDiv = $('<div>').addClass('message-content');
+
+    if (text) {
+      const lines = String(text).split('\n');
+      lines.forEach((line, index) => {
+        if (index > 0) {
+          $contentDiv.append('<br>');
+        }
+        $contentDiv.append(document.createTextNode(line));
+      });
+    }
 
     $messageDiv.append($contentDiv);
     $messagesContainer.append($messageDiv);
