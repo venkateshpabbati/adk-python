@@ -24,10 +24,10 @@ from pydantic import BaseModel
 from pydantic import Field
 
 
-class BaseSamplingResult(BaseModel):
+class SamplingResult(BaseModel):
   """Base class for evaluation results of the candidate agent on the batch of examples."""
 
-  scores: dict[str, float] = Field(
+  scores: dict[str, float] = Field(  # type: ignore[call-overload]
       required=True,
       description=(
           "A map from example UID to the agent's overall score on that example."
@@ -36,20 +36,20 @@ class BaseSamplingResult(BaseModel):
   )
 
 
-# SamplingResult: the per-component evaluation results for a batch of examples.
+# SamplingResultT: the per-component evaluation results for a batch of examples.
 # Should at least include per-example scores and may also contain other data
 # required for optimizing the agent (e.g., outputs, trajectories, and metrics).
-SamplingResult = TypeVar("SamplingResult", bound=BaseSamplingResult)
+SamplingResultT = TypeVar("SamplingResultT", bound=SamplingResult)
 
 
-class BaseAgentWithScores(BaseModel):
+class AgentWithScores(BaseModel):
   """An optimized agent with its scores.
 
   Optimizers may use the overall_score field and can return custom metrics by
   sub-classing this class.
   """
 
-  optimized_agent: Agent = Field(
+  optimized_agent: Agent = Field(  # type: ignore[call-overload]
       required=True,
       description="The optimized agent.",
   )
@@ -60,13 +60,13 @@ class BaseAgentWithScores(BaseModel):
   )
 
 
-AgentWithScores = TypeVar("AgentWithScores", bound=BaseAgentWithScores)
+AgentWithScoresT = TypeVar("AgentWithScoresT", bound=AgentWithScores)
 
 
-class OptimizerResult(BaseModel, Generic[AgentWithScores]):
+class OptimizerResult(BaseModel, Generic[AgentWithScoresT]):
   """Base class for optimizer final results."""
 
-  optimized_agents: list[AgentWithScores] = Field(
+  optimized_agents: list[AgentWithScoresT] = Field(  # type: ignore[call-overload]
       required=True,
       description=(
           "A list of optimized agents which cannot be considered strictly"
@@ -76,7 +76,7 @@ class OptimizerResult(BaseModel, Generic[AgentWithScores]):
   )
 
 
-class UnstructuredSamplingResult(BaseSamplingResult):
+class UnstructuredSamplingResult(SamplingResult):
   """Evaluation result providing per-example unstructured evaluation data."""
 
   data: Optional[dict[str, dict[str, Any]]] = Field(

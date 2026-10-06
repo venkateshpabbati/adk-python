@@ -25,7 +25,10 @@ from google.genai import types as genai_types
 from .app_details import AppDetails
 from .common import EvalBaseModel
 from .eval_case import get_all_tool_calls_with_responses
+from .eval_case import IntermediateData
 from .eval_case import IntermediateDataType
+from .eval_case import Invocation
+from .eval_case import InvocationEvents
 from .eval_metrics import RubricScore
 from .evaluator import EvalStatus
 
@@ -44,16 +47,76 @@ class Label(enum.Enum):
 
 
 def get_text_from_content(
-    content: Optional[genai_types.Content],
+    content: Optional[Union[genai_types.Content, Invocation]],
+    *,
+    include_intermediate_responses_in_final: bool = False,
 ) -> Optional[str]:
+  """Extracts text from a `Content` or an `Invocation`.
+
+  When `content` is a `Content`, returns the concatenated text of its parts.
+
+  When `content` is an `Invocation`, returns the text of the invocation's final
+  response. If `include_intermediate_responses_in_final` is True, text from
+  intermediate invocation events (e.g. natural language emitted before tool
+  calls) is concatenated with the final response text.
+  """
+  if isinstance(content, Invocation):
+    if not include_intermediate_responses_in_final:
+      # Flag off: revert to basic plain-Content behavior.
+      return get_text_from_content(content.final_response)
+
+    parts: list[str] = []
+    if isinstance(content.intermediate_data, InvocationEvents):
+      # Walk intermediate events in order; collect text parts.
+      for event in content.intermediate_data.invocation_events:
+        text = get_text_from_content(event.content)
+        if text:
+          parts.append(text)
+    elif isinstance(content.intermediate_data, IntermediateData):
+      for _, response_parts in content.intermediate_data.intermediate_responses:
+        text = get_text_from_content(genai_types.Content(parts=response_parts))
+        if text:
+          parts.append(text)
+
+    # Then fetch the final response text and append it to the end.
+    final_text = get_text_from_content(content.final_response)
+    if final_text:
+      parts.append(final_text)
+
+    return "\n".join(parts) if parts else None
+
   if content and content.parts:
     return "\n".join([p.text for p in content.parts if p.text])
+
+  return None
 
 
 def get_eval_status(score: Optional[float], threshold: float) -> EvalStatus:
   if score is None:
     return EvalStatus.NOT_EVALUATED
   return EvalStatus.PASSED if score >= threshold else EvalStatus.FAILED
+
+
+def build_judge_request_config(
+    user_config: Optional[genai_types.GenerateContentConfig],
+) -> genai_types.GenerateContentConfig:
+  """Returns a judge-request config with Automatic Function Calling forced off.
+
+  Judge evaluators never pass tools, so google-genai's AFC branch is a no-op
+  for them; the only observable effect of leaving it on is a per-request
+  warning that floods eval runs. We override the flag regardless of what the
+  caller passed so a user config that merely tweaks e.g. temperature does not
+  silently re-enable AFC. The caller's object is not mutated.
+  """
+  config = (
+      user_config.model_copy(deep=True)
+      if user_config is not None
+      else genai_types.GenerateContentConfig()
+  )
+  config.automatic_function_calling = (
+      genai_types.AutomaticFunctionCallingConfig(disable=True)
+  )
+  return config
 
 
 def get_average_rubric_score(
@@ -67,13 +130,13 @@ def get_average_rubric_score(
   If non-zero score values are present, then a mean value is returned as the
   aggregated value.
   """
-  rubric_scores = [
+  scores = [
       rubric_score.score
       for rubric_score in rubric_scores
       if rubric_score.score is not None
   ]
 
-  return statistics.mean(rubric_scores) if rubric_scores else None
+  return statistics.mean(scores) if scores else None
 
 
 class _ToolDeclarations(EvalBaseModel):
@@ -114,6 +177,20 @@ class _ToolCallsAndResponses(EvalBaseModel):
   tool_calls_and_response: list[_ToolCallAndResponse]
 
 
+class _GroundingMetadataEntry(EvalBaseModel):
+  """Internal data model to capture grounding metadata from an invocation."""
+
+  step: int
+  author: Optional[str] = None
+  grounding_metadata: genai_types.GroundingMetadata
+
+
+class _GroundingMetadataEntries(EvalBaseModel):
+  """Internal data model used for serializing grounding metadata."""
+
+  grounding_metadata: list[_GroundingMetadataEntry]
+
+
 def get_tool_calls_and_responses_as_json_str(
     intermediate_data: Optional[IntermediateDataType],
 ) -> str:
@@ -143,6 +220,37 @@ def get_tool_calls_and_responses_as_json_str(
   )
 
   return internal_tool_calls_and_responses.model_dump_json(
+      indent=2,
+      exclude_unset=True,
+      exclude_defaults=True,
+      exclude_none=True,
+  )
+
+
+def get_grounding_metadata_as_json_str(
+    intermediate_data: Optional[IntermediateDataType],
+) -> str:
+  """Returns a JSON string representation of grounding metadata."""
+  if not isinstance(intermediate_data, InvocationEvents):
+    return "No grounding metadata was provided."
+
+  grounding_metadata = []
+  for idx, invocation_event in enumerate(intermediate_data.invocation_events):
+    if invocation_event.grounding_metadata:
+      grounding_metadata.append(
+          _GroundingMetadataEntry(
+              step=idx,
+              author=invocation_event.author,
+              grounding_metadata=invocation_event.grounding_metadata,
+          )
+      )
+
+  if not grounding_metadata:
+    return "No grounding metadata was provided."
+
+  return _GroundingMetadataEntries(
+      grounding_metadata=grounding_metadata
+  ).model_dump_json(
       indent=2,
       exclude_unset=True,
       exclude_defaults=True,

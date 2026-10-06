@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from google.adk.auth import auth_handler
 from google.adk.auth.auth_credential import AuthCredential
 from google.adk.auth.auth_credential import AuthCredentialTypes
 from google.adk.auth.auth_tool import AuthConfig
+from google.adk.events.ui_widget import UiWidget
 from google.adk.memory.base_memory_service import SearchMemoryResponse
 from google.adk.memory.memory_entry import MemoryEntry
 from google.adk.tools.tool_confirmation import ToolConfirmation
@@ -39,10 +41,57 @@ def mock_invocation_context():
   mock_context.session.id = "test-session-id"
   mock_context.app_name = "test-app"
   mock_context.user_id = "test-user"
+  mock_context.branch = "test-branch"
   mock_context.artifact_service = None
   mock_context.credential_service = None
   mock_context.memory_service = None
+  mock_context.is_aborted = False
   return mock_context
+
+
+def test_context_branch_returns_invocation_branch(mock_invocation_context):
+  """Context.branch returns the branch from the underlying invocation context."""
+  mock_invocation_context.branch = "test-branch"
+  context = Context(invocation_context=mock_invocation_context)
+
+  assert context.branch == "test-branch"
+
+
+def test_context_is_aborted(mock_invocation_context):
+  """Context.is_aborted delegates to invocation context."""
+  mock_invocation_context.is_aborted = False
+  context = Context(invocation_context=mock_invocation_context)
+  assert context.is_aborted is False
+
+  mock_invocation_context.is_aborted = True
+  assert context.is_aborted is True
+
+
+@pytest.mark.asyncio
+async def test_context_is_aborted_with_real_invocation_context():
+  """Context reflects underlying InvocationContext cancellation."""
+  from google.adk.agents.base_agent import BaseAgent
+  from google.adk.agents.invocation_context import InvocationContext
+  from google.adk.sessions.base_session_service import BaseSessionService
+  from google.adk.sessions.session import Session
+
+  abort_signal = asyncio.Event()
+  inv_ctx = InvocationContext(
+      session_service=MagicMock(spec=BaseSessionService),
+      agent=MagicMock(spec=BaseAgent),
+      invocation_id="inv_1",
+      session=Session(id="s1", app_name="test_app", user_id="test_user"),
+  )
+  inv_ctx._attach_abort_signal(abort_signal)
+  context = Context(invocation_context=inv_ctx)
+  assert context.is_aborted is False
+  assert inv_ctx.is_aborted is False
+
+  inv_ctx.abort()
+
+  assert context.is_aborted is True
+  assert inv_ctx.is_aborted is True
+  assert abort_signal.is_set() is True
 
 
 @pytest.fixture
@@ -124,6 +173,12 @@ class TestContextInitialization:
     context = Context(mock_invocation_context)
 
     assert context.actions is context._event_actions
+
+  def test_custom_metadata_property(self, mock_invocation_context):
+    """Test that custom_metadata property delegates to invocation context."""
+    mock_invocation_context._custom_metadata = {"key": "value"}
+    context = Context(mock_invocation_context)
+    assert context.custom_metadata == {"key": "value"}
 
 
 class TestContextListArtifacts:
@@ -383,6 +438,23 @@ class TestContextRequestConfirmation:
     assert confirmation.hint == "Confirm this action"
     assert confirmation.payload is None
 
+  def test_request_confirmation_with_no_arguments(
+      self, mock_invocation_context
+  ):
+    """Test request_confirmation when called with its default hint."""
+    context = Context(
+        mock_invocation_context,
+        function_call_id="test-function-call-id",
+    )
+
+    context.request_confirmation()
+
+    confirmation = context.actions.requested_tool_confirmations[
+        "test-function-call-id"
+    ]
+    assert confirmation.hint == ""
+    assert confirmation.payload is None
+
   def test_request_confirmation_without_function_call_id_raises(
       self, mock_invocation_context
   ):
@@ -547,3 +619,245 @@ class TestContextMemoryMethods:
               )
           ]
       )
+
+
+class TestContextAddUiWidget:
+  """Test render_ui_widget method in Context."""
+
+  def test_render_ui_widget(self, mock_invocation_context):
+    """Test that render_ui_widget appends a widget to actions."""
+
+    context = Context(mock_invocation_context)
+    widget = UiWidget(
+        id="w1",
+        provider="mcp",
+        payload={"resource_uri": "ui://test-app"},
+    )
+
+    context.render_ui_widget(widget)
+
+    assert context.actions.render_ui_widgets is not None
+    assert len(context.actions.render_ui_widgets) == 1
+    assert context.actions.render_ui_widgets[0] is widget
+
+  def test_render_ui_widget_multiple(self, mock_invocation_context):
+    """Test that calling render_ui_widget twice yields two widgets."""
+
+    context = Context(mock_invocation_context)
+    w1 = UiWidget(
+        id="w1",
+        provider="mcp",
+        payload={"resource_uri": "ui://app-1"},
+    )
+    w2 = UiWidget(
+        id="w2",
+        provider="mcp",
+        payload={"resource_uri": "ui://app-2"},
+    )
+
+    context.render_ui_widget(w1)
+    context.render_ui_widget(w2)
+
+    assert len(context.actions.render_ui_widgets) == 2
+    assert context.actions.render_ui_widgets[0] is w1
+    assert context.actions.render_ui_widgets[1] is w2
+
+  def test_render_ui_widget_duplicate(self, mock_invocation_context):
+    """Test that duplicate widgets by id are not added."""
+
+    context = Context(mock_invocation_context)
+    w1 = UiWidget(
+        id="w1",
+        provider="mcp",
+        payload={"resource_uri": "ui://app-1"},
+    )
+    w2 = UiWidget(
+        id="w1",
+        provider="mcp",
+        payload={"resource_uri": "ui://app-1-mod"},
+    )
+
+    context.render_ui_widget(w1)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"UI widget with ID '{w1.id}' already exists in the current event"
+            " actions."
+        ),
+    ):
+      context.render_ui_widget(w2)
+
+    assert len(context.actions.render_ui_widgets) == 1
+    assert context.actions.render_ui_widgets[0] is w1
+
+
+class TestDeriveScheduler:
+  """Tests for _derive_scheduler helper."""
+
+  def test_derive_scheduler_no_parent(self):
+    from google.adk.agents.context import _derive_scheduler
+
+    assert _derive_scheduler(None) is None
+
+  def test_derive_scheduler_with_parent_having_scheduler(self):
+    from google.adk.agents.context import _derive_scheduler
+
+    mock_parent = MagicMock()
+    mock_scheduler = MagicMock()
+    mock_parent._workflow_scheduler = mock_scheduler
+
+    assert _derive_scheduler(mock_parent) is mock_scheduler
+
+  def test_derive_scheduler_with_parent_no_scheduler(self):
+    from google.adk.agents.context import _derive_scheduler
+
+    mock_parent = MagicMock()
+    mock_parent._workflow_scheduler = None
+
+    scheduler = _derive_scheduler(mock_parent)
+    assert scheduler is None
+
+
+class TestContextGetInvocationContext:
+  """Test get_invocation_context method in Context."""
+
+  def test_get_invocation_context_propagates_isolation_scope(
+      self, mock_invocation_context
+  ):
+    """Test that get_invocation_context propagates isolation_scope to the copy."""
+    context = Context(mock_invocation_context)
+    context.isolation_scope = "test-isolation-scope"
+
+    # Mock model_copy to return a mock copy
+    mock_copy = MagicMock()
+    mock_invocation_context.model_copy.return_value = mock_copy
+
+    result = context.get_invocation_context()
+
+    # Verify model_copy was called with correct update dict
+    mock_invocation_context.model_copy.assert_called_once_with(
+        update={
+            "session": context.session,
+            "isolation_scope": "test-isolation-scope",
+        }
+    )
+    assert result is mock_copy
+
+  def test_get_invocation_context_propagates_node_path_and_round_trips(
+      self, mock_invocation_context
+  ):
+    """Test that get_invocation_context propagates node_path and Context inherits both from InvocationContext."""
+    context = Context(mock_invocation_context, node_path="wf.step1")
+    context.isolation_scope = "task:fc-1"
+
+    mock_copy = MagicMock()
+    mock_copy.isolation_scope = "task:fc-1"
+    mock_copy.node_path = "wf.step1"
+    mock_invocation_context.model_copy.return_value = mock_copy
+
+    result = context.get_invocation_context()
+
+    mock_invocation_context.model_copy.assert_called_once_with(
+        update={
+            "session": context.session,
+            "isolation_scope": "task:fc-1",
+            "node_path": "wf.step1",
+        }
+    )
+    rehydrated = Context(result)
+    assert rehydrated.isolation_scope == "task:fc-1"
+    assert rehydrated.node_path == "wf.step1"
+
+  @pytest.mark.asyncio
+  async def test_tool_context_from_node_ic_nests_agent_tool_and_node_tool_children(
+      self, mock_invocation_context
+  ):
+    """ToolContext built from a node's InvocationContext nests _SingleTurnAgentTool and NodeTool run_node children under the caller's node_path."""
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.tools._node_tool import NodeTool
+    from google.adk.tools.agent_tool import _SingleTurnAgentTool
+    from google.adk.tools.tool_context import ToolContext
+    from google.adk.workflow._base_node import BaseNode
+    from pydantic import BaseModel
+
+    caller_ctx = Context(mock_invocation_context, node_path="wf@1/caller@1")
+    mock_copy = MagicMock()
+    mock_copy.node_path = "wf@1/caller@1"
+    mock_copy.isolation_scope = None
+    mock_copy.branch = None
+    mock_copy.invocation_id = "inv-1"
+    mock_copy.session = mock_invocation_context.session
+    mock_copy._enqueue_event = AsyncMock()
+    mock_copy.model_copy.return_value = mock_copy
+    mock_invocation_context.model_copy.return_value = mock_copy
+
+    node_ic = caller_ctx.get_invocation_context()
+    tool_ctx = ToolContext(
+        invocation_context=node_ic,
+        function_call_id="fc-tool-1",
+    )
+    assert tool_ctx.node_path == "wf@1/caller@1"
+
+    captured_paths: list[str] = []
+
+    class ChildNode(BaseNode):
+
+      async def _run_impl(self, *, ctx: Context, node_input: object):
+        captured_paths.append(ctx.node_path)
+        yield "node_out"
+
+    class ChildInput(BaseModel):
+      request: str
+
+    child_node = ChildNode(name="tool_node", input_schema=ChildInput)
+    node_tool = NodeTool(node=child_node, name="tool_node")
+    await node_tool.run_async(
+        args={"request": "hello"},
+        tool_context=tool_ctx,
+    )
+
+    sub_agent = LlmAgent(name="sub_agent", model="gemini-2.5-flash")
+
+    async def fake_agent_run_impl(*, ctx: Context, node_input: object):
+      captured_paths.append(ctx.node_path)
+      yield "agent_out"
+
+    object.__setattr__(sub_agent, "_run_impl", fake_agent_run_impl)
+    agent_tool = _SingleTurnAgentTool(sub_agent)
+    await agent_tool.run_async(
+        args={"request": "hello"},
+        tool_context=tool_ctx,
+    )
+
+    # NodeTool keys its child run by function_call_id so repeated calls of the
+    # same tool get distinct node paths.
+    assert captured_paths == [
+        "wf@1/caller@1/tool_node@fc-tool-1",
+        "wf@1/caller@1/sub_agent@1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_context_run_node_delegates_to_dynamic_node_executor(
+    mock_invocation_context, mocker
+):
+  """Context.run_node delegates execution to _dynamic_node_scheduler.run_node_internal."""
+  from google.adk.workflow import _dynamic_node_scheduler
+
+  mock_run_internal = mocker.patch.object(
+      _dynamic_node_scheduler,
+      "run_node_internal",
+      return_value="executor_output",
+  )
+  mock_node = MagicMock()
+  ctx = Context(mock_invocation_context)
+
+  result = await ctx.run_node(mock_node, node_input="test_input")
+
+  assert result == "executor_output"
+  mock_run_internal.assert_called_once()
+  args, kwargs = mock_run_internal.call_args
+  assert args[0] is ctx
+  assert args[1] is mock_node
+  assert kwargs.get("node_input") == "test_input"

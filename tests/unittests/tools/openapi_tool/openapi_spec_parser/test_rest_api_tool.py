@@ -20,7 +20,11 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from fastapi.openapi.models import APIKey
 from fastapi.openapi.models import MediaType
+from fastapi.openapi.models import OAuth2
+from fastapi.openapi.models import OAuthFlowAuthorizationCode
+from fastapi.openapi.models import OAuthFlows
 from fastapi.openapi.models import Operation
 from fastapi.openapi.models import Parameter as OpenAPIParameter
 from fastapi.openapi.models import RequestBody
@@ -29,15 +33,22 @@ from google.adk.auth.auth_credential import AuthCredential
 from google.adk.auth.auth_credential import AuthCredentialTypes
 from google.adk.auth.auth_credential import HttpAuth
 from google.adk.auth.auth_credential import HttpCredentials
+from google.adk.auth.auth_credential import OAuth2Auth
+from google.adk.errors.input_validation_error import InputValidationError
 from google.adk.features import FeatureName
 from google.adk.features._feature_registry import temporary_feature_override
 from google.adk.sessions.state import State
 from google.adk.tools.openapi_tool.auth.auth_helpers import token_to_scheme_credential
 from google.adk.tools.openapi_tool.common.common import ApiParameter
 from google.adk.tools.openapi_tool.openapi_spec_parser.openapi_spec_parser import OperationEndpoint
+from google.adk.tools.openapi_tool.openapi_spec_parser.openapi_spec_parser import ParsedOperation
 from google.adk.tools.openapi_tool.openapi_spec_parser.operation_parser import OperationParser
+from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import _encode_path_param
 from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import RestApiTool
 from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import snake_to_lower_camel
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import AuthPreparationResult
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import ToolAuthHandler
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import ToolContextCredentialStore
 from google.adk.tools.tool_context import ToolContext
 from google.genai.types import FunctionDeclaration
 from google.genai.types import Schema
@@ -46,104 +57,237 @@ import pytest
 import requests
 
 
-class TestRestApiTool:
+@pytest.fixture
+def mock_tool_context():
+  """Fixture for a mock OperationParser."""
+  mock_context = MagicMock(spec=ToolContext)
+  mock_context.state = State({}, {})
+  mock_context.get_auth_response.return_value = {}
+  mock_context.request_credential.return_value = {}
+  return mock_context
 
-  @pytest.fixture
-  def mock_tool_context(self):
-    """Fixture for a mock OperationParser."""
-    mock_context = MagicMock(spec=ToolContext)
-    mock_context.state = State({}, {})
-    mock_context.get_auth_response.return_value = {}
-    mock_context.request_credential.return_value = {}
-    return mock_context
 
-  @pytest.fixture
-  def mock_ssl_context(self):
-    """Fixture for a mock ssl.SSLContext."""
-    return mock.create_autospec(ssl.SSLContext)
+@pytest.fixture
+def mock_ssl_context():
+  """Fixture for a mock ssl.SSLContext."""
+  return mock.create_autospec(ssl.SSLContext)
 
-  @pytest.fixture
-  def mock_operation_parser(self):
-    """Fixture for a mock OperationParser."""
+
+@pytest.fixture
+def mock_operation_parser():
+  """Fixture for a mock OperationParser."""
+  mock_parser = MagicMock(spec=OperationParser)
+  mock_parser.get_function_name.return_value = "mock_function_name"
+  mock_parser.get_json_schema.return_value = {}
+  mock_parser.get_parameters.return_value = []
+  mock_parser.get_return_type_hint.return_value = "str"
+  mock_parser.get_pydoc_string.return_value = "Mock docstring"
+  mock_parser.get_signature_parameters.return_value = []
+  mock_parser.get_return_type_value.return_value = str
+  mock_parser.get_annotations.return_value = {}
+  return mock_parser
+
+
+@pytest.fixture
+def sample_endpoint():
+  return OperationEndpoint(
+      base_url="https://example.com", path="/test", method="GET"
+  )
+
+
+@pytest.fixture
+def sample_operation():
+  return Operation(
+      operationId="testOperation",
+      description="Test operation",
+      parameters=[],
+      requestBody=RequestBody(
+          content={
+              "application/json": MediaType(
+                  schema=OpenAPISchema(
+                      type="object",
+                      properties={
+                          "testBodyParam": OpenAPISchema(type="string")
+                      },
+                  )
+              )
+          }
+      ),
+  )
+
+
+@pytest.fixture
+def sample_api_parameters():
+  return [
+      ApiParameter(
+          original_name="test_param",
+          py_name="test_param",
+          param_location="query",
+          param_schema=OpenAPISchema(type="string"),
+          is_required=True,
+      ),
+      ApiParameter(
+          original_name="",
+          py_name="test_body_param",
+          param_location="body",
+          param_schema=OpenAPISchema(type="string"),
+          is_required=True,
+      ),
+  ]
+
+
+@pytest.fixture
+def sample_return_parameter():
+  return ApiParameter(
+      original_name="test_param",
+      py_name="test_param",
+      param_location="query",
+      param_schema=OpenAPISchema(type="string"),
+      is_required=True,
+  )
+
+
+@pytest.fixture
+def sample_auth_scheme():
+  scheme, _ = token_to_scheme_credential(
+      "apikey", "header", "", "sample_auth_credential_internal_test"
+  )
+  return scheme
+
+
+@pytest.fixture
+def sample_auth_credential():
+  _, credential = token_to_scheme_credential(
+      "apikey", "header", "", "sample_auth_credential_internal_test"
+  )
+  return credential
+
+
+@pytest.fixture
+def oauth2_scheme():
+  return OAuth2(
+      flows=OAuthFlows(
+          authorizationCode=OAuthFlowAuthorizationCode(
+              authorizationUrl="https://example.com/auth",
+              tokenUrl="https://example.com/token",
+              scopes={},
+          )
+      )
+  )
+
+
+@pytest.fixture
+def oauth2_credential():
+  return AuthCredential(
+      auth_type=AuthCredentialTypes.OAUTH2,
+      oauth2=OAuth2Auth(
+          client_id="test-client-id",
+          client_secret="test-client-secret",
+      ),
+  )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [".", "..", "../../admin/v1/tenants", "foo/../bar", r"..\admin", "./x"],
+)
+def test_encode_path_param_rejects_dot_segments(value):
+  with pytest.raises(InputValidationError, match="parent-directory"):
+    _encode_path_param(name="name", value=value)
+
+
+@pytest.mark.parametrize(
+    "value,encoded",
+    [
+        ("foo/bar", "foo%2Fbar"),
+        ("file..txt", "file..txt"),
+        (".gitignore", ".gitignore"),
+        ("ok.txt", "ok.txt"),
+        ("me?x#", "me%3Fx%23"),
+    ],
+)
+def test_encode_path_param_encodes_safe_values(value, encoded):
+  assert _encode_path_param(name="name", value=value) == encoded
+
+
+class TestRestApiToolLegacy:
+
+  @pytest.fixture(autouse=True)
+  def disable_feature_flag(self):
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, False
+    ):
+      yield
+
+  def test_get_declaration(
+      self, sample_endpoint, sample_operation, mock_operation_parser
+  ):
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test description",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        should_parse_operation=False,
+    )
+    tool._operation_parser = mock_operation_parser
+
+    declaration = tool._get_declaration()
+    assert isinstance(declaration, FunctionDeclaration)
+    assert declaration.name == "test_tool"
+    assert declaration.description == "Test description"
+    assert isinstance(declaration.parameters, Schema)
+
+
+class TestRestApiToolWithJsonSchema:
+
+  @pytest.fixture(autouse=True)
+  def enable_feature_flag(self):
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, True
+    ):
+      yield
+
+  def test_get_declaration_with_json_schema_feature_enabled(
+      self, sample_endpoint, sample_operation
+  ):
+    """Test that _get_declaration uses parameters_json_schema when feature is enabled."""
     mock_parser = MagicMock(spec=OperationParser)
-    mock_parser.get_function_name.return_value = "mock_function_name"
-    mock_parser.get_json_schema.return_value = {}
-    mock_parser.get_parameters.return_value = []
-    mock_parser.get_return_type_hint.return_value = "str"
-    mock_parser.get_pydoc_string.return_value = "Mock docstring"
-    mock_parser.get_signature_parameters.return_value = []
-    mock_parser.get_return_type_value.return_value = str
-    mock_parser.get_annotations.return_value = {}
-    return mock_parser
+    mock_parser.get_json_schema.return_value = {
+        "type": "object",
+        "properties": {
+            "test_param": {"type": "string"},
+        },
+        "required": ["test_param"],
+    }
 
-  @pytest.fixture
-  def sample_endpoint(self):
-    return OperationEndpoint(
-        base_url="https://example.com", path="/test", method="GET"
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test description",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        should_parse_operation=False,
     )
+    tool._operation_parser = mock_parser
 
-  @pytest.fixture
-  def sample_operation(self):
-    return Operation(
-        operationId="testOperation",
-        description="Test operation",
-        parameters=[],
-        requestBody=RequestBody(
-            content={
-                "application/json": MediaType(
-                    schema=OpenAPISchema(
-                        type="object",
-                        properties={
-                            "testBodyParam": OpenAPISchema(type="string")
-                        },
-                    )
-                )
-            }
-        ),
-    )
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, True
+    ):
+      declaration = tool._get_declaration()
 
-  @pytest.fixture
-  def sample_api_parameters(self):
-    return [
-        ApiParameter(
-            original_name="test_param",
-            py_name="test_param",
-            param_location="query",
-            param_schema=OpenAPISchema(type="string"),
-            is_required=True,
-        ),
-        ApiParameter(
-            original_name="",
-            py_name="test_body_param",
-            param_location="body",
-            param_schema=OpenAPISchema(type="string"),
-            is_required=True,
-        ),
-    ]
+    assert isinstance(declaration, FunctionDeclaration)
+    assert declaration.name == "test_tool"
+    assert declaration.description == "Test description"
+    assert declaration.parameters is None
+    assert declaration.parameters_json_schema == {
+        "type": "object",
+        "properties": {
+            "test_param": {"type": "string"},
+        },
+        "required": ["test_param"],
+    }
 
-  @pytest.fixture
-  def sample_return_parameter(self):
-    return ApiParameter(
-        original_name="test_param",
-        py_name="test_param",
-        param_location="query",
-        param_schema=OpenAPISchema(type="string"),
-        is_required=True,
-    )
 
-  @pytest.fixture
-  def sample_auth_scheme(self):
-    scheme, _ = token_to_scheme_credential(
-        "apikey", "header", "", "sample_auth_credential_internal_test"
-    )
-    return scheme
-
-  @pytest.fixture
-  def sample_auth_credential(self):
-    _, credential = token_to_scheme_credential(
-        "apikey", "header", "", "sample_auth_credential_internal_test"
-    )
-    return credential
+class TestRestApiTool:
 
   def test_init(
       self,
@@ -189,63 +333,6 @@ class TestRestApiTool:
     tool = RestApiTool.from_parsed_operation_str(parsed_operation_str)
     assert tool.name == "test_operation"
 
-  def test_get_declaration(
-      self, sample_endpoint, sample_operation, mock_operation_parser
-  ):
-    tool = RestApiTool(
-        name="test_tool",
-        description="Test description",
-        endpoint=sample_endpoint,
-        operation=sample_operation,
-        should_parse_operation=False,
-    )
-    tool._operation_parser = mock_operation_parser
-
-    declaration = tool._get_declaration()
-    assert isinstance(declaration, FunctionDeclaration)
-    assert declaration.name == "test_tool"
-    assert declaration.description == "Test description"
-    assert isinstance(declaration.parameters, Schema)
-
-  def test_get_declaration_with_json_schema_feature_enabled(
-      self, sample_endpoint, sample_operation
-  ):
-    """Test that _get_declaration uses parameters_json_schema when feature is enabled."""
-    mock_parser = MagicMock(spec=OperationParser)
-    mock_parser.get_json_schema.return_value = {
-        "type": "object",
-        "properties": {
-            "test_param": {"type": "string"},
-        },
-        "required": ["test_param"],
-    }
-
-    tool = RestApiTool(
-        name="test_tool",
-        description="Test description",
-        endpoint=sample_endpoint,
-        operation=sample_operation,
-        should_parse_operation=False,
-    )
-    tool._operation_parser = mock_parser
-
-    with temporary_feature_override(
-        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, True
-    ):
-      declaration = tool._get_declaration()
-
-    assert isinstance(declaration, FunctionDeclaration)
-    assert declaration.name == "test_tool"
-    assert declaration.description == "Test description"
-    assert declaration.parameters is None
-    assert declaration.parameters_json_schema == {
-        "type": "object",
-        "properties": {
-            "test_param": {"type": "string"},
-        },
-        "required": ["test_param"],
-    }
-
   @patch(
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
   )
@@ -282,6 +369,42 @@ class TestRestApiTool:
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
   )
   @pytest.mark.asyncio
+  async def test_call_does_not_add_auth_params_to_caller_args(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """The caller's args also feed after-tool callbacks and the tool span."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"result": "success"}
+    mock_request.return_value = mock_response
+    auth_scheme, auth_credential = token_to_scheme_credential(
+        "apikey", "header", "X-API-Key", "secret-api-key"
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=auth_scheme,
+        auth_credential=auth_credential,
+    )
+    args = {"testBodyParam": "value"}
+
+    await tool.call(args=args, tool_context=mock_tool_context)
+
+    assert args == {"testBodyParam": "value"}
+    assert (
+        mock_request.call_args.kwargs["headers"]["X-API-Key"]
+        == "secret-api-key"
+    )
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
   async def test_call_http_failure(
       self,
       mock_request,
@@ -293,7 +416,7 @@ class TestRestApiTool:
   ):
     mock_response = MagicMock()
     mock_response.status_code = 500
-    mock_response.content = b"Internal Server Error"
+    mock_response.text = "Internal Server Error"
 
     # Create a proper HTTPStatusError with request and response
     mock_http_request = MagicMock(spec=httpx.Request)
@@ -332,6 +455,37 @@ class TestRestApiTool:
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
   )
   @pytest.mark.asyncio
+  async def test_call_http_failure_decodes_body_with_declared_charset(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """A non-UTF-8 error body must reach the model, not abort the run."""
+    mock_request.return_value = httpx.Response(
+        status_code=404,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content="Commande introuvable : échec".encode("latin-1"),
+        headers={"content-type": "text/plain; charset=iso-8859-1"},
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert result["error"].endswith(
+        "Status Code: 404, Commande introuvable : échec"
+    )
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
   async def test_call_auth_pending(
       self,
       mock_request,
@@ -365,6 +519,926 @@ class TestRestApiTool:
           "pending": True,
           "message": "Needs your authorization to access your data.",
       }
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_reactive_refresh_retries_successfully(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 the handler can refresh away is retried once and succeeds.
+
+    This is the silent recovery: the caller sees only the successful result,
+    with no sign that the first attempt was rejected.
+    """
+    # First response: 401 Unauthorized
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+
+    # Second response: 200 OK after token refresh
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "refreshed_success"}
+    mock_200_response.raise_for_status = MagicMock()
+
+    mock_request.side_effect = [mock_401_response, mock_200_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "refreshed_success"}
+    assert mock_request.call_count == 2
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_unrefreshable_triggers_reauth_pending(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 with no way to refresh asks the user to re-authorize.
+
+    The call is not retried: there is nothing new to send until the user
+    answers, so the tool reports pending rather than an error.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "reauth_requested"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {
+        "pending": True,
+        "message": "Needs your authorization to access your data.",
+    }
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_unrecoverable_returns_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 the handler cannot act on is reported as the plain API error.
+
+    This is the path for schemes where re-authorizing means nothing, such as a
+    static API key, and it has to look exactly as it did before 401 handling
+    existed.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    # The handler could neither refresh nor request re-authorization.
+    mock_handler.handle_unauthorized_error.return_value = "failed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert mock_request.call_count == 1
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_retry_failure_prevents_infinite_recursion(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """An endpoint that 401s after a successful refresh stops at one retry.
+
+    The retry re-enters call(), which builds its own handler, so only the lock
+    held across the retry keeps a refresh that never satisfies the server from
+    recursing until the stack runs out.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    # Both initial call and retry call return 401
+    mock_request.side_effect = [mock_401_response, mock_401_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    # The real claim is credential-keyed and held across the retry, so the
+    # handler the retried call builds finds it taken. Without this the mock
+    # would hand out the claim again and the retry would recover forever.
+    mock_handler.claim_recovery.return_value.__enter__.side_effect = [
+        True,
+        False,
+    ]
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    # Recursion is halted on retry; error is returned
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert mock_request.call_count == 2
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+    # The retried call asked for the claim and was refused, which is what
+    # stops it recovering again and recursing.
+    assert mock_handler.claim_recovery.call_count == 2
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_reauth_limit_returns_non_retryable_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A credential out of re-authorization budget gets a non-retryable error.
+
+    The message has to differ from the ordinary API error, which invites the
+    model to retry: re-authorizing has already been tried and did not help, so
+    the useful next step is to tell the user.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "reauth_limit_reached"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "error" in result
+    assert not result.get("pending", False)
+    assert "retrying will not help" in result["error"]
+    assert "Status Code: 401" in result["error"]
+    # No retry: the call is not repeated after the budget is spent.
+    assert mock_request.call_count == 1
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_success_refills_the_reauth_budget(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A call the API accepts is what tells the handler recovery worked."""
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "ok"}
+    mock_200_response.raise_for_status = MagicMock()
+    mock_request.return_value = mock_200_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "ok"}
+    mock_handler.note_successful_call.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_400_refills_the_reauth_budget(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """An API error that is not a token rejection still counts as acceptance.
+
+    A 400 means the request got past authorization and was then judged on its
+    merits, so one bad argument from the model must not leave the credential
+    with its recovery budgets spent.
+    """
+    mock_400_response = MagicMock()
+    mock_400_response.status_code = 400
+    mock_400_response.text = "Bad Request"
+    mock_400_response.headers = httpx.Headers({})
+    mock_400_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "400 Bad Request",
+            request=MagicMock(spec=httpx.Request),
+            response=mock_400_response,
+        )
+    )
+    mock_request.return_value = mock_400_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Status Code: 400" in result["error"]
+    mock_handler.note_successful_call.assert_called_once()
+
+  @pytest.mark.parametrize(
+      "www_authenticate",
+      [
+          'Bearer error="invalid_token"',
+          'Bearer error="insufficient_scope"',
+          'Basic realm="x"',
+      ],
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_does_not_refill_the_reauth_budget(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      www_authenticate,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """No 401 counts as acceptance, whatever challenge it carries.
+
+    A 401 says the request was not authenticated, so none of them are evidence
+    that the credential works. Refilling on one would undo the limit that stops
+    a hopeless endpoint from asking the user to re-authorize on every turn,
+    and a challenge naming neither the token nor Bearer is still a rejection.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": www_authenticate}
+    )
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=MagicMock(spec=httpx.Request),
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.claim_recovery.return_value.__enter__.return_value = True
+    mock_handler.handle_unauthorized_error.return_value = "failed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Status Code: 401" in result["error"]
+    mock_handler.note_successful_call.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_does_not_recover_when_lock_is_held(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Recovery already in progress for this credential must not be re-entered.
+
+    The lock is held by whichever call is recovering, including across its
+    retry, so a concurrent call or the retry itself reports the API error
+    rather than recovering a second time.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    # Someone else is already recovering this credential.
+    mock_handler.claim_recovery.return_value.__enter__.return_value = False
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert not result.get("pending", False)
+    mock_handler.handle_unauthorized_error.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_insufficient_scope_is_not_recovered(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 whose challenge blames the scope must not touch the credential."""
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Insufficient scope"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="insufficient_scope"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "reauth_requested"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    # The token is fine, so the API error is reported as-is: no eviction, no
+    # retry, and no re-authorization request for scopes that just failed.
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert not result.get("pending", False)
+    assert mock_request.call_count == 1
+    mock_handler.handle_unauthorized_error.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_without_challenge_is_recovered(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 with no challenge at all gets the benefit of the doubt."""
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers({})
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "refreshed_success"}
+    mock_200_response.raise_for_status = MagicMock()
+    mock_request.side_effect = [mock_401_response, mock_200_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "refreshed_success"}
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_challenge_match_is_case_insensitive(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Challenge parameters are matched without regard to case."""
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"WWW-Authenticate": 'Bearer Error="Invalid_Token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "refreshed_success"}
+    mock_200_response.raise_for_status = MagicMock()
+    mock_request.side_effect = [mock_401_response, mock_200_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "refreshed_success"}
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
+  async def test_call_403_does_not_start_recovery(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      oauth2_scheme,
+      oauth2_credential,
+  ):
+    """Only a 401 starts recovery; a 403 leaves the stored credential alone."""
+    store = ToolContextCredentialStore(mock_tool_context)
+    key = store.get_credential_key(oauth2_scheme, oauth2_credential)
+    store.store_credential(
+        key,
+        AuthCredential(
+            auth_type=AuthCredentialTypes.OAUTH2,
+            oauth2=OAuth2Auth(
+                client_id="test-client-id",
+                client_secret="test-client-secret",
+                access_token="existing-token",
+            ),
+        ),
+    )
+    mock_request.return_value = httpx.Response(
+        status_code=403,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content=b'{"error": "Forbidden"}',
+    )
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=oauth2_scheme,
+        auth_credential=oauth2_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "403" in result["error"]
+    assert "pending" not in result
+    assert mock_tool_context.state[key] is not None
+    mock_tool_context.request_credential.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_on_an_unauthenticated_tool_returns_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """A tool with no credential has nothing to recover, so the 401 is reported."""
+    mock_request.return_value = httpx.Response(
+        status_code=401,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content=b'{"error": "Unauthorized"}',
+    )
+    # The handler is faked to tell "recovery was skipped" apart from "recovery
+    # ran and gave up", which the real handler renders as the same error dict.
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_handler.prepare_auth_credentials.return_value = AuthPreparationResult(
+        state="done"
+    )
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=None,
+        auth_credential=None,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "401" in result["error"]
+    assert "pending" not in result
+    mock_handler.handle_unauthorized_error.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_without_a_tool_context_returns_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      sample_endpoint,
+      sample_operation,
+      oauth2_scheme,
+      oauth2_credential,
+  ):
+    """Recovery has no session state to evict from or to ask through."""
+    mock_request.return_value = httpx.Response(
+        status_code=401,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content=b'{"error": "Unauthorized"}',
+    )
+    # The handler is faked because the real one reaches for the tool context
+    # while preparing credentials, well before the 401 path under test.
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_handler.prepare_auth_credentials.return_value = AuthPreparationResult(
+        state="done",
+        auth_scheme=oauth2_scheme,
+        auth_credential=oauth2_credential,
+    )
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=oauth2_scheme,
+        auth_credential=oauth2_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=None)
+    assert "401" in result["error"]
+    assert "pending" not in result
+    mock_handler.handle_unauthorized_error.assert_not_called()
 
   @patch(
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
@@ -487,6 +1561,61 @@ class TestRestApiTool:
     assert request_params["json"] == {"param1": "value1", "param2": 123}
     assert request_params["params"] == {"testQueryParam": "query_value"}
 
+  def test_prepare_request_params_preserves_falsy_query_params(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    mock_operation = Operation(operationId="test_op")
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    params = [
+        ApiParameter(
+            original_name="flag",
+            py_name="flag",
+            param_location="query",
+            param_schema=OpenAPISchema(type="boolean"),
+        ),
+        ApiParameter(
+            original_name="offset",
+            py_name="offset",
+            param_location="query",
+            param_schema=OpenAPISchema(type="integer"),
+        ),
+        ApiParameter(
+            original_name="cursor",
+            py_name="cursor",
+            param_location="query",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+        ApiParameter(
+            original_name="empty_param",
+            py_name="empty_param",
+            param_location="query",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+    ]
+    kwargs = {
+        "flag": False,
+        "offset": 0,
+        "cursor": None,
+        "empty_param": "",
+    }
+
+    request_params = tool._prepare_request_params(params, kwargs)
+    # Explicit False/0/"" must be kept; None is omitted.
+    assert request_params["params"] == {
+        "flag": False,
+        "offset": 0,
+        "empty_param": "",
+    }
+
   def test_prepare_request_params_array(
       self, sample_endpoint, sample_auth_scheme, sample_auth_credential
   ):
@@ -513,7 +1642,7 @@ class TestRestApiTool:
     )
     params = [
         ApiParameter(
-            original_name="array",  # Match the parameter name
+            original_name="array",
             py_name="array",
             param_location="body",
             param_schema=OpenAPISchema(
@@ -522,6 +1651,44 @@ class TestRestApiTool:
         )
     ]
     kwargs = {"array": ["item1", "item2"]}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert request_params["json"] == ["item1", "item2"]
+
+  def test_prepare_request_params_array_with_param_conflict(
+      self, sample_endpoint, sample_auth_scheme, sample_auth_credential
+  ):
+    """Sends array body as JSON payload when parameter names conflict."""
+    mock_operation = Operation(
+        operationId="test_op",
+        parameters=[
+            OpenAPIParameter(
+                name="array",
+                **{"in": "query"},
+                schema=OpenAPISchema(type="string"),
+            )
+        ],
+        requestBody=RequestBody(
+            content={
+                "application/json": MediaType(
+                    schema=OpenAPISchema(
+                        type="array", items=OpenAPISchema(type="string")
+                    )
+                )
+            }
+        ),
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = OperationParser(mock_operation).get_parameters()
+    kwargs = {"array": "query_val", "array_0": ["item1", "item2"]}
 
     request_params = tool._prepare_request_params(params, kwargs)
 
@@ -560,6 +1727,45 @@ class TestRestApiTool:
 
     assert request_params["data"] == "test_value"
     assert request_params["headers"]["Content-Type"] == "text/plain"
+
+  def test_prepare_request_params_oneof_body(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    """Sends the JSON payload for a oneOf/anyOf/allOf request body.
+
+    A oneOf/anyOf/allOf body is named 'body' by the parser and must
+    still be sent as the JSON payload, not silently dropped.
+    """
+    oneof_schema = OpenAPISchema(
+        oneOf=[
+            OpenAPISchema(
+                type="object", properties={"card": OpenAPISchema(type="string")}
+            ),
+            OpenAPISchema(
+                type="object", properties={"iban": OpenAPISchema(type="string")}
+            ),
+        ]
+    )
+    mock_operation = Operation(
+        operationId="test_op",
+        requestBody=RequestBody(
+            content={"application/json": MediaType(schema=oneof_schema)}
+        ),
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = OperationParser(mock_operation).get_parameters()
+    kwargs = {"body": {"card": "4111-1111"}}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert request_params["json"] == {"card": "4111-1111"}
 
   def test_prepare_request_params_form_data(
       self, sample_endpoint, sample_auth_scheme, sample_auth_credential
@@ -644,7 +1850,59 @@ class TestRestApiTool:
     request_params = tool._prepare_request_params(params, kwargs)
 
     assert request_params["files"] == {"file1": b"file_content"}
-    assert request_params["headers"]["Content-Type"] == "multipart/form-data"
+    # For multipart/form-data the boundary-bearing Content-Type must be set by
+    # httpx (from the `files` payload), not forced here. Forcing a boundary-less
+    # "multipart/form-data" header would override the boundary httpx generates
+    # and make the request body unparsable.
+    assert "Content-Type" not in request_params["headers"]
+
+  def test_prepare_request_params_multipart_content_type_has_boundary(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    mock_operation = Operation(
+        operationId="test_op",
+        requestBody=RequestBody(
+            content={
+                "multipart/form-data": MediaType(
+                    schema=OpenAPISchema(
+                        type="object",
+                        properties={
+                            "file1": OpenAPISchema(
+                                type="string", format="binary"
+                            )
+                        },
+                    )
+                )
+            }
+        ),
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="file1",
+            py_name="file1",
+            param_location="body",
+            param_schema=OpenAPISchema(type="string", format="binary"),
+        )
+    ]
+    kwargs = {"file1": b"file_content"}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    # Build the request httpx would actually send and assert the wire
+    # Content-Type carries the multipart boundary that matches the body.
+    request = httpx.Client().build_request(**request_params)
+    content_type = request.headers["Content-Type"]
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = content_type.split("boundary=", 1)[1]
+    assert request.read().startswith(f"--{boundary}".encode())
 
   def test_prepare_request_params_octet_stream(
       self, sample_endpoint, sample_auth_scheme, sample_auth_credential
@@ -715,6 +1973,156 @@ class TestRestApiTool:
     assert (
         request_params["url"] == "https://example.com/test/123"
     )  # Path param replaced
+
+  def test_prepare_request_params_path_param_is_percent_encoded(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    """A path parameter value must not introduce a query string or fragment,
+    and slash-containing IDs must stay a single encoded segment.
+
+    Path parameter values ultimately come from the model's tool-call
+    arguments. Reserved characters ('/', '?', '#') are percent-encoded.
+    RFC 3986 dot-segments ('.' / '..') are rejected separately: quote()
+    leaves '.' literal, so encoding alone cannot stop backends that
+    decode '%2F' and merge dot-segments from leaving the declared path.
+    """
+    mock_operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="user_id",
+            py_name="user_id",
+            param_location="path",
+            param_schema=OpenAPISchema(type="string"),
+        )
+    ]
+    endpoint_with_path = OperationEndpoint(
+        base_url="https://example.com",
+        path="/users/{user_id}/messages",
+        method="get",
+    )
+    tool.endpoint = endpoint_with_path
+
+    # Slash-containing IDs stay one segment after encoding.
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "foo/bar"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/foo%2Fbar/messages"
+    )
+
+    # Query/fragment smuggling attempt: '?' and '#' must be escaped so a
+    # path parameter value cannot introduce a query string or fragment.
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "me?impersonate=other-user#"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/me%3Fimpersonate%3Dother-user%23/messages"
+    )
+    assert request_params["params"] == {}  # nothing smuggled into query params
+
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "file..txt"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/file..txt/messages"
+    )
+
+    request_params = tool._prepare_request_params(
+        params, {"user_id": ".gitignore"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/.gitignore/messages"
+    )
+
+    request_params = tool._prepare_request_params(params, {"user_id": "ok.txt"})
+    assert request_params["url"] == "https://example.com/users/ok.txt/messages"
+
+  @pytest.mark.parametrize(
+      "value",
+      [".", "..", "../../admin/v1/tenants", "foo/../bar", r"..\admin", "./x"],
+  )
+  def test_prepare_request_params_path_param_rejects_dot_segments(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme, value
+  ):
+    """Dot-segments must be rejected: quote() leaves '.' literal on the wire."""
+    mock_operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="user_id",
+            py_name="user_id",
+            param_location="path",
+            param_schema=OpenAPISchema(type="string"),
+        )
+    ]
+    tool.endpoint = OperationEndpoint(
+        base_url="https://example.com",
+        path="/users/{user_id}/messages",
+        method="get",
+    )
+
+    with pytest.raises(InputValidationError, match="parent-directory"):
+      tool._prepare_request_params(params, {"user_id": value})
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
+  async def test_call_rejects_dot_segment_path_param(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Traversal path args must fail closed without issuing an HTTP request."""
+    mock_operation = Operation(
+        operationId="test_op",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": OpenAPISchema(type="string"),
+            })
+        ],
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://example.com",
+            path="/files/{name}",
+            method="GET",
+        ),
+        operation=mock_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(
+        args={"name": "../../admin/secret"}, tool_context=mock_tool_context
+    )
+
+    assert "error" in result
+    assert "parent-directory" in result["error"]
+    assert not mock_request.called
+    assert tool._detect_error_in_response(result) == "HTTP_ERROR"
 
   def test_prepare_request_params_header_param(
       self,
@@ -1088,6 +2496,87 @@ class TestRestApiTool:
       else:
         assert call_kwargs["verify"] == expected_verify_in_call
 
+  async def test_request_bounds_every_default_timeout_phase(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Test that no phase of the default client's wait is unbounded.
+
+    A peer that accepts a connection but never answers must not occupy an
+    agent invocation forever. Connection setup fails fast; the read and write
+    budgets stay generous, because httpx's own 5-second default is far too
+    short for many real-world APIs.
+    """
+    mock_response = mock.create_autospec(requests.Response, instance=True)
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.configure_mock(status_code=200)
+
+    mock_client = mock.create_autospec(
+        httpx.AsyncClient, instance=True, spec_set=True
+    )
+    mock_client.request = AsyncMock(return_value=mock_response)
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    with patch.object(
+        httpx, "AsyncClient", return_value=mock_client, autospec=True
+    ) as mock_async_client:
+      await tool.call(args={}, tool_context=mock_tool_context)
+
+      assert mock_async_client.called
+      _, call_kwargs = mock_async_client.call_args
+      timeout = call_kwargs["timeout"]
+      assert isinstance(timeout, httpx.Timeout)
+      assert timeout.connect is not None
+      assert timeout.read is not None
+      assert timeout.write is not None
+      assert timeout.pool is not None
+      assert timeout.connect <= 30.0
+      assert timeout.pool <= 30.0
+      assert timeout.read >= 600.0
+      assert timeout.write >= 600.0
+
+  async def test_request_timeout_returns_normalized_error(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Test that a transport timeout becomes the tool's error response."""
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+    request = httpx.Request("GET", "https://example.com/test")
+
+    with patch.object(
+        httpx.AsyncClient,
+        "request",
+        AsyncMock(side_effect=httpx.ReadTimeout("timed out", request=request)),
+    ):
+      result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert "timed out" in result["error"]
+    assert "retry more than 3 times" in result["error"]
+    assert tool._detect_error_in_response(result) == "HTTP_ERROR"
+
   async def test_call_with_configure_verify(
       self,
       mock_tool_context,
@@ -1268,6 +2757,335 @@ class TestRestApiTool:
 
       assert result == {"result": "success"}
 
+  def test_init_httpx_client_factory_none_by_default(
+      self,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """httpx_client_factory is None by default."""
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+    )
+    assert tool._httpx_client_factory is None
+
+  def test_init_with_httpx_client_factory(
+      self,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """A user-supplied httpx_client_factory is stored on the tool."""
+    custom_factory = MagicMock()
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        httpx_client_factory=custom_factory,
+    )
+    assert tool._httpx_client_factory is custom_factory
+
+  @pytest.mark.asyncio
+  async def test_call_uses_custom_httpx_client_factory(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """When a factory is provided, its client is used to issue the request."""
+    mock_response = mock.create_autospec(requests.Response, instance=True)
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.configure_mock(status_code=200)
+
+    mock_client = mock.create_autospec(
+        httpx.AsyncClient, instance=True, spec_set=True
+    )
+    mock_client.request = AsyncMock(return_value=mock_response)
+    # Make the mock client work as an async context manager.
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    custom_factory = MagicMock(return_value=mock_client)
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+        httpx_client_factory=custom_factory,
+    )
+
+    with patch.object(httpx, "AsyncClient", autospec=True) as mock_default:
+      result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    # Factory must be invoked once and the default client must not be built.
+    custom_factory.assert_called_once_with()
+    mock_default.assert_not_called()
+    mock_client.request.assert_awaited_once()
+    assert result == {"result": "success"}
+
+  @pytest.mark.asyncio
+  async def test_call_without_httpx_client_factory_uses_default_client(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """When no factory is provided, the default httpx.AsyncClient is used."""
+    mock_response = mock.create_autospec(requests.Response, instance=True)
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.configure_mock(status_code=200)
+
+    mock_client = mock.create_autospec(
+        httpx.AsyncClient, instance=True, spec_set=True
+    )
+    mock_client.request = AsyncMock(return_value=mock_response)
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    with patch.object(
+        httpx, "AsyncClient", return_value=mock_client, autospec=True
+    ) as mock_async_client:
+      await tool.call(args={}, tool_context=mock_tool_context)
+      assert mock_async_client.called
+
+  def test_prepare_request_params_extracts_embedded_query_params(
+      self, sample_auth_credential, sample_auth_scheme
+  ):
+    """Test that query params embedded in the URL path are extracted.
+
+    ApplicationIntegrationToolset embeds query params and fragments directly
+    in the OpenAPI path (e.g. '...execute?triggerId=api_trigger/Name#action').
+    These must be moved into the explicit query_params dict so httpx does not
+    strip them when it replaces the URL query string with the `params` arg.
+    """
+    integration_path = (
+        "/v2/projects/my-proj/locations/us-central1"
+        "/integrations/ExecuteConnection:execute"
+        "?triggerId=api_trigger/ExecuteConnection"
+        "#POST_files"
+    )
+    endpoint = OperationEndpoint(
+        base_url="https://integrations.googleapis.com",
+        path=integration_path,
+        method="POST",
+    )
+    operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=endpoint,
+        operation=operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    request_params = tool._prepare_request_params([], {})
+
+    # The embedded query param must appear in params
+    assert request_params["params"]["triggerId"] == (
+        "api_trigger/ExecuteConnection"
+    )
+    # The URL must NOT contain the query string or fragment
+    assert "?" not in request_params["url"]
+    assert "#" not in request_params["url"]
+    assert request_params["url"] == (
+        "https://integrations.googleapis.com"
+        "/v2/projects/my-proj/locations/us-central1"
+        "/integrations/ExecuteConnection:execute"
+    )
+
+  def test_prepare_request_params_merges_embedded_and_explicit_query_params(
+      self, sample_auth_credential, sample_auth_scheme
+  ):
+    """Embedded URL query params merge with explicitly defined query params."""
+    endpoint = OperationEndpoint(
+        base_url="https://example.com",
+        path="/api?embedded_key=embedded_val",
+        method="GET",
+    )
+    operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=endpoint,
+        operation=operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="explicit_key",
+            py_name="explicit_key",
+            param_location="query",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+    ]
+    kwargs = {"explicit_key": "explicit_val"}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert request_params["params"]["embedded_key"] == "embedded_val"
+    assert request_params["params"]["explicit_key"] == "explicit_val"
+    assert "?" not in request_params["url"]
+
+  def test_prepare_request_params_explicit_query_param_takes_precedence(
+      self, sample_auth_credential, sample_auth_scheme
+  ):
+    """Explicitly defined query params take precedence over embedded ones."""
+    endpoint = OperationEndpoint(
+        base_url="https://example.com",
+        path="/api?key=embedded",
+        method="GET",
+    )
+    operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=endpoint,
+        operation=operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="key",
+            py_name="key",
+            param_location="query",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+    ]
+    kwargs = {"key": "explicit"}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    # Explicit value wins over the embedded one
+    assert request_params["params"]["key"] == "explicit"
+
+  def test_prepare_request_params_strips_fragment_only(
+      self, sample_auth_credential, sample_auth_scheme
+  ):
+    """Fragment-only paths (no query string) are also cleaned."""
+    endpoint = OperationEndpoint(
+        base_url="https://example.com",
+        path="/api#fragment",
+        method="GET",
+    )
+    operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=endpoint,
+        operation=operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    request_params = tool._prepare_request_params([], {})
+
+    assert "#" not in request_params["url"]
+    assert request_params["url"] == "https://example.com/api"
+
+  def test_prepare_request_params_plain_url_unchanged(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    """URLs without embedded query or fragment are not modified."""
+    operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    request_params = tool._prepare_request_params([], {})
+
+    assert request_params["url"] == "https://example.com/test"
+
+  def test_rest_api_tool_repr_and_str(
+      self, sample_endpoint, sample_operation, sample_auth_scheme
+  ):
+    """The attached credential is not rendered into repr or str."""
+    secret_cred = AuthCredential(
+        auth_type=AuthCredentialTypes.API_KEY,
+        api_key="sk-live-secret-api-key-12345",
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="test description",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=secret_cred,
+    )
+    repr_str = repr(tool)
+    str_str = str(tool)
+    assert 'name="test_tool"' in repr_str
+    assert 'description="test description"' in repr_str
+    assert "auth_scheme=" in repr_str
+    assert "auth_credential=" not in repr_str
+    assert "sk-live-secret-api-key-12345" not in repr_str
+    assert "sk-live-secret-api-key-12345" not in str_str
+
+  def test_prepare_request_params_fragment_params_become_query_params(
+      self, sample_auth_credential, sample_auth_scheme
+  ):
+    # When the ApplicationIntegrationToolset builds an endpoint URL, it sometimes
+    # puts params in the fragment (e.g. #triggerId=my_trigger). Without this fix
+    # those params were silently dropped and the API returned a 400 error.
+    # See: https://github.com/google/adk-python/issues/4598
+    integration_endpoint = OperationEndpoint(
+        base_url="https://integrations.googleapis.com",
+        path=(
+            "/v2/projects/demo/locations/us-central1"
+            "/integrations/MyFlow:execute"
+            "?triggerId=api_trigger/MyFlow"
+            "#httpMethod=POST"
+        ),
+        method="POST",
+    )
+    op = Operation(operationId="run_integration")
+    tool = RestApiTool(
+        name="run_integration",
+        description="Runs a Google Cloud integration flow",
+        endpoint=integration_endpoint,
+        operation=op,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    result = tool._prepare_request_params([], {})
+
+    # Both the query string and fragment params should land in query params
+    assert result["params"]["triggerId"] == "api_trigger/MyFlow"
+    assert result["params"]["httpMethod"] == "POST"
+
+    # The final URL should be clean — no leftover ? or #
+    assert "?" not in result["url"]
+    assert "#" not in result["url"]
+    assert result["url"] == (
+        "https://integrations.googleapis.com"
+        "/v2/projects/demo/locations/us-central1"
+        "/integrations/MyFlow:execute"
+    )
+
 
 def test_snake_to_lower_camel():
   assert snake_to_lower_camel("single") == "single"
@@ -1275,3 +3093,206 @@ def test_snake_to_lower_camel():
   assert snake_to_lower_camel("three_word_example") == "threeWordExample"
   assert not snake_to_lower_camel("")
   assert snake_to_lower_camel("alreadyCamelCase") == "alreadyCamelCase"
+
+
+def _build_parsed_operation(
+    operation: Operation,
+    parameters=None,
+    auth_scheme=None,
+    auth_credential=None,
+) -> ParsedOperation:
+  """A ParsedOperation whose own name/description differ from the operation's.
+
+  ``from_parsed_operation`` is documented to build the tool out of the OpenAPI
+  operation, so these two fields exist as decoys: a tool that picks them up is
+  reading the wrong source.
+  """
+  return ParsedOperation(
+      name="parsed_name_that_is_not_the_tool_name",
+      description="Parsed description that is not the tool description.",
+      endpoint=OperationEndpoint(
+          base_url="https://example.com", path="/pets", method="GET"
+      ),
+      operation=operation,
+      parameters=parameters if parameters is not None else [],
+      return_value=ApiParameter(
+          original_name="",
+          py_name="",
+          param_location="",
+          param_schema=OpenAPISchema(type="string"),
+      ),
+      auth_scheme=auth_scheme,
+      auth_credential=auth_credential,
+  )
+
+
+class TestRestApiToolFromParsedOperation:
+  """Tests for RestApiTool.from_parsed_operation."""
+
+  def test_from_parsed_operation_names_tool_after_operation_id(self):
+    parsed = _build_parsed_operation(
+        Operation(operationId="ListPetsByStatus", description="List pets.")
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert tool.name == "list_pets_by_status"
+
+  def test_from_parsed_operation_truncates_long_name_to_60_chars(self):
+    # Gemini rejects function names of 64 characters or more.
+    operation_id = "get" + "Extremely" * 10 + "LongOperationName"
+    parsed = _build_parsed_operation(
+        Operation(operationId=operation_id, description="Long one.")
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert len(tool.name) == 60
+    assert tool.name.startswith("get_extremely_extremely_")
+
+  @pytest.mark.parametrize(
+      "description, summary, expected",
+      [
+          (
+              "Operation description.",
+              "Operation summary.",
+              "Operation description.",
+          ),
+          (None, "Operation summary.", "Operation summary."),
+          (None, None, ""),
+      ],
+  )
+  def test_from_parsed_operation_description_precedence(
+      self, description, summary, expected
+  ):
+    parsed = _build_parsed_operation(
+        Operation(
+            operationId="listPets", description=description, summary=summary
+        )
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert tool.description == expected
+
+  def test_from_parsed_operation_uses_parsed_parameters_over_operation_ones(
+      self,
+  ):
+    # The operation declares one query parameter, but the caller has already
+    # parsed a different one; the pre-parsed list is what the tool must expose.
+    operation = Operation(
+        operationId="listPets",
+        description="List pets.",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "fromOperation",
+                "in": "query",
+                "schema": OpenAPISchema(type="string"),
+            })
+        ],
+    )
+    parsed = _build_parsed_operation(
+        operation,
+        parameters=[
+            ApiParameter(
+                original_name="fromParsed",
+                py_name="from_parsed",
+                param_location="query",
+                param_schema=OpenAPISchema(type="string"),
+            )
+        ],
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, False
+    ):
+      declaration = tool._get_declaration()
+
+    assert set(declaration.parameters.properties) == {"from_parsed"}
+
+  def test_from_parsed_operation_forwards_transport_options(
+      self, mock_ssl_context
+  ):
+    parsed = _build_parsed_operation(
+        Operation(operationId="listPets", description="List pets.")
+    )
+
+    def header_provider(_):
+      return {"X-Correlation-Id": "abc"}
+
+    def client_factory():
+      return httpx.AsyncClient()
+
+    tool = RestApiTool.from_parsed_operation(
+        parsed,
+        ssl_verify=mock_ssl_context,
+        header_provider=header_provider,
+        httpx_client_factory=client_factory,
+    )
+
+    assert tool._ssl_verify is mock_ssl_context
+    assert tool._header_provider is header_provider
+    assert tool._httpx_client_factory is client_factory
+
+  def test_from_parsed_operation_carries_over_auth(
+      self, sample_auth_scheme, sample_auth_credential
+  ):
+    parsed = _build_parsed_operation(
+        Operation(operationId="listPets", description="List pets."),
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert tool.auth_scheme == sample_auth_scheme
+    assert tool.auth_credential == sample_auth_credential
+
+
+class TestRestApiToolAuthConfiguration:
+  """Tests for configure_auth_scheme / configure_auth_credential."""
+
+  @pytest.fixture
+  def tool(self, sample_endpoint, sample_operation):
+    return RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+    )
+
+  def test_configure_auth_scheme_converts_dict_to_auth_scheme(self, tool):
+    tool.configure_auth_scheme({
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+    })
+
+    assert isinstance(tool.auth_scheme, APIKey)
+    assert tool.auth_scheme.name == "X-API-Key"
+    assert tool.auth_scheme.in_.value == "header"
+
+  def test_configure_auth_credential_parses_json_string(self, tool):
+    credential = AuthCredential(
+        auth_type=AuthCredentialTypes.HTTP,
+        http=HttpAuth(
+            scheme="bearer",
+            credentials=HttpCredentials(token="token-from-json"),
+        ),
+    )
+
+    tool.configure_auth_credential(credential.model_dump_json())
+
+    assert isinstance(tool.auth_credential, AuthCredential)
+    assert tool.auth_credential == credential
+
+  def test_configure_auth_credential_none_clears_existing_credential(
+      self, tool, sample_auth_credential
+  ):
+    tool.configure_auth_credential(sample_auth_credential)
+
+    tool.configure_auth_credential(None)
+
+    assert tool.auth_credential is None

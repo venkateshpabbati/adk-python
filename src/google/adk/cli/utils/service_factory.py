@@ -18,7 +18,6 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-from typing import Optional
 from urllib.parse import parse_qsl
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
@@ -28,6 +27,7 @@ from ...memory.base_memory_service import BaseMemoryService
 from ...sessions.base_session_service import BaseSessionService
 from ...utils.env_utils import is_env_enabled
 from ..service_registry import get_service_registry
+from .dot_adk_folder import DotAdkFolder
 from .local_storage import create_local_artifact_service
 from .local_storage import create_local_session_service
 
@@ -43,6 +43,7 @@ _LOCAL_STORAGE_ERRNOS = frozenset({
 
 _CLOUD_RUN_SERVICE_ENV = "K_SERVICE"
 _KUBERNETES_HOST_ENV = "KUBERNETES_SERVICE_HOST"
+_AGENT_ENGINE_ID_ENV = "GOOGLE_CLOUD_AGENT_ENGINE_ID"
 
 
 def _redact_uri_for_log(uri: str) -> str:
@@ -88,6 +89,14 @@ def _is_cloud_run() -> bool:
 def _is_kubernetes() -> bool:
   """Returns True when running in Kubernetes (including GKE)."""
   return bool(os.environ.get(_KUBERNETES_HOST_ENV))
+
+
+def _get_agent_engine_uri() -> str | None:
+  """Returns the agentengine:// URI if GOOGLE_CLOUD_AGENT_ENGINE_ID is set."""
+  engine_id = os.environ.get(_AGENT_ENGINE_ID_ENV)
+  if engine_id:
+    return f"agentengine://{engine_id}"
+  return None
 
 
 def _is_dir_writable(path: Path) -> bool:
@@ -170,9 +179,9 @@ def _create_in_memory_artifact_service(
 def create_session_service_from_options(
     *,
     base_dir: Path | str,
-    session_service_uri: Optional[str] = None,
-    session_db_kwargs: Optional[dict[str, Any]] = None,
-    app_name_to_dir: Optional[dict[str, str]] = None,
+    session_service_uri: str | None = None,
+    session_db_kwargs: dict[str, Any] | None = None,
+    app_name_to_dir: dict[str, str] | None = None,
     use_local_storage: bool = True,
 ) -> BaseSessionService:
   """Creates a session service based on CLI/web options."""
@@ -202,10 +211,42 @@ def create_session_service_from_options(
     fallback_kwargs = dict(kwargs)
     fallback_kwargs.pop("agents_dir", None)
     logger.info(
-        "Falling back to DatabaseSessionService for URI: %s",
+        "Using DatabaseSessionService for URI: %s",
         _redact_uri_for_log(session_service_uri),
     )
     return DatabaseSessionService(db_url=session_service_uri, **fallback_kwargs)
+
+  # Auto-configure from Agent Platform environment if available.
+  agent_engine_uri = _get_agent_engine_uri()
+  if agent_engine_uri:
+    if is_env_enabled(_FORCE_LOCAL_STORAGE_ENV):
+      logger.warning(
+          "Auto-configuring session service from %s (%s). Ignoring %s "
+          "because an Agent Platform environment was detected.",
+          _AGENT_ENGINE_ID_ENV,
+          _redact_uri_for_log(agent_engine_uri),
+          _FORCE_LOCAL_STORAGE_ENV,
+      )
+    else:
+      logger.info(
+          "Auto-configuring session service from %s: %s",
+          _AGENT_ENGINE_ID_ENV,
+          _redact_uri_for_log(agent_engine_uri),
+      )
+    try:
+      service = registry.create_session_service(agent_engine_uri, **kwargs)
+    except ValueError as exc:
+      # Auto-configuration is best-effort: if the Agent Platform environment is
+      # incomplete (e.g. GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION not set),
+      # fall back to local/in-memory storage instead of crashing.
+      logger.warning(
+          "Failed to auto-configure Agent Platform Sessions service (%r); "
+          "falling back to local/in-memory session service.",
+          exc,
+      )
+      service = None
+    if service is not None:
+      return service
 
   effective_use_local_storage, auto_warning = _resolve_use_local_storage(
       base_path=base_path,
@@ -242,7 +283,7 @@ def create_session_service_from_options(
 def create_memory_service_from_options(
     *,
     base_dir: Path | str,
-    memory_service_uri: Optional[str] = None,
+    memory_service_uri: str | None = None,
 ) -> BaseMemoryService:
   """Creates a memory service based on CLI/web options."""
   base_path = Path(base_dir)
@@ -263,6 +304,32 @@ def create_memory_service_from_options(
       )
     return service
 
+  # Auto-configure from Agent Platform environment if available.
+  agent_engine_uri = _get_agent_engine_uri()
+  if agent_engine_uri:
+    logger.info(
+        "Auto-configuring memory service from %s: %s",
+        _AGENT_ENGINE_ID_ENV,
+        _redact_uri_for_log(agent_engine_uri),
+    )
+    try:
+      service = registry.create_memory_service(
+          agent_engine_uri,
+          agents_dir=str(base_path),
+      )
+    except ValueError as exc:
+      # Auto-configuration is best-effort: if the Agent Platform environment is
+      # incomplete (e.g. GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION not set),
+      # fall back to the in-memory memory service instead of crashing.
+      logger.warning(
+          "Failed to auto-configure Agent Platform Memory Bank service (%r); "
+          "falling back to in-memory memory service.",
+          exc,
+      )
+      service = None
+    if service is not None:
+      return service
+
   logger.info("Using in-memory memory service")
   from ...memory.in_memory_memory_service import InMemoryMemoryService
 
@@ -272,8 +339,9 @@ def create_memory_service_from_options(
 def create_artifact_service_from_options(
     *,
     base_dir: Path | str,
-    artifact_service_uri: Optional[str] = None,
+    artifact_service_uri: str | None = None,
     strict_uri: bool = False,
+    app_name_to_dir: dict[str, str] | None = None,
     use_local_storage: bool = True,
 ) -> BaseArtifactService:
   """Creates an artifact service based on CLI/web options."""
@@ -313,8 +381,22 @@ def create_artifact_service_from_options(
         "Set --artifact_service_uri for production deployments."
     )
 
+  # Default to per-agent local storage in <agents_root>/<agent>/.adk/artifacts.
+  legacy_artifacts_dir = DotAdkFolder(base_path).artifacts_dir
+  if legacy_artifacts_dir.exists():
+    logger.warning(
+        "Found legacy shared artifacts at %s. Artifacts now persist"
+        " per-agent under <agent>/.adk/artifacts and legacy artifacts remain"
+        " readable via fallback. To migrate, move the 'users' directory into"
+        " the agent's .adk/artifacts folder.",
+        legacy_artifacts_dir,
+    )
   try:
-    return create_local_artifact_service(base_dir=base_path)
+    return create_local_artifact_service(
+        base_dir=base_path,
+        per_agent=True,
+        app_name_to_dir=app_name_to_dir,
+    )
   except OSError as exc:
     if exc.errno not in _LOCAL_STORAGE_ERRNOS and not isinstance(
         exc, PermissionError
@@ -326,3 +408,23 @@ def create_artifact_service_from_options(
         base_path,
         exc,
     )
+
+
+def _create_task_store_from_options(
+    *,
+    task_store_uri: str | None = None,
+) -> Any:
+  """Creates an A2A task store based on CLI/web options."""
+  from a2a.server.tasks import InMemoryTaskStore
+
+  registry = get_service_registry()
+
+  if task_store_uri:
+    logger.info(
+        "Using A2A task store URI: %s",
+        _redact_uri_for_log(task_store_uri),
+    )
+    return registry._create_task_store_service(task_store_uri)
+
+  logger.info("Using in-memory A2A task store")
+  return InMemoryTaskStore()

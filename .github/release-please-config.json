@@ -1,6 +1,5 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "last-release-sha": "9f7d5b3f1476234e552b783415527cc4bac55b39",
   "packages": {
     ".": {
       "release-type": "python",
@@ -9,17 +8,54 @@
       "skip-github-release": true,
       "changelog-path": "CHANGELOG.md",
       "changelog-sections": [
-        {"type": "feat", "section": "Features"},
-        {"type": "fix", "section": "Bug Fixes"},
-        {"type": "perf", "section": "Performance Improvements"},
-        {"type": "refactor", "section": "Code Refactoring"},
-        {"type": "docs", "section": "Documentation"},
-        {"type": "test", "section": "Tests", "hidden": true},
-        {"type": "build", "section": "Build System", "hidden": true},
-        {"type": "ci", "section": "CI/CD", "hidden": true},
-        {"type": "style", "section": "Styles", "hidden": true},
-        {"type": "chore", "section": "Miscellaneous Chores", "hidden": true}
+        {
+          "type": "feat",
+          "section": "Features"
+        },
+        {
+          "type": "fix",
+          "section": "Bug Fixes"
+        },
+        {
+          "type": "perf",
+          "section": "Performance Improvements"
+        },
+        {
+          "type": "refactor",
+          "section": "Code Refactoring",
+          "hidden": true
+        },
+        {
+          "type": "docs",
+          "section": "Documentation"
+        },
+        {
+          "type": "test",
+          "section": "Tests",
+          "hidden": true
+        },
+        {
+          "type": "build",
+          "section": "Build System",
+          "hidden": true
+        },
+        {
+          "type": "ci",
+          "section": "CI/CD",
+          "hidden": true
+        },
+        {
+          "type": "style",
+          "section": "Styles",
+          "hidden": true
+        },
+        {
+          "type": "chore",
+          "section": "Miscellaneous Chores",
+          "hidden": true
+        }
       ]
     }
-  }
+  },
+  "last-release-sha": "731ea30ecb63ea54ea1b51a81635b3016e9c8f55"
 }

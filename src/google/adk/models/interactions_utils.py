@@ -30,33 +30,216 @@ conversation history.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import dataclasses
 import json
 import logging
 from typing import Any
 from typing import AsyncGenerator
-from typing import Optional
 from typing import TYPE_CHECKING
 
 from google.genai import types
+from google.genai.interactions import ArgumentsDelta
+from google.genai.interactions import AudioContentParam
+from google.genai.interactions import AudioDelta
+from google.genai.interactions import CodeExecutionCallDelta
+from google.genai.interactions import CodeExecutionCallStep
+from google.genai.interactions import CodeExecutionCallStepParam
+from google.genai.interactions import CodeExecutionResultDelta
+from google.genai.interactions import CodeExecutionResultStep
+from google.genai.interactions import CodeExecutionResultStepParam
+from google.genai.interactions import ContentParam
+from google.genai.interactions import DocumentContentParam
+from google.genai.interactions import DocumentDelta
+from google.genai.interactions import ErrorEvent
+from google.genai.interactions import FunctionCallStep
+from google.genai.interactions import FunctionCallStepParam
+from google.genai.interactions import FunctionParam
+from google.genai.interactions import FunctionResultDelta
+from google.genai.interactions import FunctionResultStep
+from google.genai.interactions import FunctionResultStepParam
+from google.genai.interactions import GenerationConfigParam
+from google.genai.interactions import GoogleSearchCallDelta
+from google.genai.interactions import GoogleSearchResultDelta
+from google.genai.interactions import GoogleSearchResultStep
+from google.genai.interactions import ImageContentParam
+from google.genai.interactions import ImageDelta
+from google.genai.interactions import Interaction
+from google.genai.interactions import InteractionCompletedEvent
+from google.genai.interactions import InteractionCreatedEvent
+from google.genai.interactions import InteractionSSEEvent
+from google.genai.interactions import InteractionStatusUpdate
+from google.genai.interactions import MCPServerParam
+from google.genai.interactions import ModelOutputStep
+from google.genai.interactions import ModelOutputStepParam
+from google.genai.interactions import Step
+from google.genai.interactions import StepDelta
+from google.genai.interactions import StepDeltaData
+from google.genai.interactions import StepParam
+from google.genai.interactions import StepStart
+from google.genai.interactions import StepStop
+from google.genai.interactions import TextAnnotationDelta
+from google.genai.interactions import TextContent
+from google.genai.interactions import TextContentParam
+from google.genai.interactions import TextDelta
+from google.genai.interactions import ThoughtSignatureDelta
+from google.genai.interactions import ThoughtStep
+from google.genai.interactions import ThoughtStepParam
+from google.genai.interactions import ThoughtSummaryDelta
+from google.genai.interactions import ToolParam
+from google.genai.interactions import UnknownStepDeltaData
+from google.genai.interactions import URLCitation
+from google.genai.interactions import UserInputStepParam
+from google.genai.interactions import VideoContentParam
+from google.genai.interactions import VideoDelta
+from pydantic import BaseModel
+from typing_extensions import deprecated
 
 if TYPE_CHECKING:
   from google.genai import Client
-  from google.genai._interactions.types.interaction import Output
-  from google.genai._interactions.types.tool_param import ToolParam
-  from google.genai._interactions.types.turn_param import TurnParam
-  from google.genai.interactions_types import Interaction
-  from google.genai.interactions_types import InteractionSSEEvent
 
-  from .llm_request import LlmRequest
-  from .llm_response import LlmResponse
+  from ..tools._remote_mcp_server import RemoteMcpServer
+
+from ..utils._google_client_headers import merge_tracking_headers
+from ._service_tier import ServiceTier
+from .llm_request import LlmRequest
+from .llm_response import LlmResponse
 
 logger = logging.getLogger('google_adk.' + __name__)
 
 _NEW_LINE = '\n'
 
+# Statuses that mean the API accepted the work but has not produced a result
+# yet. A deferred request sits in 'queued' until off-peak capacity frees up.
+# Every other status the API reports -- 'completed', 'requires_action',
+# 'failed', 'cancelled', 'incomplete', 'budget_exceeded' -- ends this call.
+# 'requires_action' in particular is not pending: the model is done and is
+# waiting on tool results that only the caller can supply.
+_PENDING_INTERACTION_STATUSES = frozenset({'queued', 'in_progress'})
 
-def convert_part_to_interaction_content(part: types.Part) -> Optional[dict]:
+# Poll schedule for a pending interaction. Starts short so a brief queue wait
+# is not padded much, then backs off so a long one costs few requests.
+_POLL_INITIAL_DELAY_SECONDS = 5.0
+_POLL_MAX_DELAY_SECONDS = 30.0
+
+# Consecutive failed reads to absorb before giving up on a pending
+# interaction. A failed poll is not like a failed create: the work is already
+# accepted and running, and nothing on the client can resume it once the id is
+# lost, so one blip would forfeit a job that keeps running and billing. The
+# count resets on every successful read, so this tolerates repeated blips
+# across a long wait while still surfacing an endpoint that is truly down.
+_POLL_MAX_CONSECUTIVE_ERRORS = 5
+
+# Sampling knobs the interactions API applies, but that only some google-genai
+# releases declare on the request model (2.26 added temperature and top_p).
+# That model discards keys it has no field for while serializing, so an
+# undeclared one never reaches the API and sending it is indistinguishable from
+# never setting it. The split is read from the installed release, because the
+# supported google-genai range spans releases on both sides of it. 2.26 already
+# marks both new fields deprecated on its GenerationConfig model, so a later
+# release may remove them again; they then fall back to being dropped with the
+# warning below.
+_CLIENT_DEPENDENT_SAMPLING_PARAMS = (
+    'temperature',
+    'top_p',
+    'top_k',
+)
+_DECLARED_GENERATION_CONFIG_KEYS = (
+    GenerationConfigParam.__required_keys__
+    | GenerationConfigParam.__optional_keys__
+)
+_DECLARED_SAMPLING_PARAMS = tuple(
+    name
+    for name in _CLIENT_DEPENDENT_SAMPLING_PARAMS
+    if name in _DECLARED_GENERATION_CONFIG_KEYS
+)
+_UNDECLARED_SAMPLING_PARAMS = tuple(
+    name
+    for name in _CLIENT_DEPENDENT_SAMPLING_PARAMS
+    if name not in _DECLARED_GENERATION_CONFIG_KEYS
+)
+
+# Sampling knobs the interactions API itself rejects as unknown parameters.
+# No release of the client can carry these, so the caller has to stop setting
+# them or stop using the interactions API.
+_UNSUPPORTED_SAMPLING_PARAMS = (
+    'presence_penalty',
+    'frequency_penalty',
+)
+
+# Sampling knobs already reported as dropped, so each warning below is emitted
+# once per process instead of once per model turn.
+_WARNED_SAMPLING_PARAMS: set[str] = set()
+
+
+def _extract_stream_interaction_id(
+    event: InteractionSSEEvent,
+) -> str | None:
+  """Extract the interaction ID from an Interactions SSE event.
+
+  Different SSE lifecycle events expose the interaction ID on different
+  attributes. We normalize them here so streamed ADK responses consistently
+  carry the chain identifier needed for follow-up tool calls. Older
+  google-genai builds may also yield a legacy ``interaction`` event with a
+  top-level ``id``.
+  """
+  if isinstance(event, InteractionStatusUpdate):
+    return event.interaction_id
+
+  if isinstance(event, (InteractionCreatedEvent, InteractionCompletedEvent)):
+    return event.interaction.id
+
+  if isinstance(event, Interaction):
+    return event.id
+
+  return None
+
+
+def _extract_stream_environment_id(
+    event: InteractionSSEEvent,
+) -> str | None:
+  """Extract the environment id from an Interactions SSE event, if present.
+
+  The non-streaming ``Interaction`` declares an ``environment_id`` field. On
+  streaming SSE events the id is read opportunistically from the carried
+  interaction (created/completed events allow extra fields), so it is returned
+  only when the API actually includes it and is ``None`` otherwise.
+  """
+  interaction = None
+  if isinstance(event, (InteractionCreatedEvent, InteractionCompletedEvent)):
+    interaction = event.interaction
+  elif isinstance(event, Interaction):
+    interaction = event
+
+  if interaction is None:
+    return None
+
+  env_id = getattr(interaction, 'environment_id', None)
+  return env_id if isinstance(env_id, str) else None
+
+
+def _encode_base64_string(data: bytes) -> str:
+  """Encode bytes to a base64 string."""
+  return base64.b64encode(data).decode('utf-8')
+
+
+def _wrap_content_param_in_step(
+    content_param: ContentParam, role: str
+) -> StepParam:
+  """Wraps a ContentParam into a UserInputStepParam or ModelOutputStepParam."""
+  if role == 'model':
+    return ModelOutputStepParam(type='model_output', content=[content_param])
+  return UserInputStepParam(type='user_input', content=[content_param])
+
+
+@deprecated(
+    'convert_part_to_interaction_content is deprecated and will be removed in'
+    ' future versions'
+)
+def convert_part_to_interaction_content(
+    part: types.Part,
+) -> dict[str, Any] | None:
   """Convert a types.Part to an interaction content dict.
 
   Args:
@@ -81,12 +264,12 @@ def convert_part_to_interaction_content(part: types.Part) -> Optional[dict]:
       ).decode('utf-8')
     return result
   elif part.function_response is not None:
-    # Convert the function response to a string for the interactions API
-    # The interactions API expects result to be either a string or items list
+    # Pass the function response through to the interactions API.
+    # Dict and list values are passed directly — the Interactions API handles
+    # JSON serialization internally. Pre-serializing with json.dumps() would
+    # cause double-escaping.
     result = part.function_response.response
-    if isinstance(result, dict):
-      result = json.dumps(result)
-    elif not isinstance(result, str):
+    if not isinstance(result, (dict, str, list)):
       result = str(result)
     logger.debug(
         'Converting function_response: name=%s, call_id=%s',
@@ -154,12 +337,12 @@ def convert_part_to_interaction_content(part: types.Part) -> Optional[dict]:
   elif part.thought:
     # part.thought is a boolean indicating this is a thought part
     # ThoughtContentParam expects 'signature' (base64 encoded bytes)
-    result: dict[str, Any] = {'type': 'thought'}
+    thought_result: dict[str, Any] = {'type': 'thought'}
     if part.thought_signature is not None:
-      result['signature'] = base64.b64encode(part.thought_signature).decode(
-          'utf-8'
-      )
-    return result
+      thought_result['signature'] = base64.b64encode(
+          part.thought_signature
+      ).decode('utf-8')
+    return thought_result
   elif part.code_execution_result is not None:
     is_error = part.code_execution_result.outcome in (
         types.Outcome.OUTCOME_FAILED,
@@ -183,45 +366,180 @@ def convert_part_to_interaction_content(part: types.Part) -> Optional[dict]:
   return None
 
 
-def convert_content_to_turn(content: types.Content) -> TurnParam:
-  """Convert a types.Content to a TurnParam dict for interactions API.
+def _convert_part_to_interaction_content(
+    part: types.Part,
+    role: str = 'user',
+) -> StepParam | None:
+  """Convert a types.Part to an interaction content dict.
+
+  Args:
+    part: The Part object to convert.
+    role: The role to wrap the content in ('user' or 'model').
+
+  Returns:
+    A StepParam dict representing the interaction content, or None if
+    the part type is not supported.
+  """
+  if part.text is not None:
+    return _wrap_content_param_in_step(
+        TextContentParam(type='text', text=part.text), role
+    )
+  elif part.function_call is not None:
+    return FunctionCallStepParam(
+        type='function_call',
+        id=part.function_call.id or '',
+        name=part.function_call.name or '',
+        arguments=part.function_call.args or {},
+    )
+  elif part.function_response is not None:
+
+    # genai.types.FunctionResponse specifies that
+    # an error response should be inside an error key
+    func_resp = part.function_response.response
+    is_error = False
+    if isinstance(func_resp, dict) and 'error' in func_resp:
+      is_error = True
+
+    # Pass the function response through to the interactions API.
+    # Dict and list values are passed directly — the Interactions API handles
+    # JSON serialization internally. Pre-serializing with json.dumps() would
+    # cause double-escaping.
+    if not isinstance(func_resp, (dict, str, list)):
+      func_resp = str(func_resp)
+    logger.debug(
+        'Converting function_response: name=%s, call_id=%s',
+        part.function_response.name,
+        part.function_response.id,
+    )
+    return FunctionResultStepParam(
+        type='function_result',
+        name=part.function_response.name or '',
+        call_id=part.function_response.id or '',
+        result=func_resp,
+        is_error=is_error,
+    )
+  elif part.inline_data is not None:
+    mime_type = part.inline_data.mime_type or ''
+    # The interactions API requires inline data to be a base64 encoded string
+    # when serialized to JSON, otherwise openapi_dumps will raise a TypeError.
+    data = part.inline_data.data
+    if isinstance(data, bytes):
+      data = _encode_base64_string(data)
+
+    if mime_type.startswith('image/'):
+      return _wrap_content_param_in_step(
+          ImageContentParam(type='image', data=data, mime_type=mime_type), role
+      )
+    elif mime_type.startswith('audio/'):
+      return _wrap_content_param_in_step(
+          AudioContentParam(type='audio', data=data, mime_type=mime_type), role
+      )
+    elif mime_type.startswith('video/'):
+      return _wrap_content_param_in_step(
+          VideoContentParam(type='video', data=data, mime_type=mime_type), role
+      )
+    else:
+      return _wrap_content_param_in_step(
+          DocumentContentParam(type='document', data=data, mime_type=mime_type),
+          role,
+      )
+  elif part.file_data is not None:
+    mime_type = part.file_data.mime_type or ''
+    if mime_type.startswith('image/'):
+      return _wrap_content_param_in_step(
+          ImageContentParam(
+              type='image', uri=part.file_data.file_uri, mime_type=mime_type
+          ),
+          role,
+      )
+    elif mime_type.startswith('audio/'):
+      return _wrap_content_param_in_step(
+          AudioContentParam(
+              type='audio', uri=part.file_data.file_uri, mime_type=mime_type
+          ),
+          role,
+      )
+    elif mime_type.startswith('video/'):
+      return _wrap_content_param_in_step(
+          VideoContentParam(
+              type='video', uri=part.file_data.file_uri, mime_type=mime_type
+          ),
+          role,
+      )
+    else:
+      return _wrap_content_param_in_step(
+          DocumentContentParam(
+              type='document', uri=part.file_data.file_uri, mime_type=mime_type
+          ),
+          role,
+      )
+  elif part.thought:
+    # part.thought is a boolean indicating this is a thought part
+    # ThoughtContentParam expects 'signature' (base64 encoded bytes)
+    thought_result = ThoughtStepParam(type='thought')
+    if part.thought_signature is not None:
+      thought_result['signature'] = _encode_base64_string(
+          part.thought_signature
+      )
+    return thought_result
+  elif part.code_execution_result is not None:
+    is_error = part.code_execution_result.outcome in (
+        types.Outcome.OUTCOME_FAILED,
+        types.Outcome.OUTCOME_DEADLINE_EXCEEDED,
+    )
+    return CodeExecutionResultStepParam(
+        type='code_execution_result',
+        call_id='',
+        result=part.code_execution_result.output or '',
+        is_error=is_error,
+    )
+  elif part.executable_code is not None:
+    return CodeExecutionCallStepParam(
+        type='code_execution_call',
+        id='',
+        arguments={
+            'code': part.executable_code.code,
+            'language': part.executable_code.language,
+        },
+    )
+  return None
+
+
+def _convert_content_to_step(content: types.Content) -> list[StepParam]:
+  """Convert a types.Content to a list of StepParam dicts for interactions API.
 
   Args:
     content: The Content object to convert.
 
   Returns:
-    A TurnParam dictionary for the interactions API.
+    A list of StepParam dictionaries for the interactions API.
   """
-  contents = []
+  steps: list[StepParam] = []
+
+  role = content.role or 'user'
   if content.parts:
     for part in content.parts:
-      interaction_content = convert_part_to_interaction_content(part)
+      interaction_content = _convert_part_to_interaction_content(part, role)
       if interaction_content:
-        contents.append(interaction_content)
+        steps.append(interaction_content)
 
-  return {
-      'role': content.role or 'user',
-      'content': contents,
-  }
+  return steps
 
 
-def convert_contents_to_turns(
+def _convert_contents_to_steps(
     contents: list[types.Content],
-) -> list[TurnParam]:
+) -> list[StepParam]:
   """Convert a list of Content objects to interactions API input format.
 
   Args:
     contents: The list of Content objects to convert.
 
   Returns:
-    A list of TurnParam dictionaries for the interactions API.
+    A list of StepParam dictionaries for the interactions API.
   """
-  turns = []
-  for content in contents:
-    turn = convert_content_to_turn(content)
-    if turn['content']:  # Only add turns with content
-      turns.append(turn)
-  return turns
+  return [
+      step for content in contents for step in _convert_content_to_step(content)
+  ]
 
 
 def convert_tools_config_to_interactions_format(
@@ -246,7 +564,7 @@ def convert_tools_config_to_interactions_format(
     # Handle function declarations
     if tool.function_declarations:
       for func_decl in tool.function_declarations:
-        func_tool: dict[str, Any] = {
+        func_tool: FunctionParam = {
             'type': 'function',
             'name': func_decl.name,
         }
@@ -258,14 +576,14 @@ def convert_tools_config_to_interactions_format(
             props = {}
             for k, v in func_decl.parameters.properties.items():
               props[k] = v.model_dump(exclude_none=True)
-            func_tool['parameters'] = {
+
+            params_dict: dict[str, object] = {
                 'type': 'object',
                 'properties': props,
             }
             if func_decl.parameters.required:
-              func_tool['parameters']['required'] = list(
-                  func_decl.parameters.required
-              )
+              params_dict['required'] = list(func_decl.parameters.required)
+            func_tool['parameters'] = params_dict
         elif func_decl.parameters_json_schema:
           func_tool['parameters'] = func_decl.parameters_json_schema
         interaction_tools.append(func_tool)
@@ -289,115 +607,184 @@ def convert_tools_config_to_interactions_format(
   return interaction_tools
 
 
-def convert_interaction_output_to_part(output: Output) -> Optional[types.Part]:
-  """Convert an interaction output content to a types.Part.
+def _build_mcp_server_param(
+    server: RemoteMcpServer,
+    resolved_headers: dict[str, str],
+) -> MCPServerParam:
+  """Map a RemoteMcpServer + resolved headers to an interactions MCPServerParam.
+
+  Built directly (not via ``types.McpServer``) so ``allowed_tools`` can be
+  carried and the "not supported in Vertex AI" restriction on
+  ``types.Tool.mcp_servers`` is avoided. ``resolved_headers`` is the static
+  headers already merged with any ``header_provider`` output by the caller.
+  """
+  param: MCPServerParam = {'type': 'mcp_server', 'url': server.url}
+  if server.name is not None:
+    param['name'] = server.name
+  if resolved_headers:
+    param['headers'] = resolved_headers
+  if server.allowed_tools is not None:
+    param['allowed_tools'] = [{'tools': list(server.allowed_tools)}]
+  return param
+
+
+def _function_result_to_response(
+    result: BaseModel | dict[str, Any] | list[Any] | str,
+) -> dict[str, Any]:
+  """Convert a FunctionResultStep result into a FunctionResponse dict.
+
+  The Interactions API types the result as a model, a list of content blocks,
+  or a plain string, but types.FunctionResponse.response requires a dict. A
+  dict is returned as-is; other non-dict shapes are wrapped under a 'result'
+  key.
+  """
+  if isinstance(result, dict):
+    return result
+  if isinstance(result, BaseModel):
+    return result.model_dump()
+  if isinstance(result, list):
+    items: list[Any] = []
+    for item in result:
+      if isinstance(item, BaseModel):
+        items.append(item.model_dump())
+      else:
+        items.append(item)
+    return {'result': items}
+  return {'result': result}
+
+
+def _convert_interaction_step_to_parts(step: Step) -> list[types.Part]:
+  """Convert an interaction output content to a list of types.Part.
 
   Args:
     output: The interaction output object to convert.
 
   Returns:
-    A types.Part object, or None if the output type is not supported.
+    A list of types.Part objects.
   """
-  if not hasattr(output, 'type'):
-    return None
+  if isinstance(step, ModelOutputStep):
+    if not step.content:
+      return []
 
-  output_type = output.type
-
-  if output_type == 'text':
-    return types.Part.from_text(text=output.text or '')
-  elif output_type == 'function_call':
+    parts = []
+    for content in step.content:
+      if content.type == 'text':
+        parts.append(types.Part.from_text(text=content.text))
+      elif content.type in ['image', 'audio', 'document', 'video']:
+        if content.data:
+          parts.append(
+              types.Part(
+                  inline_data=types.Blob(
+                      data=content.data,
+                      mime_type=content.mime_type,
+                  )
+              )
+          )
+        elif content.uri:
+          parts.append(
+              types.Part(
+                  file_data=types.FileData(
+                      file_uri=content.uri,
+                      mime_type=content.mime_type,
+                  )
+              )
+          )
+    return parts
+  elif isinstance(step, FunctionCallStep):
     logger.debug(
         'Converting function_call output: name=%s, id=%s',
-        output.name,
-        output.id,
+        step.name,
+        step.id,
     )
-    thought_signature = None
-    thought_sig_value = getattr(output, 'thought_signature', None)
-    if thought_sig_value and isinstance(thought_sig_value, str):
-      # Decode base64 string back to bytes
-      thought_signature = base64.b64decode(thought_sig_value)
-    return types.Part(
-        function_call=types.FunctionCall(
-            id=output.id,
-            name=output.name,
-            args=output.arguments or {},
-        ),
-        thought_signature=thought_signature,
-    )
-  elif output_type == 'function_result':
-    result = output.result
-    # Handle different result formats
-    if isinstance(result, str):
-      result_value = result
-    elif hasattr(result, 'items'):
-      result_value = result.items
-    else:
-      result_value = result
-    return types.Part(
-        function_response=types.FunctionResponse(
-            id=output.call_id,
-            response=result_value,
+    return [
+        types.Part(
+            function_call=types.FunctionCall(
+                id=step.id,
+                name=step.name,
+                args=step.arguments or {},
+            ),
         )
-    )
-  elif output_type == 'image':
-    if output.data:
-      return types.Part(
-          inline_data=types.Blob(
-              data=output.data,
-              mime_type=output.mime_type,
-          )
-      )
-    elif output.uri:
-      return types.Part(
-          file_data=types.FileData(
-              file_uri=output.uri,
-              mime_type=output.mime_type,
-          )
-      )
-  elif output_type == 'audio':
-    if output.data:
-      return types.Part(
-          inline_data=types.Blob(
-              data=output.data,
-              mime_type=output.mime_type,
-          )
-      )
-    elif output.uri:
-      return types.Part(
-          file_data=types.FileData(
-              file_uri=output.uri,
-              mime_type=output.mime_type,
-          )
-      )
-  elif output_type == 'thought':
-    # ThoughtContent has a 'signature' attribute, not 'thought'
-    # These are internal model reasoning and typically not exposed as Parts
-    # Skip thought outputs for now
-    return None
-  elif output_type == 'code_execution_result':
-    return types.Part(
-        code_execution_result=types.CodeExecutionResult(
-            output=output.result or '',
-            outcome=types.Outcome.OUTCOME_FAILED
-            if output.is_error
-            else types.Outcome.OUTCOME_OK,
+    ]
+  elif isinstance(step, FunctionResultStep):
+    return [
+        types.Part(
+            function_response=types.FunctionResponse(
+                id=step.call_id or '',
+                name=step.name,
+                response=_function_result_to_response(step.result),
+            )
         )
-    )
-  elif output_type == 'code_execution_call':
-    args = output.arguments or {}
-    return types.Part(
-        executable_code=types.ExecutableCode(
-            code=args.get('code', ''),
-            language=args.get('language', 'PYTHON'),
+    ]
+  elif isinstance(step, ThoughtStep):
+    # Gemini 3 rejects the follow-up unless this signature is echoed back.
+    # Keep it on a part of its own: a part that also carries text is
+    # re-encoded as a text step, which drops the signature.
+    if step.signature:
+      return [
+          types.Part(
+              thought=True,
+              thought_signature=base64.b64decode(step.signature),
+          )
+      ]
+    return []
+  elif isinstance(step, CodeExecutionResultStep):
+    return [
+        types.Part(
+            code_execution_result=types.CodeExecutionResult(
+                output=step.result or '',
+                outcome=types.Outcome.OUTCOME_FAILED
+                if step.is_error
+                else types.Outcome.OUTCOME_OK,
+            )
         )
-    )
-  elif output_type == 'google_search_result':
+    ]
+  elif isinstance(step, CodeExecutionCallStep):
+    args = step.arguments
+    return [
+        types.Part(
+            executable_code=types.ExecutableCode(
+                code=args.code,
+                language=types.Language.PYTHON
+                if args.language and args.language.lower() == 'python'
+                else types.Language.LANGUAGE_UNSPECIFIED,
+            )
+        )
+    ]
+  elif isinstance(step, GoogleSearchResultStep):
     # For google search results, we create a text part with the results
-    if output.result:
-      results_text = '\n'.join(str(r) for r in output.result if r)
-      return types.Part.from_text(text=results_text)
+    if step.result:
+      results_text = '\n'.join(str(r) for r in step.result if r)
+      return [types.Part.from_text(text=results_text)]
 
-  return None
+  return []
+
+
+def _usage_metadata_from_interaction(
+    interaction: Interaction,
+) -> types.GenerateContentResponseUsageMetadata | None:
+  """Build usage metadata from an interaction's usage, if present.
+
+  Shared by the non-streaming converter and the streaming final-event branch so
+  both surface token counts identically. ``InteractionSseEventInteraction`` (the
+  type carried by ``InteractionCompletedEvent``) also exposes ``usage``, so this
+  accepts either interaction type.
+  """
+  usage = interaction.usage
+  if not usage:
+    return None
+  # Prefer the total the API reports: it also covers thought and tool-use
+  # tokens, which input + output alone undercounts. Fall back to the sum only
+  # when the API omits the total.
+  total_token_count = usage.total_tokens
+  if total_token_count is None:
+    total_token_count = (usage.total_input_tokens or 0) + (
+        usage.total_output_tokens or 0
+    )
+  return types.GenerateContentResponseUsageMetadata(
+      prompt_token_count=usage.total_input_tokens,
+      candidates_token_count=usage.total_output_tokens,
+      total_token_count=total_token_count,
+  )
 
 
 def convert_interaction_to_llm_response(
@@ -413,13 +800,15 @@ def convert_interaction_to_llm_response(
   """
   from .llm_response import LlmResponse
 
-  # Check for errors
+  # Check for errors. Lifecycle SSE events carry a partial interaction
+  # (InteractionSseEventInteraction) that has no 'error' attribute.
   if interaction.status == 'failed':
     error_msg = 'Unknown error'
     error_code = 'UNKNOWN_ERROR'
-    if interaction.error:
-      error_msg = interaction.error.message or error_msg
-      error_code = interaction.error.code or error_code
+    error = getattr(interaction, 'error', None)
+    if error:
+      error_msg = error.message or error_msg
+      error_code = error.code or error_code
     return LlmResponse(
         error_code=error_code,
         error_message=error_msg,
@@ -428,27 +817,17 @@ def convert_interaction_to_llm_response(
 
   # Convert outputs to Content parts
   parts = []
-  if interaction.outputs:
-    for output in interaction.outputs:
-      part = convert_interaction_output_to_part(output)
-      if part:
-        parts.append(part)
+  if interaction.steps:
+    for step in interaction.steps:
+      step_parts = _convert_interaction_step_to_parts(step)
+      if step_parts:
+        parts.extend(step_parts)
 
   content = None
   if parts:
     content = types.Content(role='model', parts=parts)
 
-  # Convert usage metadata if available
-  usage_metadata = None
-  if interaction.usage:
-    usage_metadata = types.GenerateContentResponseUsageMetadata(
-        prompt_token_count=interaction.usage.total_input_tokens,
-        candidates_token_count=interaction.usage.total_output_tokens,
-        total_token_count=(
-            (interaction.usage.total_input_tokens or 0)
-            + (interaction.usage.total_output_tokens or 0)
-        ),
-    )
+  usage_metadata = _usage_metadata_from_interaction(interaction)
 
   # Determine finish reason based on status.
   # Interaction status can be: 'completed', 'requires_action', 'failed', or
@@ -469,131 +848,475 @@ def convert_interaction_to_llm_response(
   )
 
 
+@dataclasses.dataclass
+class _StreamState:
+  """Accumulates streamed parts and grounding data across SSE events.
+
+  ``parts`` collects ``types.Part``s in arrival order to assemble the final
+  ``Content``. The grounding fields accumulate google_search / citation data
+  that maps to ``grounding_metadata`` (a top-level ``LlmResponse`` field, not a
+  part) so it can be reattached to the final, persisted event.
+  """
+
+  parts: list[types.Part] = dataclasses.field(default_factory=list)
+  # Maps a function-call step's ``index`` to the part started at that step, so
+  # interleaved calls route their argument deltas and stops to the matching
+  # step instead of always landing on the most recently started call.
+  fc_parts_by_index: dict[int, types.Part] = dataclasses.field(
+      default_factory=dict
+  )
+  web_search_queries: list[str] = dataclasses.field(default_factory=list)
+  grounding_chunks: list[types.GroundingChunk] = dataclasses.field(
+      default_factory=list
+  )
+  grounding_supports: list[types.GroundingSupport] = dataclasses.field(
+      default_factory=list
+  )
+  search_entry_point: types.SearchEntryPoint | None = None
+
+
+def _partial_part_response(
+    part: types.Part, interaction_id: str | None
+) -> LlmResponse:
+  """Build a partial streaming LlmResponse carrying a single content part."""
+  return LlmResponse(
+      content=types.Content(role='model', parts=[part]),
+      partial=True,
+      turn_complete=False,
+      interaction_id=interaction_id,
+  )
+
+
+def _partial_grounding_response(
+    grounding_metadata: types.GroundingMetadata, interaction_id: str | None
+) -> LlmResponse:
+  """Build a partial streaming LlmResponse carrying incremental grounding."""
+  return LlmResponse(
+      grounding_metadata=grounding_metadata,
+      partial=True,
+      turn_complete=False,
+      interaction_id=interaction_id,
+  )
+
+
+def _handle_text(
+    delta: TextDelta, state: _StreamState, interaction_id: str | None
+) -> LlmResponse | None:
+  text = delta.text
+  if not text:
+    return None
+  part = types.Part.from_text(text=text)
+  state.parts.append(part)
+  return _partial_part_response(part, interaction_id)
+
+
+def _handle_media(
+    delta: ImageDelta | AudioDelta | VideoDelta | DocumentDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+) -> LlmResponse | None:
+  """Handle image/audio/video/document deltas (shared data/uri/mime_type)."""
+  data = delta.data
+  uri = delta.uri
+  mime_type = delta.mime_type
+  if not data and not uri:
+    return None
+  if data:
+    part = types.Part(inline_data=types.Blob(data=data, mime_type=mime_type))
+  else:
+    part = types.Part(
+        file_data=types.FileData(file_uri=uri, mime_type=mime_type)
+    )
+  state.parts.append(part)
+  return _partial_part_response(part, interaction_id)
+
+
+def _resolve_streaming_function_call_part(
+    index: int | None, state: _StreamState
+) -> types.Part | None:
+  """Resolve the function-call part a streaming event applies to.
+
+  Streaming events carry the ``index`` of the step they belong to. When that
+  index maps to a known function-call part we use it directly, so argument
+  deltas and step stops for interleaved calls route to the correct step instead
+  of always landing on the most recently started call. Events without an index
+  (or from builds that don't track one) fall back to the last started function
+  call to preserve the previous behavior.
+  """
+  if index is not None:
+    return state.fc_parts_by_index.get(index)
+  if state.parts and state.parts[-1].function_call:
+    return state.parts[-1]
+  return None
+
+
+def _handle_arguments_delta(
+    delta: ArgumentsDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+    index: int | None = None,
+) -> LlmResponse | None:
+  target_part = _resolve_streaming_function_call_part(index, state)
+  if target_part is None or not target_part.function_call:
+    logger.warning(
+        'Interactions streaming converter dropped an arguments delta: step'
+        ' index %r has no function-call part; skipping.',
+        index,
+    )
+    return None
+  delta_args = delta.arguments
+  if delta_args is None:
+    return None
+  if target_part.function_call.partial_args is None:
+    logger.warning(
+        'Interactions streaming converter dropped an arguments delta: step'
+        ' index %r was already finalized; skipping.',
+        index,
+    )
+    return None
+  target_part.function_call.partial_args.append(
+      types.PartialArg(string_value=delta_args)
+  )
+  chunk_part = types.Part(
+      function_call=types.FunctionCall(
+          name=target_part.function_call.name,
+          partial_args=[types.PartialArg(string_value=delta_args)],
+      )
+  )
+  return _partial_part_response(chunk_part, interaction_id)
+
+
+def _handle_unknown_delta(
+    delta: StepDeltaData, state: _StreamState, interaction_id: str | None
+) -> LlmResponse | None:
+  """Generic fallback: log the unhandled delta, emit nothing."""
+  if isinstance(delta, UnknownStepDeltaData):
+    # Forward-compat surprise: preserve the raw payload so it isn't lost.
+    logger.warning(
+        'Interactions streaming converter received unrecognized step delta;'
+        ' skipping (no event emitted). raw=%r',
+        delta.raw,
+    )
+  else:
+    # Known delta type we deliberately don't handle yet: keep log noise low.
+    logger.debug(
+        'Interactions streaming converter received unhandled step delta type'
+        ' %r; skipping (no event emitted).',
+        delta.type,
+    )
+  return None
+
+
+def _handle_thought_summary(
+    delta: ThoughtSummaryDelta, state: _StreamState, interaction_id: str | None
+) -> LlmResponse | None:
+  content = delta.content
+  text = content.text if isinstance(content, TextContent) else None
+  if not text:
+    return None
+  part = types.Part(text=text, thought=True)
+  state.parts.append(part)
+  return _partial_part_response(part, interaction_id)
+
+
+def _handle_thought_signature(
+    delta: ThoughtSignatureDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+) -> LlmResponse | None:
+  signature = delta.signature
+  if not signature:
+    return None
+  for part in reversed(state.parts):
+    if part.thought:
+      part.thought_signature = base64.b64decode(signature)
+      return None
+  # A signature often arrives with no preceding thought summary, leaving no
+  # part to attach it to. Keep it on its own part rather than dropping it.
+  state.parts.append(
+      types.Part(thought=True, thought_signature=base64.b64decode(signature))
+  )
+  return None
+
+
+def _handle_code_execution_call(
+    delta: CodeExecutionCallDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+) -> LlmResponse | None:
+  args = delta.arguments
+  code = args.code if args else None
+  if not code:
+    return None
+  language = (
+      types.Language.PYTHON
+      if args.language and args.language.lower() == 'python'
+      else types.Language.LANGUAGE_UNSPECIFIED
+  )
+  part = types.Part(
+      executable_code=types.ExecutableCode(code=code, language=language)
+  )
+  state.parts.append(part)
+  return _partial_part_response(part, interaction_id)
+
+
+def _handle_code_execution_result(
+    delta: CodeExecutionResultDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+) -> LlmResponse | None:
+  part = types.Part(
+      code_execution_result=types.CodeExecutionResult(
+          output=delta.result or '',
+          outcome=types.Outcome.OUTCOME_FAILED
+          if delta.is_error
+          else types.Outcome.OUTCOME_OK,
+      )
+  )
+  state.parts.append(part)
+  return _partial_part_response(part, interaction_id)
+
+
+def _handle_google_search_call(
+    delta: GoogleSearchCallDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+) -> LlmResponse | None:
+  queries = delta.arguments.queries if delta.arguments else None
+  if not queries:
+    return None
+  state.web_search_queries.extend(queries)
+  grounding_metadata = types.GroundingMetadata(web_search_queries=list(queries))
+  return _partial_grounding_response(grounding_metadata, interaction_id)
+
+
+def _handle_google_search_result(
+    delta: GoogleSearchResultDelta,
+    state: _StreamState,
+    interaction_id: str | None,
+) -> LlmResponse | None:
+  rendered = None
+  for search_result in delta.result or []:
+    if search_result.search_suggestions:
+      rendered = search_result.search_suggestions
+      break
+  if not rendered:
+    return None
+  entry_point = types.SearchEntryPoint(rendered_content=rendered)
+  state.search_entry_point = entry_point
+  grounding_metadata = types.GroundingMetadata(search_entry_point=entry_point)
+  return _partial_grounding_response(grounding_metadata, interaction_id)
+
+
+def _handle_text_annotation(
+    delta: TextAnnotationDelta, state: _StreamState, interaction_id: str | None
+) -> LlmResponse | None:
+  new_chunks: list[types.GroundingChunk] = []
+  new_supports: list[types.GroundingSupport] = []
+  for annotation in delta.annotations or []:
+    if not isinstance(annotation, URLCitation):
+      continue
+    chunk_index = len(state.grounding_chunks) + len(new_chunks)
+    new_chunks.append(
+        types.GroundingChunk(
+            web=types.GroundingChunkWeb(
+                uri=annotation.url, title=annotation.title
+            )
+        )
+    )
+    new_supports.append(
+        types.GroundingSupport(
+            segment=types.Segment(
+                start_index=annotation.start_index,
+                end_index=annotation.end_index,
+            ),
+            grounding_chunk_indices=[chunk_index],
+        )
+    )
+  if not new_chunks:
+    return None
+  state.grounding_chunks.extend(new_chunks)
+  state.grounding_supports.extend(new_supports)
+  grounding_metadata = types.GroundingMetadata(
+      grounding_chunks=new_chunks,
+      grounding_supports=new_supports,
+  )
+  return _partial_grounding_response(grounding_metadata, interaction_id)
+
+
+def _handle_function_result(
+    delta: FunctionResultDelta, state: _StreamState, interaction_id: str | None
+) -> LlmResponse | None:
+  part = types.Part(
+      function_response=types.FunctionResponse(
+          id=delta.call_id or '',
+          name=delta.name,
+          response=_function_result_to_response(delta.result),
+      )
+  )
+  state.parts.append(part)
+  return _partial_part_response(part, interaction_id)
+
+
+def _build_grounding_metadata(
+    state: _StreamState,
+) -> types.GroundingMetadata | None:
+  if not (
+      state.web_search_queries
+      or state.grounding_chunks
+      or state.grounding_supports
+      or state.search_entry_point
+  ):
+    return None
+  return types.GroundingMetadata(
+      web_search_queries=state.web_search_queries or None,
+      grounding_chunks=state.grounding_chunks or None,
+      grounding_supports=state.grounding_supports or None,
+      search_entry_point=state.search_entry_point,
+  )
+
+
 def convert_interaction_event_to_llm_response(
     event: InteractionSSEEvent,
-    aggregated_parts: list[types.Part],
-    interaction_id: Optional[str] = None,
-) -> Optional[LlmResponse]:
+    state: _StreamState,
+    interaction_id: str | None = None,
+) -> LlmResponse | None:
   """Convert an InteractionSSEEvent to an LlmResponse for streaming.
 
   Args:
     event: The streaming event from interactions API.
-    aggregated_parts: List to accumulate parts across events.
+    state: Accumulates parts and grounding data across streamed events.
     interaction_id: The interaction ID to include in responses.
 
   Returns:
     LlmResponse if this event produces one, None otherwise.
   """
-  from .llm_response import LlmResponse
 
-  event_type = getattr(event, 'event_type', None)
+  if isinstance(event, StepStart):
 
-  if event_type == 'content.delta':
-    delta = event.delta
-    if delta is None:
-      return None
+    # Streaming function calls follow a sequence of events (https://ai.google.dev/gemini-api/docs/interactions-breaking-changes-may-2026#streaming):
+    # 1. StepStart: Delivers the function id and name.
+    # 2. StepDelta (multiple): Streams arguments as raw JSON strings via arguments.
+    # 3. StepStop: Signals the end of the step, where arguments are finalized and parsed.
+    if isinstance(event.step, FunctionCallStep):
+      fc = types.FunctionCall(
+          id=event.step.id,
+          name=event.step.name,
+          partial_args=[],
+      )
+      part = types.Part(function_call=fc)
+      state.parts.append(part)
+      if event.index is not None:
+        state.fc_parts_by_index[event.index] = part
 
-    delta_type = getattr(delta, 'type', None)
-
-    if delta_type == 'text':
-      text = delta.text or ''
-      if text:
-        part = types.Part.from_text(text=text)
-        aggregated_parts.append(part)
-        return LlmResponse(
-            content=types.Content(role='model', parts=[part]),
-            partial=True,
-            turn_complete=False,
-            interaction_id=interaction_id,
-        )
-
-    elif delta_type == 'function_call':
-      # Function calls are typically sent as complete units
-      # DON'T yield immediately - add to aggregated_parts only.
-      # The function_call will be yielded in the final response which has
-      # the correct interaction_id. If we yield here, interaction_id may be
-      # None because SSE streams the id later in the 'interaction' event.
-      if delta.name:
-        thought_signature = None
-        thought_sig_value = getattr(delta, 'thought_signature', None)
-        if thought_sig_value and isinstance(thought_sig_value, str):
-          # Decode base64 string back to bytes
-          thought_signature = base64.b64decode(thought_sig_value)
-        part = types.Part(
-            function_call=types.FunctionCall(
-                id=delta.id or '',
-                name=delta.name,
-                args=delta.arguments or {},
-            ),
-            thought_signature=thought_signature,
-        )
-        aggregated_parts.append(part)
-        # Return None - function_call will be in the final aggregated response
-        return None
-
-    elif delta_type == 'image':
-      if delta.data or delta.uri:
-        if delta.data:
-          part = types.Part(
-              inline_data=types.Blob(
-                  data=delta.data,
-                  mime_type=delta.mime_type,
-              )
-          )
-        else:
-          part = types.Part(
-              file_data=types.FileData(
-                  file_uri=delta.uri,
-                  mime_type=delta.mime_type,
-              )
-          )
-        aggregated_parts.append(part)
-        return LlmResponse(
-            content=types.Content(role='model', parts=[part]),
-            partial=False,
-            turn_complete=False,
-            interaction_id=interaction_id,
-        )
-
-  elif event_type == 'content.stop':
-    # Content streaming finished, return aggregated content
-    if aggregated_parts:
       return LlmResponse(
-          content=types.Content(role='model', parts=list(aggregated_parts)),
-          partial=False,
+          content=types.Content(role='model', parts=[part]),
+          partial=True,
           turn_complete=False,
           interaction_id=interaction_id,
       )
 
-  elif event_type == 'interaction':
-    # Final interaction event with complete data
-    return convert_interaction_to_llm_response(event)
+  elif isinstance(event, StepDelta):
+    delta = event.delta
 
-  elif event_type == 'interaction.status_update':
-    status = getattr(event, 'status', None)
-    if status in ('completed', 'requires_action'):
+    # Dispatch on the delta class, not on its ``type`` tag, so each handler can
+    # declare the one delta it reads. A renamed class fails at import; a renamed
+    # tag string would leave a branch that silently never matches.
+    if isinstance(delta, TextDelta):
+      return _handle_text(delta, state, interaction_id)
+    elif isinstance(delta, ThoughtSummaryDelta):
+      return _handle_thought_summary(delta, state, interaction_id)
+    elif isinstance(delta, ThoughtSignatureDelta):
+      return _handle_thought_signature(delta, state, interaction_id)
+    elif isinstance(delta, (ImageDelta, AudioDelta, VideoDelta, DocumentDelta)):
+      return _handle_media(delta, state, interaction_id)
+    elif isinstance(delta, ArgumentsDelta):
+      return _handle_arguments_delta(delta, state, interaction_id, event.index)
+    elif isinstance(delta, CodeExecutionCallDelta):
+      return _handle_code_execution_call(delta, state, interaction_id)
+    elif isinstance(delta, CodeExecutionResultDelta):
+      return _handle_code_execution_result(delta, state, interaction_id)
+    elif isinstance(delta, GoogleSearchCallDelta):
+      return _handle_google_search_call(delta, state, interaction_id)
+    elif isinstance(delta, GoogleSearchResultDelta):
+      return _handle_google_search_result(delta, state, interaction_id)
+    elif isinstance(delta, TextAnnotationDelta):
+      return _handle_text_annotation(delta, state, interaction_id)
+    elif isinstance(delta, FunctionResultDelta):
+      return _handle_function_result(delta, state, interaction_id)
+    else:
+      return _handle_unknown_delta(delta, state, interaction_id)
+
+  elif isinstance(event, StepStop):
+    target_part = _resolve_streaming_function_call_part(event.index, state)
+    if target_part is not None and target_part.function_call:
+      fc = target_part.function_call
+      if fc.partial_args is not None:
+        arg_str = ''.join(pa.string_value or '' for pa in fc.partial_args)
+
+        args = {}
+        if arg_str:
+          try:
+            args = json.loads(arg_str)
+          except json.JSONDecodeError as e:
+            logger.error(
+                'Failed to parse function call args: %s. arg_str: %s',
+                e,
+                arg_str,
+            )
+            fc.args = args
+            fc.partial_args = None
+            return LlmResponse(
+                error_code='JSON_PARSE_ERROR',
+                error_message='Failed to parse function call arguments',
+                turn_complete=True,
+                finish_reason=types.FinishReason.STOP,
+                interaction_id=interaction_id,
+            )
+
+        fc.args = args
+        fc.partial_args = None
+
+    return None
+
+  elif isinstance(event, InteractionCompletedEvent):
+    grounding_metadata = _build_grounding_metadata(state)
+    if state.parts or grounding_metadata is not None:
+      content = (
+          types.Content(role='model', parts=state.parts)
+          if state.parts
+          else None
+      )
       return LlmResponse(
-          content=types.Content(role='model', parts=list(aggregated_parts))
-          if aggregated_parts
-          else None,
+          content=content,
+          grounding_metadata=grounding_metadata,
+          usage_metadata=_usage_metadata_from_interaction(event.interaction),
           partial=False,
           turn_complete=True,
           finish_reason=types.FinishReason.STOP,
           interaction_id=interaction_id,
       )
-    elif status == 'failed':
-      error = getattr(event, 'error', None)
+    # No streaming parts or grounding collected: convert the final interaction.
+    return convert_interaction_to_llm_response(event.interaction)
+
+  elif isinstance(event, Interaction):
+    # Fallback for legacy interaction events without lifecycle
+    return convert_interaction_to_llm_response(event)
+
+  elif isinstance(event, InteractionStatusUpdate):
+    if event.status == 'failed':
       return LlmResponse(
-          error_code=error.code if error else 'UNKNOWN_ERROR',
-          error_message=error.message if error else 'Unknown error',
+          error_code='UNKNOWN_ERROR',
+          error_message='Unknown error',
           turn_complete=True,
           interaction_id=interaction_id,
       )
 
-  elif event_type == 'error':
+  elif isinstance(event, ErrorEvent):
+    error = event.error
     return LlmResponse(
-        error_code=getattr(event, 'code', 'UNKNOWN_ERROR'),
-        error_message=getattr(event, 'message', 'Unknown error'),
+        error_code=error.code if error else 'UNKNOWN_ERROR',
+        error_message=error.message if error else 'Unknown error',
         turn_complete=True,
         interaction_id=interaction_id,
     )
@@ -601,10 +1324,27 @@ def convert_interaction_event_to_llm_response(
   return None
 
 
+def _unwarned_params_set_on(
+    config: types.GenerateContentConfig, names: tuple[str, ...]
+) -> list[str]:
+  """Return the names the caller set that have not been warned about yet."""
+  return [
+      name
+      for name in names
+      if getattr(config, name) is not None
+      and name not in _WARNED_SAMPLING_PARAMS
+  ]
+
+
 def build_generation_config(
     config: types.GenerateContentConfig,
-) -> dict[str, Any]:
+) -> GenerationConfigParam:
   """Build generation config dict for interactions API.
+
+  Only the parameters that reach the interactions API are carried over. A
+  sampling parameter that would be discarded before the request is sent is
+  logged as ignored, once per parameter per process, naming whether the client
+  or the API is the one that cannot carry it.
 
   Args:
     config: The GenerateContentConfig to extract parameters from.
@@ -612,27 +1352,46 @@ def build_generation_config(
   Returns:
     A dictionary containing generation configuration parameters.
   """
-  generation_config: dict[str, Any] = {}
-  if config.temperature is not None:
-    generation_config['temperature'] = config.temperature
-  if config.top_p is not None:
-    generation_config['top_p'] = config.top_p
-  if config.top_k is not None:
-    generation_config['top_k'] = config.top_k
+  generation_config: GenerationConfigParam = {}
   if config.max_output_tokens is not None:
     generation_config['max_output_tokens'] = config.max_output_tokens
   if config.stop_sequences:
     generation_config['stop_sequences'] = config.stop_sequences
-  if config.presence_penalty is not None:
-    generation_config['presence_penalty'] = config.presence_penalty
-  if config.frequency_penalty is not None:
-    generation_config['frequency_penalty'] = config.frequency_penalty
+  if config.seed is not None:
+    generation_config['seed'] = config.seed
+  for name in _DECLARED_SAMPLING_PARAMS:
+    value = getattr(config, name)
+    if value is not None:
+      # Not a literal key: which of these the TypedDict declares depends on
+      # the installed google-genai.
+      generation_config[name] = value  # type: ignore[literal-required]
+
+  undeclared = _unwarned_params_set_on(config, _UNDECLARED_SAMPLING_PARAMS)
+  if undeclared:
+    _WARNED_SAMPLING_PARAMS.update(undeclared)
+    logger.warning(
+        'The installed google-genai has no field for %s on the interactions'
+        ' request, so they are dropped before the request is sent even though'
+        ' the API itself applies them. Applying them needs a google-genai'
+        ' release that declares those fields.',
+        ', '.join(undeclared),
+    )
+
+  unsupported = _unwarned_params_set_on(config, _UNSUPPORTED_SAMPLING_PARAMS)
+  if unsupported:
+    _WARNED_SAMPLING_PARAMS.update(unsupported)
+    logger.warning(
+        'The interactions API has no equivalent for %s, so the model decodes'
+        ' with its own defaults instead. Unset them, or turn off'
+        ' use_interactions_api to have them applied.',
+        ', '.join(unsupported),
+    )
   return generation_config
 
 
 def extract_system_instruction(
     config: types.GenerateContentConfig,
-) -> Optional[str]:
+) -> str | None:
   """Extract system instruction as a string from config.
 
   Args:
@@ -649,9 +1408,10 @@ def extract_system_instruction(
   elif isinstance(config.system_instruction, types.Content):
     # Extract text from Content
     texts = []
-    for part in config.system_instruction.parts:
-      if part.text:
-        texts.append(part.text)
+    if config.system_instruction.parts:
+      for part in config.system_instruction.parts:
+        if part.text:
+          texts.append(part.text)
     return '\n'.join(texts) if texts else None
   return None
 
@@ -677,18 +1437,18 @@ def _build_tool_log(tool: ToolParam) -> str:
 
 def build_interactions_request_log(
     model: str,
-    input_turns: list[TurnParam],
-    system_instruction: Optional[str],
-    tools: Optional[list[ToolParam]],
-    generation_config: Optional[dict[str, Any]],
-    previous_interaction_id: Optional[str],
+    input_steps: list[StepParam],
+    system_instruction: str | None,
+    tools: list[ToolParam] | None,
+    generation_config: dict[str, object] | None,
+    previous_interaction_id: str | None,
     stream: bool,
 ) -> str:
   """Build a log string for an interactions API request.
 
   Args:
     model: The model name.
-    input_turns: The input turns to send.
+    input_steps: The input steps to send.
     system_instruction: The system instruction.
     tools: The tools configuration.
     generation_config: The generation config.
@@ -698,11 +1458,11 @@ def build_interactions_request_log(
   Returns:
     A formatted log string describing the request.
   """
-  # Format input turns for logging
-  turns_logs = []
-  for turn in input_turns:
-    role = turn.get('role', 'unknown')
-    contents = turn.get('content', [])
+  # Format input steps for logging
+  steps_logs = []
+  for step in input_steps:
+    role = step.get('role', 'unknown')
+    contents = step.get('content', [])
     content_strs = []
     for content in contents:
       content_type = content.get('type', 'unknown')
@@ -725,7 +1485,7 @@ def build_interactions_request_log(
         content_strs.append(f'function_result[{call_id}]: {result}')
       else:
         content_strs.append(f'{content_type}: ...')
-    turns_logs.append(f'  [{role}]: {", ".join(content_strs)}')
+    steps_logs.append(f'  [{role}]: {", ".join(content_strs)}')
 
   # Format tools for logging
   tools_logs = []
@@ -751,8 +1511,8 @@ System Instruction:
 Generation Config:
 {config_str}
 -----------------------------------------------------------
-Input Turns:
-{_NEW_LINE.join(turns_logs) if turns_logs else '(none)'}
+Input Steps:
+{_NEW_LINE.join(steps_logs) if steps_logs else '(none)'}
 -----------------------------------------------------------
 Tools:
 {_NEW_LINE.join(tools_logs) if tools_logs else '(none)'}
@@ -775,17 +1535,17 @@ def build_interactions_response_log(interaction: Interaction) -> str:
 
   # Extract outputs
   outputs_logs = []
-  if hasattr(interaction, 'outputs') and interaction.outputs:
-    for output in interaction.outputs:
-      output_type = getattr(output, 'type', 'unknown')
+  if hasattr(interaction, 'steps') and interaction.steps:
+    for step in interaction.steps:
+      output_type = getattr(step, 'type', 'unknown')
       if output_type == 'text':
-        text = getattr(output, 'text', '')
+        text = getattr(step, 'text', '')
         if len(text) > 300:
           text = text[:300] + '...'
         outputs_logs.append(f'  text: "{text}"')
       elif output_type == 'function_call':
-        name = getattr(output, 'name', '')
-        args = getattr(output, 'arguments', {})
+        name = getattr(step, 'name', '')
+        args = getattr(step, 'arguments', {})
         outputs_logs.append(f'  function_call: {name}({json.dumps(args)})')
       else:
         outputs_logs.append(f'  {output_type}: ...')
@@ -838,7 +1598,7 @@ def build_interactions_event_log(event: InteractionSSEEvent) -> str:
 
   details = []
 
-  if event_type == 'content.delta':
+  if event_type == 'step.delta':
     delta = getattr(event, 'delta', None)
     if delta:
       delta_type = getattr(delta, 'type', 'unknown')
@@ -854,11 +1614,11 @@ def build_interactions_event_log(event: InteractionSSEEvent) -> str:
       else:
         details.append(f'{delta_type}: ...')
 
-  elif event_type == 'interaction.status_update':
+  elif event_type in ('interaction.completed', 'interaction.requires_action'):
     status = getattr(event, 'status', 'unknown')
     details.append(f'status: {status}')
 
-  elif event_type == 'error':
+  elif event_type == 'interaction.error':
     code = getattr(event, 'code', 'unknown')
     message = getattr(event, 'message', 'unknown')
     details.append(f'error: {code} - {message}')
@@ -876,12 +1636,8 @@ def _get_latest_user_contents(
 
   For interactions API with previous_interaction_id, we only need to send
   the current turn's messages since prior history is maintained by
-  the interaction chain.
-
-  Special handling for function_result: When the user content contains a
-  function_result (response to a model's function_call), we must also include
-  the preceding model content with the function_call. The Interactions API
-  needs both the function_call and function_result to properly match call_ids.
+  the interaction chain. The preceding model turn with the function_call
+  is already encapsulated in the previous_interaction_id state.
 
   Args:
     contents: The full list of content messages.
@@ -893,48 +1649,176 @@ def _get_latest_user_contents(
     return []
 
   # Find the latest continuous user messages from the end
-  latest_user_contents = []
-  for content in reversed(contents):
-    if content.role == 'user':
-      latest_user_contents.insert(0, content)
-    else:
-      # Stop when we hit a non-user message
-      break
+  latest_user_contents: list[types.Content] = []
+  index = len(contents) - 1
+  while index >= 0 and contents[index].role == 'user':
+    latest_user_contents.append(contents[index])
+    index -= 1
 
-  # Check if the user contents contain a function_result
-  has_function_result = False
-  for content in latest_user_contents:
-    if content.parts:
-      for part in content.parts:
-        if part.function_response is not None:
-          has_function_result = True
-          break
-    if has_function_result:
-      break
+  latest_user_contents.reverse()
 
-  # If we have a function_result, we also need the preceding model content
-  # with the function_call so the API can match the call_id
-  if has_function_result and len(contents) > len(latest_user_contents):
-    # Get the index where user contents start
-    user_start_idx = len(contents) - len(latest_user_contents)
-    if user_start_idx > 0:
-      # Check if the content before user contents is a model turn with
-      # function_call
-      preceding_content = contents[user_start_idx - 1]
-      if preceding_content.role == 'model' and preceding_content.parts:
-        for part in preceding_content.parts:
-          if part.function_call is not None:
-            # Include the model's function_call turn before user's
-            # function_result
-            return [preceding_content] + latest_user_contents
+  # The thought signature Gemini model needs back sits on the preceding
+  # model turn, outside the user-only window above. Carry just those parts
+  # across; the rest of that turn is already server-side under
+  # previous_interaction_id.
+  if index >= 0:
+    signature_parts = [
+        part for part in contents[index].parts or [] if part.thought_signature
+    ]
+    if signature_parts:
+      latest_user_contents.insert(
+          0, types.Content(role='model', parts=signature_parts)
+      )
 
   return latest_user_contents
+
+
+async def _wait_for_interaction(
+    api_client: Client,
+    interaction: Interaction,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> Interaction:
+  """Re-read a pending interaction until the API reports a final status.
+
+  ``interactions.create`` returns once the work is accepted, not once it is
+  done, so a deferred request comes back ``queued`` carrying an id and no
+  output. Polling here keeps that off the callers: the generator still yields
+  one response per turn, and it holds the finished result.
+
+  There is no client-side deadline. The server already bounds the wait with
+  the interaction's own completion timeout (24 hours by default) and reports
+  the outcome as a final status, and nothing on the client can resume a queued
+  interaction, so giving up early would abandon work that runs anyway. A
+  caller that needs to stop sooner can cancel the surrounding task: the sleep
+  between polls is a cancellation point.
+
+  Args:
+    api_client: The Google GenAI client.
+    interaction: The pending interaction returned by ``interactions.create``.
+    extra_headers: Optional per-request HTTP headers forwarded to each poll.
+
+  Returns:
+    The interaction as of the first read that reported a final status.
+  """
+  logger.info(
+      'Interaction %s is %s; waiting for the result.',
+      interaction.id,
+      interaction.status,
+  )
+  interaction_id = interaction.id
+  delay = _POLL_INITIAL_DELAY_SECONDS
+  consecutive_errors = 0
+  while interaction.status in _PENDING_INTERACTION_STATUSES:
+    await asyncio.sleep(delay)
+    delay = min(delay * 2, _POLL_MAX_DELAY_SECONDS)
+    try:
+      interaction = await api_client.aio.interactions.get(
+          interaction_id, stream=False, extra_headers=extra_headers
+      )
+    except Exception as e:  # pylint: disable=broad-except
+      # Absorb a failed read rather than abandoning accepted work. Cancelling
+      # the surrounding task still stops the wait: CancelledError derives from
+      # BaseException, so it is not caught here.
+      consecutive_errors += 1
+      if consecutive_errors >= _POLL_MAX_CONSECUTIVE_ERRORS:
+        logger.error(
+            'Giving up on interaction %s after %d consecutive failed reads.',
+            interaction_id,
+            consecutive_errors,
+        )
+        raise
+      logger.warning(
+          'Failed to read interaction %s (%d/%d consecutive); retrying: %s',
+          interaction_id,
+          consecutive_errors,
+          _POLL_MAX_CONSECUTIVE_ERRORS,
+          e,
+      )
+      continue
+    consecutive_errors = 0
+    logger.debug('Interaction %s is %s.', interaction_id, interaction.status)
+
+  logger.info(
+      'Interaction %s reached status %s.', interaction.id, interaction.status
+  )
+  logger.debug(build_interactions_response_log(interaction))
+  return interaction
+
+
+async def _create_interactions(
+    api_client: Client,
+    *,
+    create_kwargs: dict[str, Any],
+    stream: bool,
+    extra_headers: dict[str, str] | None = None,
+) -> AsyncGenerator[LlmResponse, None]:
+  """Issue ``interactions.create`` and convert the response(s) to LlmResponses.
+
+  This is the shared transport + conversion loop. The caller assembles
+  ``create_kwargs`` (``model`` or ``agent``, ``input``, ``tools``, etc.); this
+  helper owns issuing the call and mapping the stream to ``LlmResponse``s.
+
+  A non-streaming create that comes back still pending -- a deferred request
+  returns ``queued`` as soon as it is accepted -- is polled to completion
+  before anything is yielded, so every caller sees a finished result.
+
+  Args:
+    api_client: The Google GenAI client.
+    create_kwargs: Keyword arguments passed verbatim to
+      ``api_client.aio.interactions.create`` (excluding ``stream`` and
+      ``extra_headers``).
+    stream: Whether to stream the response.
+    extra_headers: Optional per-request HTTP headers forwarded to
+      ``interactions.create`` (e.g. ADK tracking headers merged with any
+      user-supplied headers). ``None`` sends no extra headers.
+
+  Yields:
+    LlmResponse objects converted from interaction responses.
+  """
+  current_interaction_id: str | None = None
+  current_environment_id: str | None = None
+
+  if stream:
+    responses = await api_client.aio.interactions.create(
+        **create_kwargs, stream=True, extra_headers=extra_headers
+    )
+    state = _StreamState()
+    async for event in responses:
+      logger.debug(build_interactions_event_log(event))
+      interaction_id = _extract_stream_interaction_id(event)
+      if interaction_id:
+        current_interaction_id = interaction_id
+      environment_id = _extract_stream_environment_id(event)
+      if environment_id:
+        current_environment_id = environment_id
+      llm_response = convert_interaction_event_to_llm_response(
+          event, state, current_interaction_id
+      )
+      if llm_response:
+        llm_response.environment_id = current_environment_id
+        yield llm_response
+  else:
+    interaction = await api_client.aio.interactions.create(
+        **create_kwargs, stream=False, extra_headers=extra_headers
+    )
+    logger.info('Interaction response received.')
+    logger.debug(build_interactions_response_log(interaction))
+    if interaction.status in _PENDING_INTERACTION_STATUSES:
+      interaction = await _wait_for_interaction(
+          api_client, interaction, extra_headers=extra_headers
+      )
+    llm_response = convert_interaction_to_llm_response(interaction)
+    llm_response.environment_id = interaction.environment_id
+    yield llm_response
 
 
 async def generate_content_via_interactions(
     api_client: Client,
     llm_request: LlmRequest,
     stream: bool,
+    *,
+    service_tier: ServiceTier | str | None = None,
 ) -> AsyncGenerator[LlmResponse, None]:
   """Generate content using the interactions API.
 
@@ -949,11 +1833,22 @@ async def generate_content_via_interactions(
     api_client: The Google GenAI client.
     llm_request: The LLM request to send.
     stream: Whether to stream the response.
+    service_tier: Optional serving tier. ``deferred`` queues the request to run
+      on off-peak capacity and cannot be combined with streaming.
 
   Yields:
     LlmResponse objects converted from interaction responses.
+
+  Raises:
+    ValueError: If ``deferred`` is combined with streaming.
   """
-  from .llm_response import LlmResponse
+  if service_tier == ServiceTier.DEFERRED and stream:
+    raise ValueError(
+        "service_tier='deferred' cannot be used with streaming. A deferred"
+        ' request is queued to run on off-peak capacity and returns an'
+        ' interaction id instead of a result, so there is nothing to stream.'
+        ' Use StreamingMode.NONE.'
+    )
 
   # When previous_interaction_id is set, only send the latest continuous
   # user messages (the current turn) instead of full conversation history
@@ -962,7 +1857,7 @@ async def generate_content_via_interactions(
     contents = _get_latest_user_contents(contents)
 
   # Convert contents to interactions API format
-  input_turns = convert_contents_to_turns(contents)
+  input_steps = _convert_contents_to_steps(contents)
   interaction_tools = convert_tools_config_to_interactions_format(
       llm_request.config
   )
@@ -983,8 +1878,8 @@ async def generate_content_via_interactions(
 
   logger.debug(
       build_interactions_request_log(
-          model=llm_request.model,
-          input_turns=input_turns,
+          model=llm_request.model or '',
+          input_steps=input_steps,
           system_instruction=system_instruction,
           tools=interaction_tools if interaction_tools else None,
           generation_config=generation_config if generation_config else None,
@@ -993,59 +1888,36 @@ async def generate_content_via_interactions(
       )
   )
 
-  # Track the current interaction ID from responses
-  current_interaction_id: Optional[str] = None
+  # Assemble the create() kwargs for the model path and delegate the
+  # transport + conversion loop to the shared helper.
+  create_kwargs: dict[str, Any] = {
+      'model': llm_request.model,
+      'input': input_steps,
+      'system_instruction': system_instruction,
+      'tools': interaction_tools if interaction_tools else None,
+      'generation_config': generation_config if generation_config else None,
+      'previous_interaction_id': previous_interaction_id,
+  }
 
-  if stream:
-    # Streaming mode
-    responses = await api_client.aio.interactions.create(
-        model=llm_request.model,
-        input=input_turns,
-        stream=True,
-        system_instruction=system_instruction,
-        tools=interaction_tools if interaction_tools else None,
-        generation_config=generation_config if generation_config else None,
-        previous_interaction_id=previous_interaction_id,
-    )
+  if service_tier:
+    create_kwargs['service_tier'] = service_tier
+    if service_tier == ServiceTier.DEFERRED:
+      # The API rejects deferred without this. 'store' is deliberately left
+      # unset: it already defaults on for a background call, and sending
+      # store=False is rejected outright.
+      create_kwargs['background'] = True
 
-    aggregated_parts: list[types.Part] = []
-    async for event in responses:
-      # Log the streaming event
-      logger.debug(build_interactions_event_log(event))
+  # Re-merge tracking headers into any request-time headers (idempotent) so the
+  # interactions path forwards user-supplied headers instead of dropping them.
+  config_headers = None
+  if llm_request.config and llm_request.config.http_options:
+    config_headers = llm_request.config.http_options.headers
+  extra_headers = merge_tracking_headers(config_headers)
 
-      # Extract interaction ID from event if available
-      if hasattr(event, 'id') and event.id:
-        current_interaction_id = event.id
-      llm_response = convert_interaction_event_to_llm_response(
-          event, aggregated_parts, current_interaction_id
-      )
-      if llm_response:
-        yield llm_response
-
-    # Final aggregated response
-    if aggregated_parts:
-      yield LlmResponse(
-          content=types.Content(role='model', parts=aggregated_parts),
-          partial=False,
-          turn_complete=True,
-          finish_reason=types.FinishReason.STOP,
-          interaction_id=current_interaction_id,
-      )
-
-  else:
-    # Non-streaming mode
-    interaction = await api_client.aio.interactions.create(
-        model=llm_request.model,
-        input=input_turns,
-        stream=False,
-        system_instruction=system_instruction,
-        tools=interaction_tools if interaction_tools else None,
-        generation_config=generation_config if generation_config else None,
-        previous_interaction_id=previous_interaction_id,
-    )
-
-    # Log the response
-    logger.info('Interaction response received from the model.')
-    logger.debug(build_interactions_response_log(interaction))
-
-    yield convert_interaction_to_llm_response(interaction)
+  async for llm_response in _create_interactions(
+      api_client,
+      create_kwargs=create_kwargs,
+      stream=stream,
+      extra_headers=extra_headers,
+  ):
+    yield llm_response

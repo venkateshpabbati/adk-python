@@ -14,20 +14,25 @@
 
 import asyncio
 import contextlib
+from typing import Any
 from typing import AsyncGenerator
 from typing import Generator
 from typing import Optional
 from typing import Union
 
 from google.adk.agents.invocation_context import InvocationContext
-from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.apps.app import App
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.adk.events.event import Event
+from google.adk.flows.llm_flows.context._fencing import OTHER_AGENT_CONTEXT_PREAMBLE
+from google.adk.flows.llm_flows.context._fencing import QUOTED_CONTENT_BEGIN
+from google.adk.flows.llm_flows.context._fencing import QUOTED_CONTENT_END
+from google.adk.live import LiveRequestQueue
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.models import LlmCapabilities
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.base_llm_connection import BaseLlmConnection
 from google.adk.models.llm_request import LlmRequest
@@ -42,6 +47,8 @@ from google.adk.utils.context_utils import Aclosing
 from google.genai import types
 from google.genai.types import Part
 from typing_extensions import override
+
+from ._invariants import InvariantPlugin
 
 
 def create_test_agent(name: str = 'test_agent') -> LlmAgent:
@@ -78,6 +85,7 @@ async def create_invocation_context(
     user_content: str = '',
     run_config: RunConfig = None,
     plugins: list[BasePlugin] = [],
+    abort_signal: Optional[asyncio.Event] = None,
 ):
   invocation_id = 'test_id'
   artifact_service = InMemoryArtifactService()
@@ -98,6 +106,8 @@ async def create_invocation_context(
       ),
       run_config=run_config or RunConfig(),
   )
+  if abort_signal is not None:
+    invocation_context._attach_abort_signal(abort_signal)
   if user_content:
     append_user_content(
         invocation_context, [types.Part.from_text(text=user_content)]
@@ -142,6 +152,9 @@ def simplify_resumable_app_events(
   for event in events:
     if event.content:
       results.append((event.author, simplify_content(event.content)))
+    elif event.output and isinstance(event.output, (str, dict)):
+      # Single_turn agents strip event.content and set event.output instead.
+      results.append((event.author, event.output))
     elif event.actions.end_of_agent:
       results.append((event.author, END_OF_AGENT))
     elif event.actions.agent_state is not None:
@@ -179,24 +192,69 @@ def get_user_content(message: types.ContentUnion) -> types.Content:
   return message if isinstance(message, types.Content) else UserContent(message)
 
 
+def other_agent_preamble_part() -> types.Part:
+  """Returns the leading part of another agent's message relayed as context."""
+  return types.Part(text=OTHER_AGENT_CONTEXT_PREAMBLE)
+
+
+def other_agent_part(attribution: str, payload: str) -> types.Part:
+  """Builds a relayed part: an attribution line plus the fenced payload.
+
+  Args:
+    attribution: The line naming the speaker, e.g. ``[other_agent] said:``.
+    payload: The relayed text, as it should appear inside the fence.
+
+  Returns:
+    The part the contents processor is expected to produce. The fence is
+    assembled here rather than by calling the code under test, so a change to
+    how relayed content is quoted has to be made deliberately in both places.
+  """
+  return types.Part(
+      text=(
+          f'{attribution}\n'
+          f'{QUOTED_CONTENT_BEGIN}\n'
+          f'{payload}\n'
+          f'{QUOTED_CONTENT_END}'
+      )
+  )
+
+
 class TestInMemoryRunner(AfInMemoryRunner):
   """InMemoryRunner that is tailored for tests, features async run method.
 
   app_name is hardcoded as InMemoryRunner in the parent class.
   """
 
+  __test__ = False
+
+  def __init__(
+      self,
+      *args: Any,
+      check_invariants: bool = True,
+      **kwargs: Any,
+  ) -> None:
+    super().__init__(*args, **kwargs)
+    if check_invariants:
+      self.plugin_manager.plugins.insert(0, InvariantPlugin())
+
   async def run_async_with_new_session(
-      self, new_message: types.ContentUnion
+      self,
+      new_message: types.ContentUnion,
+      run_config: Optional[RunConfig] = None,
   ) -> list[Event]:
 
     collected_events: list[Event] = []
-    async for event in self.run_async_with_new_session_agen(new_message):
+    async for event in self.run_async_with_new_session_agen(
+        new_message, run_config
+    ):
       collected_events.append(event)
 
     return collected_events
 
   async def run_async_with_new_session_agen(
-      self, new_message: types.ContentUnion
+      self,
+      new_message: types.ContentUnion,
+      run_config: Optional[RunConfig] = None,
   ) -> AsyncGenerator[Event, None]:
     session = await self.session_service.create_session(
         app_name='InMemoryRunner', user_id='test_user'
@@ -205,6 +263,7 @@ class TestInMemoryRunner(AfInMemoryRunner):
         user_id=session.user_id,
         session_id=session.id,
         new_message=get_user_content(new_message),
+        run_config=run_config,
     )
     async with Aclosing(agen):
       async for event in agen:
@@ -220,6 +279,8 @@ class InMemoryRunner:
       response_modalities: list[str] = None,
       plugins: list[BasePlugin] = [],
       app: Optional[App] = None,
+      node: Any = None,
+      check_invariants: bool = True,
   ):
     """Initializes the InMemoryRunner.
 
@@ -229,8 +290,20 @@ class InMemoryRunner:
       plugins: The plugins to use in the runner, won't be used if app is
         provided.
       app: The app to use in the runner.
+      node: The root node to run.
+      check_invariants: Whether to attach the runtime invariant checker plugin.
     """
-    if not app:
+    if node:
+      self.app_name = node.name
+      self.root_agent = None
+      self.runner = Runner(
+          node=node,
+          artifact_service=InMemoryArtifactService(),
+          session_service=InMemorySessionService(),
+          memory_service=InMemoryMemoryService(),
+          plugins=plugins,
+      )
+    elif not app:
       self.app_name = 'test_app'
       self.root_agent = root_agent
       self.runner = Runner(
@@ -250,6 +323,8 @@ class InMemoryRunner:
           session_service=InMemorySessionService(),
           memory_service=InMemoryMemoryService(),
       )
+    if check_invariants:
+      self.runner.plugin_manager.plugins.insert(0, InvariantPlugin())
     self.session_id = None
 
   @property
@@ -300,11 +375,12 @@ class InMemoryRunner:
           run_config=run_config or RunConfig(),
       )
 
-      async for response in run_res:
-        collected_responses.append(response)
-        # When we have enough response, we should return
-        if len(collected_responses) >= 1:
-          return
+      async with Aclosing(run_res) as agen:
+        async for response in agen:
+          collected_responses.append(response)
+          # When we have enough response, we should return
+          if len(collected_responses) >= 1:
+            return
 
     try:
       session = self.session
@@ -313,6 +389,28 @@ class InMemoryRunner:
       print('Returning any partial results collected so far.')
 
     return collected_responses
+
+
+class ModelWithCapabilities(BaseLlm):
+  """A model that self-reports fixed capabilities.
+
+  For exercising flows that branch on ``BaseLlm.capabilities``, without
+  depending on which model ids happen to satisfy ADK's detection today.
+  """
+
+  model: str = 'mock'
+  output_schema_and_tools: bool = False
+
+  @property
+  @override
+  def capabilities(self) -> LlmCapabilities:
+    return LlmCapabilities(output_schema_and_tools=self.output_schema_and_tools)
+
+  @override
+  async def generate_content_async(
+      self, llm_request: LlmRequest, stream: bool = False
+  ) -> AsyncGenerator[LlmResponse, None]:
+    yield LlmResponse()
 
 
 class MockModel(BaseLlm):
@@ -330,6 +428,9 @@ class MockModel(BaseLlm):
           list[types.Part], list[LlmResponse], list[str], list[list[types.Part]]
       ],
       error: Union[Exception, None] = None,
+      usage_metadata: Optional[
+          types.GenerateContentResponseUsageMetadata
+      ] = None,
   ):
     if error and not responses:
       return cls(responses=[], error=error)
@@ -340,14 +441,18 @@ class MockModel(BaseLlm):
       return cls(responses=responses)
     else:
       responses = [
-          LlmResponse(content=ModelContent(item))
+          LlmResponse(
+              content=ModelContent(item),
+              usage_metadata=usage_metadata,
+          )
           if isinstance(item, list) and isinstance(item[0], types.Part)
           # responses is list[list[Part]]
           else LlmResponse(
               content=ModelContent(
                   # responses is list[str] or list[Part]
                   [Part(text=item) if isinstance(item, str) else item]
-              )
+              ),
+              usage_metadata=usage_metadata,
           )
           for item in responses
           if item
@@ -369,7 +474,7 @@ class MockModel(BaseLlm):
     self.response_index += 1
     self.requests.append(llm_request)
     # yield LlmResponse(content=self.responses[self.response_index])
-    yield self.responses[self.response_index]
+    yield self.responses[self.response_index].model_copy(deep=True)
 
   @override
   async def generate_content_async(
@@ -380,7 +485,7 @@ class MockModel(BaseLlm):
     # Increasement of the index has to happen before the yield.
     self.response_index += 1
     self.requests.append(llm_request)
-    yield self.responses[self.response_index]
+    yield self.responses[self.response_index].model_copy(deep=True)
 
   @contextlib.asynccontextmanager
   async def connect(self, llm_request: LlmRequest) -> BaseLlmConnection:
@@ -393,6 +498,8 @@ class MockLlmConnection(BaseLlmConnection):
 
   def __init__(self, llm_responses: list[LlmResponse]):
     self.llm_responses = llm_responses
+    self._replayed = False
+    self._closed = asyncio.Event()
 
   async def send_history(self, history: list[types.Content]):
     pass
@@ -408,12 +515,15 @@ class MockLlmConnection(BaseLlmConnection):
 
   async def receive(self) -> AsyncGenerator[LlmResponse, None]:
     """Yield each of the pre-defined LlmResponses."""
-    for response in self.llm_responses:
-      # Yield control to allow other tasks (like send_task) to run first.
-      # This ensures user content gets persisted before the mock response
-      # is yielded.
-      await asyncio.sleep(0)
-      yield response
+    if not self._replayed:
+      self._replayed = True
+      for response in self.llm_responses:
+        # Yield control to allow other tasks (like send_task) to run first.
+        # This ensures user content gets persisted before the mock response
+        # is yielded.
+        await asyncio.sleep(0)
+        yield response
+    await self._closed.wait()
 
   async def close(self):
-    pass
+    self._closed.set()

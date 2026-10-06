@@ -94,6 +94,65 @@ class SafetyEvaluatorV1MetricInfoProvider(MetricInfoProvider):
     )
 
 
+class MultiTurnTaskSuccessV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for MultiTurnTaskSuccessV1."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.MULTI_TURN_TASK_SUCCESS_V1.value,
+        description=(
+            "Evaluates if the agent was able to achieve the goal or goals of"
+            " the conversation."
+            " Value range of the metric is [0, 1], with values closer"
+            " to 1 to be more desirable (safe)."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=1.0)
+        ),
+    )
+
+
+class MultiTurnTrajectoryQualityV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for MultiTurnTrajectoryQualityV1."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.MULTI_TURN_TRAJECTORY_QUALITY_V1.value,
+        description=(
+            "Evaluates the overall trajectory of the conversation. Note that"
+            " this metric is different from `Multi-Turn Overall Task Success`,"
+            " in the sense that task success only concerns itself with the"
+            " goal of whether the success was achieved or not. How that was"
+            " achieved is not its concern. This metric on the other hand does"
+            " care about the path that agent took to achieve the goal. This is"
+            " a reference free metric."
+            " Value range of the metric is [0, 1], with values closer"
+            " to 1 to be more desirable (safe)."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=1.0)
+        ),
+    )
+
+
+class MultiTurnToolUseQualityV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for MultiTurnToolUseQualityV1."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.MULTI_TURN_TOOL_USE_QUALITY_V1.value,
+        description=(
+            "Evaluates the function calls made during a multi-turn"
+            " conversation. This is a reference free metric."
+            " Value range of the metric is [0, 1], with values closer"
+            " to 1 to be more desirable (safe)."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=1.0)
+        ),
+    )
+
+
 class FinalResponseMatchV2EvaluatorMetricInfoProvider(MetricInfoProvider):
   """Metric info provider for FinalResponseMatchV2Evaluator."""
 
@@ -182,4 +241,109 @@ class PerTurnUserSimulatorQualityV1MetricInfoProvider(MetricInfoProvider):
         metric_value_info=MetricValueInfo(
             interval=Interval(min_value=0.0, max_value=1.0)
         ),
+    )
+
+
+class RubricBasedMultiTurnTrajectoryMetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for RubricBasedMultiTurnTrajectory."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.RUBRIC_BASED_MULTI_TURN_TRAJECTORY_QUALITY_V1,
+        description=(
+            "This metric evaluates the agent's multi-turn trajectory against"
+            " a set of user-provided rubrics using an LLM as a judge. Value"
+            " range for this metric is [0,1], with values closer to 1 more"
+            " desirable."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=1.0)
+        ),
+    )
+
+
+class ToolCallCountV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for _ToolCallCountV1Evaluator."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.TOOL_CALL_COUNT_V1.value,
+        description=(
+            "This metric counts the number of tool (function) calls the agent"
+            " made per invocation, averaged across the eval case. It is an"
+            " informational efficiency metric: it reports the value for"
+            " tracking and does not pass or fail the eval case."
+        ),
+        metric_value_info=MetricValueInfo(),
+        # Informational: reports a value, never gates, so no threshold
+        # is required and no value interval bounds it.
+        requires_threshold=False,
+    )
+
+
+class InferenceCallCountV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for _InferenceCallCountV1Evaluator."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.INFERENCE_CALL_COUNT_V1.value,
+        description=(
+            "This metric counts the number of inference (model) calls the agent"
+            " made per invocation, averaged across the eval case. It is a proxy"
+            " for the number of attempts or reasoning steps taken, and read"
+            " alongside token usage it separates the two ways a turn gets"
+            " expensive: more calls, or a larger context per call. It is an"
+            " informational efficiency metric: it reports the value for"
+            " tracking and does not pass or fail the eval case."
+        ),
+        metric_value_info=MetricValueInfo(),
+        # Informational: reports a value, never gates, so no threshold
+        # is required and no value interval bounds it.
+        requires_threshold=False,
+    )
+
+
+class InvocationDurationV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for _InvocationDurationV1Evaluator."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.INVOCATION_DURATION_V1.value,
+        description=(
+            "This metric reports the wall-clock seconds an invocation took,"
+            " averaged across the eval case. The duration is measured while the"
+            " agent runs; an invocation not produced by this eval run reports"
+            " no value. Wall-clock time is noisier than the token and call"
+            " counts, since it moves with model-server load and network, so"
+            " read it as an indication rather than a regression signal. It is"
+            " an informational efficiency metric: it reports the value for"
+            " tracking and does not pass or fail the eval case."
+        ),
+        metric_value_info=MetricValueInfo(),
+        # Informational: reports a value, never gates, so no threshold
+        # is required and no value interval bounds it.
+        requires_threshold=False,
+    )
+
+
+class TokenUsageV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for _TokenUsageV1Evaluator."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.TOKEN_USAGE_V1.value,
+        description=(
+            "This metric sums the tokens consumed by the model across all model"
+            " calls in an invocation, averaged across the eval case. The score"
+            " is the total; every token type is reported alongside it as a"
+            " nested breakdown -- total, then input (prompt, of which cached,"
+            " plus tool use) and output (candidates plus reasoning) -- using"
+            " the same definitions as ADK's telemetry token metrics. It is an"
+            " informational efficiency metric: it reports the value for"
+            " tracking and does not pass or fail the eval case."
+        ),
+        metric_value_info=MetricValueInfo(),
+        # Informational: reports a value, never gates, so no threshold
+        # is required and no value interval bounds it.
+        requires_threshold=False,
     )

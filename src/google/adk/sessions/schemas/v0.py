@@ -20,8 +20,7 @@ v0 schema, see
 https://github.com/google/adk-python/blob/main/docs/upgrading_from_1_22_0.md.
 
 The latest schema is defined in `v1.py`. That module uses JSON serialization
-for the EventActions data as well as other fields in the `events` table. See
-https://github.com/google/adk-python/discussions/3605 for more details.
+for the EventActions data as well as other fields in the `events` table.
 """
 
 from __future__ import annotations
@@ -29,16 +28,20 @@ from __future__ import annotations
 from datetime import datetime
 from datetime import timezone
 import json
+import logging
 import pickle
 from typing import Any
+from typing import cast
 from typing import Optional
-import uuid
 
+from google.adk.platform import uuid as platform_uuid
 from google.genai import types
 from sqlalchemy import Boolean
+from sqlalchemy import desc
+from sqlalchemy import Dialect
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy import func
-from sqlalchemy import inspect
+from sqlalchemy import Index
 from sqlalchemy import Text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.mutable import MutableDict
@@ -49,7 +52,9 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.types import PickleType
 from sqlalchemy.types import String
 from sqlalchemy.types import TypeDecorator
+from sqlalchemy.types import TypeEngine
 
+from .. import _restricted_pickle
 from .. import _session_util
 from ...events.event import Event
 from ...events.event_actions import EventActions
@@ -58,34 +63,76 @@ from .shared import DEFAULT_MAX_KEY_LENGTH
 from .shared import DEFAULT_MAX_VARCHAR_LENGTH
 from .shared import DynamicJSON
 from .shared import PreciseTimestamp
+from .shared import timestamp_to_utc_datetime
+from .shared import utc_datetime_to_timestamp
+
+logger = logging.getLogger("google_adk." + __name__)
+
+_TRUNCATION_SUFFIX = "...[truncated]"
 
 
-class DynamicPickleType(TypeDecorator):
-  """Represents a type that can be pickled."""
+def _truncate_str(value: Optional[str], max_length: int) -> Optional[str]:
+  """Truncates a string to fit within *max_length* characters.
 
-  impl = PickleType
+  Old databases may still carry ``VARCHAR(N)`` columns that were never
+  ALTERed after ADK upgraded the schema definition to ``TEXT``.  Truncating
+  before the INSERT prevents a ``StringDataRightTruncationError`` crash.
+  """
+  if value is not None and len(value) > max_length:
+    truncated = value[: max_length - len(_TRUNCATION_SUFFIX)] + (
+        _TRUNCATION_SUFFIX
+    )
+    logger.warning(
+        "Truncated value from %d to %d characters to fit database"
+        " column constraint. Run the appropriate ALTER TABLE command"
+        " or migrate to the v1 schema to store full-length values.",
+        len(value),
+        max_length,
+    )
+    return truncated
+  return value
 
-  def load_dialect_impl(self, dialect):
+
+class DynamicPickleType(TypeDecorator[object]):  # type: ignore[misc]
+  """Represents a type that can be pickled.
+
+  Values read back from the database are untrusted input, so they are always
+  unpickled through the restricted unpickler.
+  """
+
+  impl = PickleType(pickler=_restricted_pickle)
+  # Behavior depends only on the dialect, which the compiled cache already
+  # keys on, so statements using this type are safe to cache.
+  cache_ok = True
+
+  def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
     if dialect.name == "mysql":
-      return dialect.type_descriptor(mysql.LONGBLOB)
+      return dialect.type_descriptor(mysql.LONGBLOB())
     if dialect.name == "spanner+spanner":
       from google.cloud.sqlalchemy_spanner.sqlalchemy_spanner import SpannerPickleType
 
-      return dialect.type_descriptor(SpannerPickleType)
-    return self.impl
+      return dialect.type_descriptor(SpannerPickleType())
+    return self.impl_instance
 
-  def process_bind_param(self, value, dialect):
+  def process_bind_param(
+      self, value: object | None, dialect: Dialect
+  ) -> object | None:
     """Ensures the pickled value is a bytes object before passing it to the database dialect."""
     if value is not None:
       if dialect.name in ("spanner+spanner", "mysql"):
         return pickle.dumps(value)
     return value
 
-  def process_result_value(self, value, dialect):
+  def process_result_value(
+      self, value: object | None, dialect: Dialect
+  ) -> object | None:
     """Ensures the raw bytes from the database are unpickled back into a Python object."""
     if value is not None:
       if dialect.name in ("spanner+spanner", "mysql"):
-        return pickle.loads(value)
+        decoded: object = _restricted_pickle.loads(
+            cast("bytes | bytearray", value)
+        )
+        return decoded
     return value
 
 
@@ -109,18 +156,25 @@ class StorageSession(Base):
   id: Mapped[str] = mapped_column(
       String(DEFAULT_MAX_KEY_LENGTH),
       primary_key=True,
-      default=lambda: str(uuid.uuid4()),
+      default=platform_uuid.new_uuid,
   )
 
   state: Mapped[MutableDict[str, Any]] = mapped_column(
-      MutableDict.as_mutable(DynamicJSON), default={}
+      MutableDict.as_mutable(DynamicJSON), default=dict
   )
 
   create_time: Mapped[datetime] = mapped_column(
       PreciseTimestamp, default=func.now()
   )
+  # No `onupdate=func.now()` here: `DatabaseSessionService.append_event`
+  # always sets this column explicitly. An `onupdate` default would only
+  # fire when SQLAlchemy considers the column unchanged (the new event's
+  # timestamp equals the one already stored) but another column, such as
+  # `state`, did change -- writing the database's own clock over the
+  # explicit value and desynchronizing the in-memory revision marker read
+  # before commit from what is actually in storage.
   update_time: Mapped[datetime] = mapped_column(
-      PreciseTimestamp, default=func.now(), onupdate=func.now()
+      PreciseTimestamp, default=func.now()
   )
 
   storage_events: Mapped[list[StorageEvent]] = relationship(
@@ -128,7 +182,7 @@ class StorageSession(Base):
       back_populates="storage_session",
   )
 
-  def __repr__(self):
+  def __repr__(self) -> str:
     return f"<StorageSession(id={self.id}, update_time={self.update_time})>"
 
   @property
@@ -137,28 +191,28 @@ class StorageSession(Base):
 
     This is a compatibility alias for callers that used the pre-`main` API.
     """
-    sqlalchemy_session = inspect(self).session
-    is_sqlite = bool(
-        sqlalchemy_session
-        and sqlalchemy_session.bind
-        and sqlalchemy_session.bind.dialect.name == "sqlite"
-    )
-    return self.get_update_timestamp(is_sqlite=is_sqlite)
+    return self.get_update_timestamp()
 
-  def get_update_timestamp(self, is_sqlite: bool) -> float:
+  def get_update_timestamp(self) -> float:
     """Returns the time zone aware update timestamp."""
-    if is_sqlite:
-      # SQLite does not support timezone. SQLAlchemy returns a naive datetime
+    if self.update_time.tzinfo is None:
+      # SQLite and PostgreSQL do not support timezone. SQLAlchemy returns a naive datetime
       # object without timezone information. We need to convert it to UTC
       # manually.
       return self.update_time.replace(tzinfo=timezone.utc).timestamp()
     return self.update_time.timestamp()
 
+  def get_update_marker(self) -> str:
+    """Returns a stable revision marker for optimistic concurrency checks."""
+    update_time = self.update_time
+    if update_time.tzinfo is not None:
+      update_time = update_time.astimezone(timezone.utc)
+    return update_time.isoformat(timespec="microseconds")
+
   def to_session(
       self,
       state: dict[str, Any] | None = None,
       events: list[Event] | None = None,
-      is_sqlite: bool = False,
   ) -> Session:
     """Converts the storage session to a session object."""
     if state is None:
@@ -166,14 +220,16 @@ class StorageSession(Base):
     if events is None:
       events = []
 
-    return Session(
+    session = Session(
         app_name=self.app_name,
         user_id=self.user_id,
         id=self.id,
         state=state,
         events=events,
-        last_update_time=self.get_update_timestamp(is_sqlite=is_sqlite),
+        last_update_time=self.get_update_timestamp(),
     )
+    session._storage_update_marker = self.get_update_marker()
+    return session
 
 
 class StorageEvent(Base):
@@ -196,43 +252,45 @@ class StorageEvent(Base):
 
   invocation_id: Mapped[str] = mapped_column(String(DEFAULT_MAX_VARCHAR_LENGTH))
   author: Mapped[str] = mapped_column(String(DEFAULT_MAX_VARCHAR_LENGTH))
-  actions: Mapped[MutableDict[str, Any]] = mapped_column(DynamicPickleType)
-  long_running_tool_ids_json: Mapped[Optional[str]] = mapped_column(
+  actions: Mapped[EventActions] = mapped_column(DynamicPickleType)
+  long_running_tool_ids_json: Mapped[str | None] = mapped_column(
       Text, nullable=True
   )
-  branch: Mapped[str] = mapped_column(
+  branch: Mapped[str | None] = mapped_column(
       String(DEFAULT_MAX_VARCHAR_LENGTH), nullable=True
   )
-  timestamp: Mapped[PreciseTimestamp] = mapped_column(
+  timestamp: Mapped[datetime] = mapped_column(
       PreciseTimestamp, default=func.now()
   )
 
   # === Fields from llm_response.py ===
-  content: Mapped[dict[str, Any]] = mapped_column(DynamicJSON, nullable=True)
-  grounding_metadata: Mapped[dict[str, Any]] = mapped_column(
+  content: Mapped[dict[str, Any] | None] = mapped_column(
       DynamicJSON, nullable=True
   )
-  custom_metadata: Mapped[dict[str, Any]] = mapped_column(
+  grounding_metadata: Mapped[dict[str, Any] | None] = mapped_column(
       DynamicJSON, nullable=True
   )
-  usage_metadata: Mapped[dict[str, Any]] = mapped_column(
+  custom_metadata: Mapped[dict[str, Any] | None] = mapped_column(
       DynamicJSON, nullable=True
   )
-  citation_metadata: Mapped[dict[str, Any]] = mapped_column(
+  usage_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+      DynamicJSON, nullable=True
+  )
+  citation_metadata: Mapped[dict[str, Any] | None] = mapped_column(
       DynamicJSON, nullable=True
   )
 
-  partial: Mapped[bool] = mapped_column(Boolean, nullable=True)
-  turn_complete: Mapped[bool] = mapped_column(Boolean, nullable=True)
-  error_code: Mapped[str] = mapped_column(
+  partial: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+  turn_complete: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+  error_code: Mapped[str | None] = mapped_column(
       String(DEFAULT_MAX_VARCHAR_LENGTH), nullable=True
   )
-  error_message: Mapped[str] = mapped_column(Text, nullable=True)
-  interrupted: Mapped[bool] = mapped_column(Boolean, nullable=True)
-  input_transcription: Mapped[dict[str, Any]] = mapped_column(
+  error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+  interrupted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+  input_transcription: Mapped[dict[str, Any] | None] = mapped_column(
       DynamicJSON, nullable=True
   )
-  output_transcription: Mapped[dict[str, Any]] = mapped_column(
+  output_transcription: Mapped[dict[str, Any] | None] = mapped_column(
       DynamicJSON, nullable=True
   )
 
@@ -247,7 +305,28 @@ class StorageEvent(Base):
           ["sessions.app_name", "sessions.user_id", "sessions.id"],
           ondelete="CASCADE",
       ),
+      Index(
+          "idx_events_app_user_session_ts_id",
+          "app_name",
+          "user_id",
+          "session_id",
+          desc("timestamp"),
+          desc("id"),
+      ),
   )
+
+  @classmethod
+  def stored_event_fields(cls) -> frozenset[str]:
+    """Returns the names of the event fields this table has a column for.
+
+    Read off the columns rather than listed, so it cannot drift from them. The
+    legacy layout is frozen, so any event field outside this set is one the
+    table can never hold.
+    """
+    names = set(cls.__mapper__.columns.keys())
+    names.discard("long_running_tool_ids_json")
+    names.add("long_running_tool_ids")
+    return frozenset(names)
 
   @property
   def long_running_tool_ids(self) -> set[str]:
@@ -258,7 +337,7 @@ class StorageEvent(Base):
     )
 
   @long_running_tool_ids.setter
-  def long_running_tool_ids(self, value: set[str]):
+  def long_running_tool_ids(self, value: set[str] | None) -> None:
     if value is None:
       self.long_running_tool_ids_json = None
     else:
@@ -275,12 +354,14 @@ class StorageEvent(Base):
         session_id=session.id,
         app_name=session.app_name,
         user_id=session.user_id,
-        timestamp=datetime.fromtimestamp(event.timestamp),
+        timestamp=timestamp_to_utc_datetime(event.timestamp),
         long_running_tool_ids=event.long_running_tool_ids,
         partial=event.partial,
         turn_complete=event.turn_complete,
         error_code=event.error_code,
-        error_message=event.error_message,
+        error_message=_truncate_str(
+            event.error_message, DEFAULT_MAX_VARCHAR_LENGTH
+        ),
         interrupted=event.interrupted,
     )
     if event.content:
@@ -324,7 +405,7 @@ class StorageEvent(Base):
             if self.actions
             else EventActions()
         ),
-        timestamp=self.timestamp.timestamp(),
+        timestamp=utc_datetime_to_timestamp(self.timestamp),
         long_running_tool_ids=self.long_running_tool_ids,
         partial=self.partial,
         turn_complete=self.turn_complete,
@@ -360,7 +441,7 @@ class StorageAppState(Base):
       String(DEFAULT_MAX_KEY_LENGTH), primary_key=True
   )
   state: Mapped[MutableDict[str, Any]] = mapped_column(
-      MutableDict.as_mutable(DynamicJSON), default={}
+      MutableDict.as_mutable(DynamicJSON), default=dict
   )
   update_time: Mapped[datetime] = mapped_column(
       PreciseTimestamp, default=func.now(), onupdate=func.now()
@@ -379,7 +460,7 @@ class StorageUserState(Base):
       String(DEFAULT_MAX_KEY_LENGTH), primary_key=True
   )
   state: Mapped[MutableDict[str, Any]] = mapped_column(
-      MutableDict.as_mutable(DynamicJSON), default={}
+      MutableDict.as_mutable(DynamicJSON), default=dict
   )
   update_time: Mapped[datetime] = mapped_column(
       PreciseTimestamp, default=func.now(), onupdate=func.now()

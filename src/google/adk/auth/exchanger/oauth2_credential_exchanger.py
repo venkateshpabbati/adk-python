@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 from typing import Optional
 
@@ -34,7 +36,7 @@ from .base_credential_exchanger import CredentialExchangeError
 from .base_credential_exchanger import ExchangeResult
 
 try:
-  from authlib.integrations.requests_client import OAuth2Session
+  from authlib.integrations.requests_client import OAuth2Session  # noqa: F401
 
   AUTHLIB_AVAILABLE = True
 except ImportError:
@@ -101,6 +103,21 @@ class OAuth2CredentialExchanger(BaseCredentialExchanger):
       logger.warning("Unsupported OAuth2 grant type: %s", grant_type)
       return ExchangeResult(auth_credential, False)
 
+  def _exchange_sync(
+      self,
+      auth_credential: AuthCredential,
+      auth_scheme: Optional[AuthScheme] = None,
+  ) -> ExchangeResult:
+    """Same as `exchange`, for framework callers that cannot await.
+
+    The exchange runs on a worker thread with its own event loop, so a loop
+    already running on the calling thread is never reentered.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+      return executor.submit(
+          asyncio.run, self.exchange(auth_credential, auth_scheme)
+      ).result()
+
   def _determine_grant_type(
       self, auth_scheme: AuthScheme
   ) -> Optional[OAuthGrantType]:
@@ -150,7 +167,9 @@ class OAuth2CredentialExchanger(BaseCredentialExchanger):
       return ExchangeResult(auth_credential, False)
 
     try:
-      tokens = client.fetch_token(
+      # authlib's client is synchronous; run it off the event loop.
+      tokens = await asyncio.to_thread(
+          client.fetch_token,
           token_endpoint,
           grant_type=OAuthGrantType.CLIENT_CREDENTIALS,
       )
@@ -186,21 +205,31 @@ class OAuth2CredentialExchanger(BaseCredentialExchanger):
         boolean indicating whether the credential was exchanged.
     """
     client, token_endpoint = create_oauth2_session(auth_scheme, auth_credential)
-    if not client:
+    if not client or not auth_credential.oauth2:
       logger.warning(
           "Could not create OAuth2 session for authorization code exchange"
       )
       return ExchangeResult(auth_credential, False)
 
     try:
-      tokens = client.fetch_token(
+      kwargs = {}
+      # If a code_verifier is available (e.g. from PKCE), include it in the
+      # token exchange request.
+      if auth_credential.oauth2 and auth_credential.oauth2.code_verifier:
+        kwargs["code_verifier"] = auth_credential.oauth2.code_verifier
+
+      # Authlib already injects client_id for body-based client auth flows such
+      # as client_secret_post, so passing it here would duplicate the field.
+      # authlib's client is synchronous; run it off the event loop.
+      tokens = await asyncio.to_thread(
+          client.fetch_token,
           token_endpoint,
           authorization_response=self._normalize_auth_uri(
               auth_credential.oauth2.auth_response_uri
           ),
           code=auth_credential.oauth2.auth_code,
           grant_type=OAuthGrantType.AUTHORIZATION_CODE,
-          client_id=auth_credential.oauth2.client_id,
+          **kwargs,
       )
       update_credential_with_tokens(auth_credential, tokens)
       logger.debug("Successfully exchanged authorization code for access token")

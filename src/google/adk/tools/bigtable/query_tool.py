@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 """Tool to execute SQL queries against Bigtable."""
+import asyncio
 import json
 import logging
 from typing import Any
@@ -22,7 +23,7 @@ from typing import Dict
 from typing import List
 
 from google.auth.credentials import Credentials
-from google.cloud import bigtable
+from google.cloud.bigtable import data
 
 from . import client
 from ..tool_context import ToolContext
@@ -33,14 +34,17 @@ logger = logging.getLogger("google_adk." + __name__)
 DEFAULT_MAX_EXECUTED_QUERY_RESULT_ROWS = 50
 
 
-def execute_sql(
+async def execute_sql(
     project_id: str,
     instance_id: str,
     query: str,
     credentials: Credentials,
     settings: BigtableToolSettings,
     tool_context: ToolContext,
-) -> dict:
+    parameters: Dict[str, Any] | None = None,
+    parameter_types: Dict[str, Any] | None = None,
+    _view_parameters: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
   """Execute a GoogleSQL query from a Bigtable table.
 
   Args:
@@ -51,6 +55,11 @@ def execute_sql(
       credentials (Credentials): The credentials to use for the request.
       settings (BigtableToolSettings): The configuration for the tool.
       tool_context (ToolContext): The context for the tool.
+      parameters (dict): properties for parameter replacement. Keys must match
+        the names used in ``query``.
+      parameter_types (dict): maps explicit types for one or more param values.
+      _view_parameters (dict): maps properties for parameterized views.
+
   Returns:
       dict: Dictionary containing the status and the rows read.
             If the result contains the key "result_is_likely_truncated" with
@@ -59,64 +68,79 @@ def execute_sql(
 
   Examples:
       Fetch data or insights from a table:
-
-          >>> execute_sql("my_project", "my_instance",
-          ... "SELECT * from mytable", credentials, config, tool_context)
-          {
-            "status": "SUCCESS",
-            "rows": [
-                {
-                    "user_id": 1,
-                    "user_name": "Alice"
-                }
-            ]
-          }
+      <Example>
+        >>> await execute_sql("my_project", "my_instance",
+        ... "SELECT * from mytable", credentials, config, tool_context)
+        {
+          "status": "SUCCESS",
+          "rows": [
+              {
+                  "user_id": 1,
+                  "user_name": "Alice"
+              }
+          ]
+        }
+      </Example>
   """
   del tool_context  # Unused for now
 
-  try:
-    bt_client = client.get_bigtable_data_client(
-        project=project_id, credentials=credentials
-    )
-    eqi = bt_client.execute_query(
-        query=query,
-        instance_id=instance_id,
-    )
-
-    rows: List[Dict[str, Any]] = []
-    max_rows = (
-        settings.max_query_result_rows
-        if settings and settings.max_query_result_rows > 0
-        else DEFAULT_MAX_EXECUTED_QUERY_RESULT_ROWS
-    )
-    counter = max_rows
-    truncated = False
+  def _execute_sql() -> Dict[str, Any]:
+    bt_client: data.BigtableDataClient | None = None
     try:
-      for row in eqi:
-        if counter <= 0:
-          truncated = True
-          break
-        row_values = {}
-        for key, val in dict(row.fields).items():
-          try:
-            # if the json serialization of the value succeeds, use it as is
-            json.dumps(val)
-          except (TypeError, ValueError, OverflowError):
-            val = str(val)
-          row_values[key] = val
-        rows.append(row_values)
-        counter -= 1
+      bt_client = client.get_bigtable_data_client(
+          project=project_id, credentials=credentials
+      )
+      eqi = bt_client.execute_query(
+          query=query,
+          instance_id=instance_id,
+          parameters=parameters,
+          parameter_types=parameter_types,
+          view_parameters=_view_parameters,
+      )
+
+      rows: List[Dict[str, Any]] = []
+      max_rows = (
+          settings.max_query_result_rows
+          if settings and settings.max_query_result_rows > 0
+          else DEFAULT_MAX_EXECUTED_QUERY_RESULT_ROWS
+      )
+      counter = max_rows
+      truncated = False
+      try:
+        for row in eqi:
+          if counter <= 0:
+            truncated = True
+            break
+          row_values = {}
+          for key, val in dict(row.fields).items():
+            try:
+              # if the json serialization of the value succeeds, use it as is
+              json.dumps(val)
+            except (TypeError, ValueError, OverflowError):
+              val = str(val)
+            row_values[key] = val
+          rows.append(row_values)
+          counter -= 1
+      finally:
+        eqi.close()
+
+      result: Dict[str, Any] = {"status": "SUCCESS", "rows": rows}
+      if truncated:
+        result["result_is_likely_truncated"] = True
+      return result
+
+    except Exception as ex:
+      logger.exception("Bigtable query failed")
+      return {
+          "status": "ERROR",
+          "error_details": str(ex),
+      }
     finally:
-      eqi.close()
+      if bt_client is not None:
+        try:
+          bt_client.close()
+        except Exception:
+          # Failing to release the client must not discard the tool's result.
+          logger.exception("Failed to close the Bigtable client")
 
-    result = {"status": "SUCCESS", "rows": rows}
-    if truncated:
-      result["result_is_likely_truncated"] = True
-    return result
-
-  except Exception as ex:
-    logger.error("Bigtable query failed: %s", ex)
-    return {
-        "status": "ERROR",
-        "error_details": str(ex),
-    }
+  return await asyncio.to_thread(_execute_sql)
