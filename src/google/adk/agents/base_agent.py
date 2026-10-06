@@ -42,6 +42,7 @@ from typing_extensions import deprecated
 from typing_extensions import override
 from typing_extensions import TypeAlias
 
+from ..events._node_path_builder import _NodePathBuilder
 from ..events.event import Event
 from ..events.event_actions import EventActions
 from ..features import experimental
@@ -92,6 +93,18 @@ class BaseAgentState(BaseModel):
 
 
 AgentState = TypeVar('AgentState', bound=BaseAgentState)
+
+
+def _agent_state_key(ctx: Any, agent_name: str) -> str:
+  """Returns the key used to store agent state for `agent_name`."""
+  node_path = getattr(ctx, 'node_path', None)
+  if (
+      isinstance(node_path, str)
+      and node_path
+      and _NodePathBuilder.from_string(node_path).node_name == agent_name
+  ):
+    return node_path
+  return agent_name
 
 
 # TODO: drop the explicit abc.ABC base once BaseNode surfaces ABCMeta to
@@ -204,10 +217,20 @@ class BaseAgent(BaseNode, abc.ABC):
     Returns:
         The current state if exists; otherwise, None.
     """
-    if ctx.agent_states is None or self.name not in ctx.agent_states:
+    if ctx.agent_states is None:
       return None
-    else:
-      return state_type.model_validate(ctx.agent_states.get(self.name))
+    key = _agent_state_key(ctx, self.name)
+    raw_state = ctx.agent_states.get(key) if key in ctx.agent_states else None
+    if (
+        raw_state is None
+        and key != self.name
+        and key not in ctx.end_of_agents
+        and self.name in ctx.agent_states
+    ):
+      raw_state = ctx.agent_states.get(self.name)
+    if raw_state is None:
+      return None
+    return state_type.model_validate(raw_state)
 
   def _create_agent_state_event(
       self,
@@ -222,9 +245,20 @@ class BaseAgent(BaseNode, abc.ABC):
       An event with the current agent state set in the invocation context.
     """
     event_actions = EventActions()
-    if (agent_state := ctx.agent_states.get(self.name)) is not None:
+    key = _agent_state_key(ctx, self.name)
+    agent_state = ctx.agent_states.get(key)
+    if (
+        agent_state is None
+        and key != self.name
+        and key not in ctx.end_of_agents
+    ):
+      agent_state = ctx.agent_states.get(self.name)
+    if agent_state is not None:
       event_actions.agent_state = agent_state
-    if ctx.end_of_agents.get(self.name):
+    end_of_agent = ctx.end_of_agents.get(key)
+    if end_of_agent is None and key != self.name:
+      end_of_agent = ctx.end_of_agents.get(self.name)
+    if end_of_agent:
       event_actions.end_of_agent = True
     return Event(
         invocation_id=ctx.invocation_id,
@@ -512,31 +546,38 @@ class BaseAgent(BaseNode, abc.ABC):
     """
     return _normalize_callbacks(self.after_agent_callback)
 
-  async def _handle_before_agent_callback(
-      self, ctx: InvocationContext
+  async def _handle_agent_callbacks(
+      self,
+      ctx: InvocationContext,
+      *,
+      plugin_hook: Callable[..., Awaitable[Optional[types.Content]]],
+      callbacks: list[_SingleAgentCallback],
+      end_invocation_on_content: bool,
   ) -> Optional[Event]:
-    """Runs the before_agent_callback if it exists.
+    """Runs the plugin hook and then the canonical agent callbacks.
 
     Args:
       ctx: InvocationContext, the invocation context for this agent.
+      plugin_hook: The plugin manager hook consulted before the canonical
+        callbacks. A non-empty result from it suppresses them.
+      callbacks: The canonical callbacks to run when the plugins provide no
+        override.
+      end_invocation_on_content: Whether returned content ends the invocation.
 
     Returns:
-      Optional[Event]: an event if callback provides content or changed state.
+      Optional[Event]: an event if a callback provides content or changed state.
     """
     callback_context = CallbackContext(ctx)
 
     # Run callbacks from the plugins.
-    before_agent_callback_content = (
-        await ctx.plugin_manager.run_before_agent_callback(
-            agent=self, callback_context=callback_context
-        )
+    callback_content = await plugin_hook(
+        agent=self, callback_context=callback_context
     )
 
     # If no overrides are provided from the plugins, further run the canonical
     # callbacks.
-    callbacks = self.canonical_before_agent_callbacks
-    if not before_agent_callback_content and callbacks:
-      before_agent_callback_content = await _run_callbacks(
+    if not callback_content and callbacks:
+      callback_content = await _run_callbacks(
           callbacks,
           _stop_on_truthy,
           callback_context=callback_context,
@@ -544,15 +585,16 @@ class BaseAgent(BaseNode, abc.ABC):
 
     # Process the override content if exists, and further process the state
     # change if exists.
-    if before_agent_callback_content:
+    if callback_content:
       ret_event = Event(
           invocation_id=ctx.invocation_id,
           author=self.name,
           branch=ctx.branch,
-          content=before_agent_callback_content,
+          content=callback_content,
           actions=callback_context._event_actions,
       )
-      ctx.end_invocation = True
+      if end_invocation_on_content:
+        ctx.end_invocation = True
       return ret_event
 
     if callback_context.state.has_delta():
@@ -564,6 +606,24 @@ class BaseAgent(BaseNode, abc.ABC):
       )
 
     return None
+
+  async def _handle_before_agent_callback(
+      self, ctx: InvocationContext
+  ) -> Optional[Event]:
+    """Runs the before_agent_callback if it exists.
+
+    Args:
+      ctx: InvocationContext, the invocation context for this agent.
+
+    Returns:
+      Optional[Event]: an event if callback provides content or changed state.
+    """
+    return await self._handle_agent_callbacks(
+        ctx,
+        plugin_hook=ctx.plugin_manager.run_before_agent_callback,
+        callbacks=self.canonical_before_agent_callbacks,
+        end_invocation_on_content=True,
+    )
 
   async def _handle_after_agent_callback(
       self, invocation_context: InvocationContext
@@ -577,47 +637,12 @@ class BaseAgent(BaseNode, abc.ABC):
     Returns:
       Optional[Event]: an event if callback provides content or changed state.
     """
-
-    callback_context = CallbackContext(invocation_context)
-
-    # Run callbacks from the plugins.
-    after_agent_callback_content = (
-        await invocation_context.plugin_manager.run_after_agent_callback(
-            agent=self, callback_context=callback_context
-        )
+    return await self._handle_agent_callbacks(
+        invocation_context,
+        plugin_hook=invocation_context.plugin_manager.run_after_agent_callback,
+        callbacks=self.canonical_after_agent_callbacks,
+        end_invocation_on_content=False,
     )
-
-    # If no overrides are provided from the plugins, further run the canonical
-    # callbacks.
-    callbacks = self.canonical_after_agent_callbacks
-    if not after_agent_callback_content and callbacks:
-      after_agent_callback_content = await _run_callbacks(
-          callbacks,
-          _stop_on_truthy,
-          callback_context=callback_context,
-      )
-
-    # Process the override content if exists, and further process the state
-    # change if exists.
-    if after_agent_callback_content:
-      ret_event = Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          branch=invocation_context.branch,
-          content=after_agent_callback_content,
-          actions=callback_context._event_actions,
-      )
-      return ret_event
-
-    if callback_context.state.has_delta():
-      return Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          branch=invocation_context.branch,
-          content=after_agent_callback_content,
-          actions=callback_context._event_actions,
-      )
-    return None
 
   async def _handle_agent_error_callback(
       self,
