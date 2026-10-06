@@ -39,6 +39,7 @@ from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactServ
 from google.adk.auth.auth_credential import _redact_credential_secrets
 from google.adk.cli import api_server as api_server_module
 from google.adk.cli import fast_api as fast_api_module
+from google.adk.cli import service_registry as service_registry_module
 from google.adk.cli.api_server import RunAgentRequest
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.utils.base_agent_loader import _AgentLoadError
@@ -6094,6 +6095,94 @@ def test_single_agent_mode_detection(
     response = client.get("/list-apps")
     assert response.status_code == 200
     assert response.json() == ["my_only_agent"]
+
+
+def test_single_agent_mode_loads_services_module_from_agent_dir(
+    tmp_path,
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Verify a services module in the agent folder registers custom services."""
+  agent_folder = tmp_path / "my_only_agent"
+  agent_folder.mkdir()
+  (agent_folder / "agent.py").write_text("root_agent = None")
+  (agent_folder / "services.py").write_text(
+      "from google.adk.cli.service_registry import get_service_registry\n"
+      "\n"
+      "\n"
+      "def _custom_session_factory(uri, **kwargs):\n"
+      "  return 'custom-session-service'\n"
+      "\n"
+      "\n"
+      "get_service_registry().register_session_service(\n"
+      "    'customscheme', _custom_session_factory\n"
+      ")\n"
+  )
+
+  original_sys_path = list(sys.path)
+  sys.modules.pop("services", None)
+
+  try:
+    # A fresh registry can only know the scheme if the agent's services.py ran.
+    with (
+        patch.object(
+            service_registry_module, "_service_registry_instance", None
+        ),
+        patch.object(signal, "signal", autospec=True, return_value=None),
+        patch.object(
+            fast_api_module,
+            "create_session_service_from_options",
+            autospec=True,
+            return_value=mock_session_service,
+        ),
+        patch.object(
+            fast_api_module,
+            "create_artifact_service_from_options",
+            autospec=True,
+            return_value=mock_artifact_service,
+        ),
+        patch.object(
+            fast_api_module,
+            "create_memory_service_from_options",
+            autospec=True,
+            return_value=mock_memory_service,
+        ),
+        patch.object(
+            fast_api_module,
+            "LocalEvalSetsManager",
+            autospec=True,
+            return_value=mock_eval_sets_manager,
+        ),
+        patch.object(
+            fast_api_module,
+            "LocalEvalSetResultsManager",
+            autospec=True,
+            return_value=mock_eval_set_results_manager,
+        ),
+    ):
+      get_fast_api_app(
+          agents_dir=str(agent_folder),
+          web=True,
+          session_service_uri="",
+          artifact_service_uri="",
+          memory_service_uri="",
+          allow_origins=None,
+          a2a=False,
+          host="127.0.0.1",
+          port=8000,
+      )
+
+      registry = service_registry_module.get_service_registry()
+      assert (
+          registry.create_session_service("customscheme://db")
+          == "custom-session-service"
+      )
+  finally:
+    sys.modules.pop("services", None)
+    sys.path[:] = original_sys_path
 
 
 def test_single_agent_mode_sets_default_app(

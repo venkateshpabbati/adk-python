@@ -269,8 +269,8 @@ def get_fast_api_app(
       web and bind_host is not None and _is_loopback_address(bind_host)
   )
 
-  # Load services.py from agents_dir for custom service registration.
-  load_services_module(agents_dir)
+  # services.py lives in the folder the user passed, not the rewritten parent.
+  load_services_module(original_agents_dir)
 
   # Build the Memory service
   try:
