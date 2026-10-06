@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 from urllib.parse import quote
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from google.adk.a2a import _compat
 from google.adk.agents.base_agent import BaseAgent
@@ -40,6 +41,7 @@ from google.adk.cli import api_server as api_server_module
 from google.adk.cli import fast_api as fast_api_module
 from google.adk.cli.api_server import RunAgentRequest
 from google.adk.cli.fast_api import get_fast_api_app
+from google.adk.cli.utils.base_agent_loader import _AgentLoadError
 from google.adk.errors.input_validation_error import InputValidationError
 from google.adk.errors.session_not_found_error import SessionNotFoundError
 from google.adk.evaluation.eval_case import EvalCase
@@ -769,7 +771,6 @@ def test_api_server_get_runner_async_rejects_internal_special_agent_name(
     mock_eval_sets_manager,
     mock_eval_set_results_manager,
 ):
-  from fastapi import HTTPException
   from google.adk.cli.api_server import ApiServer
 
   special_app_name = "__adk_agent_builder_assistant"
@@ -1523,6 +1524,55 @@ def test_agent_run_sse_unknown_app_returns_404(test_app, mock_agent_loader):
     response = test_app.post("/run_sse", json=payload)
     assert response.status_code == 404
     assert "Agent not found: unknown_app" in response.json()["detail"]
+
+
+def test_get_adk_app_info_load_failure_returns_500(test_app, mock_agent_loader):
+  """Test app-info returns 500, not 404, when the agent fails to load."""
+  with patch.object(
+      mock_agent_loader,
+      "load_agent",
+      side_effect=_AgentLoadError(
+          "Fail to load 'broken_app' module. ToolConfig"
+      ),
+  ):
+    response = test_app.get("/apps/broken_app/app-info")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to load agent"
+
+
+def test_get_adk_app_info_loader_http_error_is_preserved(
+    test_app, mock_agent_loader
+):
+  """Test a loader's own HTTPException keeps its status."""
+  with patch.object(
+      mock_agent_loader,
+      "load_agent",
+      side_effect=HTTPException(status_code=403, detail="Not your agent"),
+  ):
+    response = test_app.get("/apps/forbidden_app/app-info")
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Not your agent"
+
+
+def test_agent_run_sse_load_failure_returns_500(test_app, mock_agent_loader):
+  """Test /run_sse returns 500, not 404, when the agent fails to load."""
+  payload = {
+      "app_name": "broken_app",
+      "user_id": "test_user",
+      "session_id": "test_session",
+      "new_message": {"role": "user", "parts": [{"text": "Hello agent"}]},
+      "streaming": True,
+  }
+  with patch.object(
+      mock_agent_loader,
+      "load_agent",
+      side_effect=_AgentLoadError(
+          "Fail to load 'broken_app' module. ToolConfig"
+      ),
+  ):
+    response = test_app.post("/run_sse", json=payload)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to load agent"
 
 
 def test_create_session_with_id(test_app, test_session_info):
