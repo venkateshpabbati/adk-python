@@ -823,7 +823,7 @@ def test_special_agents_allowed_only_on_loopback_web_server(
 ):
   # The agent builder assistant writes files the server imports, and the dev
   # server is unauthenticated, so it must not be reachable off the machine.
-  _create_test_client(
+  client = _create_test_client(
       mock_session_service,
       mock_artifact_service,
       mock_memory_service,
@@ -835,6 +835,14 @@ def test_special_agents_allowed_only_on_loopback_web_server(
   )
 
   assert mock_agent_loader._allow_special_agents is expected
+  if not expected:
+    # Refused by the server itself, not by a 500 from the loader.
+    response = client.get(
+        "/apps/__adk_agent_builder_assistant/app-info",
+        headers={"host": "127.0.0.1:8000"},
+    )
+    assert response.status_code == 403
+    assert "internal special agents" in response.json()["detail"]
 
 
 @pytest.fixture
@@ -6973,7 +6981,6 @@ def test_span_buffers_filled_when_web_enabled(
 
 
 def test_app_info_rejects_special_agent_only_in_api_server_mode(
-    test_app,
     mock_session_service,
     mock_artifact_service,
     mock_memory_service,
@@ -6996,9 +7003,21 @@ def test_app_info_rejects_special_agent_only_in_api_server_mode(
   assert blocked.status_code == 403
   assert "internal special agents" in blocked.json()["detail"]
 
-  # Same request on the dev server gets past the guard and is answered on the
-  # merits of the loaded agent (which here is not an LlmAgent).
-  allowed = test_app.get("/apps/__internal_assistant/app-info")
+  # Same request on a loopback-bound dev server gets past the guard and is
+  # answered on the merits of the loaded agent (which here is not an LlmAgent).
+  dev_client = _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      bind_host="127.0.0.1",
+  )
+  allowed = dev_client.get(
+      "/apps/__internal_assistant/app-info",
+      headers={"host": "127.0.0.1:8000"},
+  )
   assert allowed.status_code == 400
   assert allowed.json()["detail"] == "Root agent is not an LlmAgent"
 

@@ -347,6 +347,10 @@ def get_fast_api_app(
       avatar_config=avatar_config,
       max_llm_calls=max_llm_calls,
   )
+  # DevServer allows the built-in agents by default. Follow the loader, so a
+  # refused request gets the server's 403 rather than a 500 from the loader's
+  # PermissionError.
+  adk_web_server._allow_special_agents = agent_loader._allow_special_agents
 
   # In single agent mode, use that agent as the default app.
   if is_single_agent:
