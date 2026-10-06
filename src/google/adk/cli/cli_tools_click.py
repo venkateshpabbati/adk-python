@@ -2531,6 +2531,20 @@ def cli_api_server(
         " execution. Requires the 'gcloud beta run deploy' release track."
     ),
 )
+@click.option(
+    "--extra_packages",
+    multiple=True,
+    type=str,
+    default=(),
+    help=(
+        "Optional. Additional local package paths (a file or directory) to"
+        " stage and deploy alongside the agent, and make importable in the"
+        " deployed image. Each entry is placed at `/app/<basename>` and `/app`"
+        " is added to PYTHONPATH, so a top-level name that matches an installed"
+        " dependency will shadow it at runtime; pick distinct names."
+        " Repeatable."
+    ),
+)
 @deploy_options
 @adk_services_options(default_use_local_storage=False)
 @click.pass_context
@@ -2560,6 +2574,7 @@ def cli_deploy_cloud_run(
     trigger_oidc_service_accounts: str | None = None,
     provider_args: tuple[str, ...] = (),
     env: tuple[str, ...] = (),
+    extra_packages: tuple[str, ...] = (),
 ):
   """Deploys an agent to Cloud Run.
 
@@ -2610,6 +2625,7 @@ def cli_deploy_cloud_run(
         env=env,
         extra_gcloud_args=tuple(gcloud_args),
         with_cloud_run_sandbox=with_cloud_run_sandbox,
+        extra_packages=list(extra_packages),
     )
   except (click.ClickException, click.Abort):
     raise
@@ -3203,6 +3219,20 @@ def cli_deploy_agent_engine(
     ),
     default=None,
 )
+@click.option(
+    "--extra_packages",
+    multiple=True,
+    type=str,
+    default=(),
+    help=(
+        "Optional. Additional local package paths (a file or directory) to"
+        " stage and deploy alongside the agent, and make importable in the"
+        " deployed image. Each entry is placed at `/app/<basename>` and `/app`"
+        " is added to PYTHONPATH, so a top-level name that matches an installed"
+        " dependency will shadow it at runtime; pick distinct names."
+        " Repeatable."
+    ),
+)
 @adk_services_options(default_use_local_storage=False)
 @click.argument(
     "agent",
@@ -3232,6 +3262,7 @@ def cli_deploy_gke(
     trigger_sources: str | None = None,
     trigger_oidc_audience: str | None = None,
     trigger_oidc_service_accounts: str | None = None,
+    extra_packages: tuple[str, ...] = (),
 ):
   """Deploys an agent to GKE.
 
@@ -3268,6 +3299,7 @@ def cli_deploy_gke(
         trigger_sources=trigger_sources,
         trigger_oidc_audience=trigger_oidc_audience,
         trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+        extra_packages=list(extra_packages),
     )
   except (click.ClickException, click.Abort):
     raise
