@@ -542,6 +542,45 @@ def test_to_gke_without_region_omits_location(
   assert "GOOGLE_CLOUD_LOCATION" not in yaml_content
 
 
+def test_to_gke_installs_telemetry_extras(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: Callable[[bool, bool], Path],
+    tmp_path: Path,
+) -> None:
+  """The container must install the extras the telemetry flags need."""
+  src_dir = agent_dir(False, False)
+
+  def mock_subprocess_run(*args, **kwargs):
+    if args[0][0:2] == ["kubectl", "apply"]:
+      return types.SimpleNamespace(stdout="deployment.apps/gke-svc created")
+    return None
+
+  monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+
+  cli_deploy.to_gke(
+      agent_folder=str(src_dir),
+      project="gke-proj",
+      region="us-east1",
+      cluster_name="my-gke-cluster",
+      service_name="gke-svc",
+      app_name="agent",
+      temp_folder=str(tmp_path),
+      port=9090,
+      trace_to_cloud=False,
+      otel_to_cloud=True,
+      with_ui=False,
+      log_level="debug",
+      adk_version="1.2.0",
+  )
+
+  dockerfile_content = (tmp_path / "Dockerfile").read_text()
+  assert (
+      'RUN ["pip", "install", "google-adk[a2a,gcp,otel-gcp]==1.2.0"]'
+      in dockerfile_content
+  )
+
+
 def test_to_gke_uses_gcloud_cmd_on_windows(
     monkeypatch: pytest.MonkeyPatch,
     agent_dir: Callable[[bool, bool], Path],
@@ -1268,6 +1307,35 @@ def test_to_agent_engine_with_extra_packages_adds_to_source_packages(
   assert "agents/agent" in source_packages
   assert "Dockerfile" in source_packages
   assert "my_extra_pkg" in source_packages
+
+
+def test_to_agent_engine_installs_telemetry_extras(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: Callable[[bool, bool], Path],
+) -> None:
+  """The container must install the extras the telemetry flags need."""
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+  captured: List[Dict[str, Any]] = []
+  monkeypatch.setitem(
+      sys.modules, "vertexai", _make_recording_vertexai(captured)
+  )
+  src_dir = agent_dir(False, False)
+  tmp_dir = src_dir.parent / "tmp"
+
+  cli_deploy.to_agent_engine(
+      agent_folder=str(src_dir),
+      temp_folder="tmp",
+      project="my-gcp-project",
+      region="us-central1",
+      adk_version="1.2.0",
+      otel_to_cloud=True,
+  )
+
+  dockerfile_content = (tmp_dir / "Dockerfile").read_text()
+  assert (
+      'RUN ["pip", "install", "google-adk[a2a,gcp,otel-gcp]==1.2.0"]'
+      in dockerfile_content
+  )
 
 
 def test_to_agent_engine_with_extra_packages_copies_into_temp_and_dockerfile(

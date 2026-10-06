@@ -170,7 +170,8 @@ def test_to_cloud_run_happy_path(
   )
   assert "USER myuser" in dockerfile_content
   assert (
-      'RUN ["pip", "install", "google-adk[a2a]==1.3.0"]' in dockerfile_content
+      'RUN ["pip", "install", "google-adk[a2a,gcp,otel-gcp]==1.3.0"]'
+      in dockerfile_content
   )
   assert "--trace_to_cloud" in cmd_argv
   assert "--otel_to_cloud" in cmd_argv
@@ -212,6 +213,52 @@ def test_to_cloud_run_happy_path(
   assert gcloud_args == expected_gcloud_command
 
   assert str(rmtree_recorder.get_last_call_args()[0]) == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "trace_to_cloud, otel_to_cloud, expected_extras",
+    [
+        (False, False, "a2a"),
+        (True, False, "a2a,gcp,otel-gcp"),
+        (False, True, "a2a,gcp,otel-gcp"),
+        (True, True, "a2a,gcp,otel-gcp"),
+    ],
+)
+def test_to_cloud_run_installs_telemetry_extras(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: AgentDirFixture,
+    tmp_path: Path,
+    trace_to_cloud: bool,
+    otel_to_cloud: bool,
+    expected_extras: str,
+) -> None:
+  """The container must install the extras the telemetry flags need."""
+  src_dir = agent_dir(include_requirements=False, include_env=False)
+  monkeypatch.setattr(subprocess, "run", _Recorder())
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+
+  cli_deploy.run(
+      agent_folder=str(src_dir),
+      provider="cloud_run",
+      project="proj",
+      region="us-central1",
+      service_name="svc",
+      app_name="agent",
+      temp_folder=str(tmp_path),
+      port=8080,
+      trace_to_cloud=trace_to_cloud,
+      otel_to_cloud=otel_to_cloud,
+      with_ui=False,
+      log_level="info",
+      verbosity="info",
+      adk_version="1.3.0",
+  )
+
+  dockerfile_content = (tmp_path / "Dockerfile").read_text()
+  assert (
+      f'RUN ["pip", "install", "google-adk[{expected_extras}]==1.3.0"]'
+      in dockerfile_content
+  )
 
 
 def test_to_cloud_run_cleans_temp_dir(
