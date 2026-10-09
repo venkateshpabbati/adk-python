@@ -24,22 +24,20 @@ from typing import TYPE_CHECKING
 from google.adk.platform import uuid as platform_uuid
 from google.genai import types
 
-from ....auth.auth_tool import AuthConfig
-from ....auth.auth_tool import AuthToolArguments
 from ....events.event import Event
 from ....tools.base_tool import BaseTool
 from ....tools.tool_confirmation import ToolConfirmation
+from ....utils._function_call_names import AF_FUNCTION_CALL_ID_PREFIX as AF_FUNCTION_CALL_ID_PREFIX
+from ....utils._function_call_names import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME as REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
+from ....utils._function_call_names import REQUEST_EUC_FUNCTION_CALL_NAME as REQUEST_EUC_FUNCTION_CALL_NAME
+from ....utils._function_call_names import REQUEST_INPUT_FUNCTION_CALL_NAME as REQUEST_INPUT_FUNCTION_CALL_NAME
 from ..core._utils import require_agent_name as _require_agent_name
 from ._batch_executor import handle_function_call_list_async as _handle_function_call_list_async
 from ._live_caller import handle_function_calls_live as _handle_function_calls_live
 
 if TYPE_CHECKING:
   from ....agents.invocation_context import InvocationContext
-
-AF_FUNCTION_CALL_ID_PREFIX = 'adk-'
-REQUEST_EUC_FUNCTION_CALL_NAME = 'adk_request_credential'
-REQUEST_CONFIRMATION_FUNCTION_CALL_NAME = 'adk_request_confirmation'
-REQUEST_INPUT_FUNCTION_CALL_NAME = 'adk_request_input'
+  from ....auth.auth_tool import AuthConfig
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -137,6 +135,8 @@ def build_auth_request_event(
   Returns:
     Event with auth request function calls.
   """
+  from ....auth.auth_tool import AuthToolArguments
+
   parts: list[types.Part] = []
   long_running_tool_ids: set[str] = set()
 

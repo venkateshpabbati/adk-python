@@ -155,9 +155,6 @@ XFAIL_LOAD = {
     "models/hello_world_litellm_add_function_to_prompt": (
         "langchain_core requires an explicit import of langchain_core.tools"
     ),
-    "adk_team/adk_triaging_agent": (
-        "agent.py imports adk_triaging_agent.settings, which is not present"
-    ),
 }
 
 _DUMMY_ENV = {
@@ -281,8 +278,9 @@ def test_knowledge_agent_requires_datastore_env(monkeypatch):
   for key, value in _DUMMY_ENV.items():
     monkeypatch.setenv(key, value)
   monkeypatch.delenv("VERTEXAI_DATASTORE_ID")
-  with pytest.raises(ValueError, match="VERTEXAI_DATASTORE_ID"):
+  with pytest.raises(RuntimeError, match="VERTEXAI_DATASTORE_ID") as exc_info:
     _load_root_agent(SAMPLES_DIR / "adk_team" / "adk_knowledge_agent")
+  assert isinstance(exc_info.value.__cause__, ValueError)
 
 
 @pytest.mark.parametrize(

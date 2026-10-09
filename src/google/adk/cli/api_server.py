@@ -87,9 +87,6 @@ from ..events._internal_metadata import public_event
 from ..events._internal_metadata import public_session
 from ..events.event import Event
 from ..events.event_actions import EventActions
-from ..flows.llm_flows.tools._functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
-from ..flows.llm_flows.tools._functions import REQUEST_EUC_FUNCTION_CALL_NAME
-from ..flows.llm_flows.tools._functions import REQUEST_INPUT_FUNCTION_CALL_NAME
 from ..live.live_request_queue import LiveRequest
 from ..live.live_request_queue import LiveRequestQueue
 from ..memory.base_memory_service import BaseMemoryService
@@ -98,6 +95,7 @@ from ..plugins.base_plugin import BasePlugin
 from ..runners import Runner
 from ..sessions.base_session_service import BaseSessionService
 from ..sessions.session import Session
+from ..utils._function_call_names import CLIENT_FUNCTION_CALL_NAMES as _CLIENT_FUNCTION_CALL_NAMES
 from ..utils._telemetry_config import read_telemetry_consent
 from ..utils.agent_info import AgentInfo
 from ..utils.agent_info import get_agents_dict
@@ -108,6 +106,7 @@ from .cli_eval import _LEGACY_EVAL_SESSION_ID_PREFIX
 from .cli_eval import EVAL_SESSION_ID_PREFIX
 from .utils import cleanup
 from .utils import common
+from .utils.base_agent_loader import _AgentLoadError
 from .utils.base_agent_loader import BaseAgentLoader
 from .utils.shared_value import SharedValue
 
@@ -650,11 +649,7 @@ class CreateSessionRequest(common.BaseModel):
 
 
 # Function calls ADK generates itself to drive human-in-the-loop flows.
-_ADK_RESERVED_FUNCTION_NAMES = frozenset({
-    REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
-    REQUEST_EUC_FUNCTION_CALL_NAME,
-    REQUEST_INPUT_FUNCTION_CALL_NAME,
-})
+_ADK_RESERVED_FUNCTION_NAMES = _CLIENT_FUNCTION_CALL_NAMES
 
 
 def _is_adk_reserved_function_name(name: Optional[str]) -> bool:
@@ -1002,6 +997,15 @@ class ApiServer:
     self.auto_create_session = auto_create_session
     self.trigger_sources = trigger_sources
     if (
+        trigger_sources
+        and not trigger_oidc_audience
+        and not trigger_auth_verifier
+    ):
+      raise ValueError(
+          "trigger_sources requires trigger_oidc_audience or"
+          " trigger_auth_verifier to be set."
+      )
+    if (
         trigger_oidc_service_accounts
         and not trigger_oidc_audience
         and not trigger_auth_verifier
@@ -1009,6 +1013,18 @@ class ApiServer:
       raise ValueError(
           "trigger_oidc_service_accounts requires trigger_oidc_audience to be"
           " set."
+      )
+    if (
+        trigger_sources
+        and trigger_oidc_audience
+        and not trigger_oidc_service_accounts
+        and not trigger_auth_verifier
+    ):
+      logger.warning(
+          "trigger_oidc_audience is set without"
+          " trigger_oidc_service_accounts; any Google account can obtain a"
+          " token for this audience. Set trigger_oidc_service_accounts to"
+          " restrict caller identity."
       )
     self.trigger_oidc_audience = trigger_oidc_audience
     self.trigger_oidc_service_accounts = trigger_oidc_service_accounts
@@ -1040,10 +1056,7 @@ class ApiServer:
       return self.runner_dict[app_name]
 
     # Create new runner
-    try:
-      agent_or_app = self.agent_loader.load_agent(app_name)
-    except ValueError as ve:
-      raise HTTPException(status_code=404, detail=str(ve)) from ve
+    agent_or_app = self._load_agent_or_raise(app_name)
 
     if self.default_llm_model:
       from .cli import _override_default_llm_model
@@ -1125,6 +1138,29 @@ class ApiServer:
     runner = self._create_runner(agentic_app, app_name)
     self.runner_dict[app_name] = runner
     return runner
+
+  def _load_agent_or_raise(self, app_name: str) -> BaseAgent | App:
+    """Loads an agent, mapping a load failure onto an HTTP status code.
+
+    Args:
+      app_name: The name of the agent to load.
+
+    Returns:
+      The loaded agent or app.
+
+    Raises:
+      HTTPException: 404 when the loader raises ValueError, which means no agent
+        exists under the name. 500 when the agent's own module or config fails
+        to load, with a generic detail because that exception text can carry
+        paths or config; the traceback goes to the log instead.
+    """
+    try:
+      return self.agent_loader.load_agent(app_name)
+    except ValueError as e:
+      raise HTTPException(status_code=404, detail=str(e)) from e
+    except _AgentLoadError as e:
+      logger.exception("Failed to load agent %s", app_name)
+      raise HTTPException(status_code=500, detail="Failed to load agent") from e
 
   def _get_root_agent(self, agent_or_app: BaseAgent | App) -> BaseAgent:
     """Extract root agent from either a BaseAgent or App object."""
@@ -1597,10 +1633,7 @@ class ApiServer:
                 " mode."
             ),
         )
-      try:
-        agent_or_app = self.agent_loader.load_agent(app_name)
-      except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve)) from ve
+      agent_or_app = self._load_agent_or_raise(app_name)
       root_agent = self._get_root_agent(agent_or_app)
       if isinstance(root_agent, LlmAgent):
         return AppInfo(
@@ -2333,13 +2366,6 @@ class ApiServer:
       runner_for_context = await self.get_runner_async(app_name)
       _set_telemetry_context_if_needed(runner_for_context)
 
-      session = await self.session_service.get_session(
-          app_name=app_name, user_id=user_id, session_id=session_id
-      )
-      if not session:
-        await websocket.close(code=1002, reason="Session not found")
-        return
-
       live_request_queue = LiveRequestQueue()
 
       async def forward_events():
@@ -2377,7 +2403,8 @@ class ApiServer:
         )
         async with Aclosing(
             runner.run_live(
-                session=session,
+                user_id=user_id,
+                session_id=session_id,
                 live_request_queue=live_request_queue,
                 run_config=run_config,
             )
@@ -2414,6 +2441,8 @@ class ApiServer:
         # This will re-raise any exception from the completed tasks.
         for task in done:
           task.result()
+      except SessionNotFoundError:
+        await websocket.close(code=1002, reason="Session not found")
       except WebSocketDisconnect:
         # Disconnection could happen when receive or send text via websocket
         logger.info("Client disconnected during live session.")
