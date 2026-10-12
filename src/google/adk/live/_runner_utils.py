@@ -26,14 +26,12 @@ from typing import TYPE_CHECKING
 import warnings
 
 from google.genai import types
-from opentelemetry import context
 
 from ..agents.invocation_context import InvocationContext
 from ..agents.run_config import RunConfig
 from ..events.event import Event
 from ..sessions.session import Session
 from ..utils._runner_utils import _notify_run_error
-from ..utils._runner_utils import _with_caller_context
 from .live_request_queue import LiveRequestQueue
 
 if TYPE_CHECKING:
@@ -206,7 +204,6 @@ async def run_live(
     run_config = run_config.model_copy()
     run_config.response_modalities = [types.Modality.AUDIO]
 
-  caller_ctx = context.get_current()
   if live_request_queue is None:
     raise ValueError("live_request_queue is required for run_live.")
   if session is not None:
@@ -274,14 +271,11 @@ async def run_live(
       _merge_live_event_streams(
           runner,
           invocation_context,
-          _with_caller_context(
-              runner._exec_with_plugin(  # pylint: disable=protected-access
-                  invocation_context=invocation_context,
-                  session=invocation_context.session,
-                  execute_fn=execute,
-                  is_live_call=True,
-              ),
-              caller_ctx,
+          runner._exec_with_plugin(  # pylint: disable=protected-access
+              invocation_context=invocation_context,
+              session=invocation_context.session,
+              execute_fn=execute,
+              is_live_call=True,
           ),
       )
   ) as agen:
