@@ -27,8 +27,10 @@ from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.bash_tool import ExecuteBashTool
 from google.adk.tools.function_tool import FunctionTool
+from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.adk.workflow import node
 from google.adk.workflow import START
+from google.adk.workflow._errors import WorkflowDataError
 from google.adk.workflow._tool_node import _ToolNode as ToolNode
 from google.adk.workflow._workflow import Workflow
 from google.adk.workflow.utils._workflow_hitl_utils import create_request_input_response
@@ -1505,3 +1507,61 @@ async def test_tool_node_autoboxes_streaming_and_rejects_multi_param():
         "scalar_value",
         tool=MockToolWithDeclaration(param_names=("param_a", "param_b")),
     )
+
+
+def test_tool_node_uses_custom_name():
+  tool_node = ToolNode(
+      name="custom_weather_node", tool=MockToolWithDeclaration()
+  )
+  assert tool_node.name == "custom_weather_node"
+
+
+_CONFIRMATION_INTERRUPT_ID = "wf_tool_confirmation:delete_node@1"
+
+
+async def _resume_delete_node(resume_input: Any) -> tuple[list[Event], Context]:
+  """Resumes a confirmation-gated ToolNode with `resume_input`."""
+  inv_ctx = await testing_utils.create_invocation_context(
+      Workflow(name="host_wf")
+  )
+  tool_node = ToolNode(
+      name="delete_node",
+      tool=FunctionTool(
+          func=lambda name: {"deleted": name}, require_confirmation=True
+      ),
+  )
+  ctx = Context(
+      invocation_context=inv_ctx,
+      node_path="delete_node@1",
+      resume_inputs={_CONFIRMATION_INTERRUPT_ID: resume_input},
+  )
+  events = [e async for e in tool_node.run(ctx=ctx, node_input={"name": "x"})]
+  return events, ctx
+
+
+@pytest.mark.asyncio
+async def test_tool_node_resume_accepts_tool_confirmation_instance():
+  events, ctx = await _resume_delete_node(
+      ToolConfirmation(confirmed=True, payload={"ok": 1})
+  )
+
+  assert events[0].output == {"deleted": "x"}
+  assert ctx.tool_confirmation.payload == {"ok": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resume_input, match",
+    [
+        ("not_a_dict_or_confirmation", "must be a ToolConfirmation payload"),
+        (
+            {"confirmed": "not_a_valid_bool_dict", "extra_bad": object()},
+            "Invalid tool confirmation response",
+        ),
+    ],
+)
+async def test_tool_node_resume_rejects_invalid_confirmation(
+    resume_input, match
+):
+  with pytest.raises(WorkflowDataError, match=match):
+    await _resume_delete_node(resume_input)
