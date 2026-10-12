@@ -123,9 +123,29 @@ async def run_node_live(
       assert ic._event_queue is not None  # pylint: disable=protected-access
       await ic._event_queue.put((done_sentinel, None))  # pylint: disable=protected-access
 
-  task = asyncio.create_task(_drive_root_node())
+  completed_cleanly = False
+  closing_early = False
 
   try:
+    early_exit_result = await ic.plugin_manager.run_before_run_callback(
+        invocation_context=ic
+    )
+    if isinstance(early_exit_result, types.Content):
+      early_exit_event = Event(
+          invocation_id=ic.invocation_id,
+          author="model",
+          content=early_exit_result,
+      )
+      yield await runner._process_and_append_event(  # pylint: disable=protected-access
+          event=early_exit_event,
+          invocation_context=ic,
+          is_live_call=True,
+      )
+      completed_cleanly = True
+      return
+
+    task = asyncio.create_task(_drive_root_node())
+
     try:
       async with aclosing(
           runner._consume_event_queue(  # pylint: disable=protected-access
@@ -137,11 +157,29 @@ async def run_node_live(
     finally:
       # _cleanup_root_task re-raises a root-node Exception (if any).
       await runner._cleanup_root_task(task, runner.agent.name)  # pylint: disable=protected-access
+    completed_cleanly = True
+  except GeneratorExit:
+    closing_early = True
+    raise
   except Exception as e:
     # An unhandled exception escaped live runner execution. Notify plugins
     # (notification-only) and re-raise.
     await _notify_run_error(ic.plugin_manager, ic, e)
     raise
+  finally:
+    if completed_cleanly or closing_early:
+      try:
+        await ic.plugin_manager.run_after_run_callback(invocation_context=ic)
+      except Exception as e:
+        await _notify_run_error(ic.plugin_manager, ic, e)
+        if closing_early:
+          logger.error(
+              "after_run callback failed while closing invocation %s early.",
+              ic.invocation_id,
+              exc_info=True,
+          )
+        else:
+          raise
 
 
 async def run_live(
