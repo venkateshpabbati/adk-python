@@ -1642,12 +1642,12 @@ async def test_generator_tool_pauses_on_request_input_and_resumes(
   from google.adk.agents.llm_agent import Agent
   from google.adk.apps.app import App
   from google.adk.apps.app import ResumabilityConfig
+  from google.adk.events._interrupts import extract_event_interrupt_ids
   from google.adk.events.event import Event
   from google.adk.events.request_input import RequestInput
   from google.adk.models.llm_response import LlmResponse
+  from google.adk.utils._function_call_names import REQUEST_INPUT_FUNCTION_CALL_NAME
   from google.adk.workflow.utils._workflow_hitl_utils import create_request_input_response
-  from google.adk.workflow.utils._workflow_hitl_utils import get_request_input_interrupt_ids
-  from google.adk.workflow.utils._workflow_hitl_utils import REQUEST_INPUT_FUNCTION_CALL_NAME
   from google.genai import types
 
   from .. import testing_utils
@@ -1699,7 +1699,7 @@ async def test_generator_tool_pauses_on_request_input_and_resumes(
           for p in (e.content.parts if e.content and e.content.parts else [])
       )
   ]
-  interrupt_id = get_request_input_interrupt_ids(req_events[0])[0]
+  [interrupt_id] = extract_event_interrupt_ids(req_events[0])
   invocation_id = req_events[0].invocation_id
   resume_part = create_request_input_response(interrupt_id, {"text": "APAC"})
   events2 = await runner.run_async(
@@ -1784,12 +1784,12 @@ async def test_generator_tool_repeated_calls_isolate_node_path_and_hitl_state():
   from google.adk.agents.llm_agent import Agent
   from google.adk.apps.app import App
   from google.adk.apps.app import ResumabilityConfig
+  from google.adk.events._interrupts import extract_event_interrupt_ids
   from google.adk.events.event import Event
   from google.adk.events.request_input import RequestInput
   from google.adk.models.llm_response import LlmResponse
+  from google.adk.utils._function_call_names import REQUEST_INPUT_FUNCTION_CALL_NAME
   from google.adk.workflow.utils._workflow_hitl_utils import create_request_input_response
-  from google.adk.workflow.utils._workflow_hitl_utils import get_request_input_interrupt_ids
-  from google.adk.workflow.utils._workflow_hitl_utils import REQUEST_INPUT_FUNCTION_CALL_NAME
   from google.genai import types
 
   from .. import testing_utils
@@ -1846,7 +1846,7 @@ async def test_generator_tool_repeated_calls_isolate_node_path_and_hitl_state():
           for p in (e.content.parts if e.content and e.content.parts else [])
       )
   )
-  interrupt_id1 = get_request_input_interrupt_ids(req_event1)[0]
+  [interrupt_id1] = extract_event_interrupt_ids(req_event1)
   invocation_id = req_event1.invocation_id
 
   # Step 2: Resume first call ("APAC"); model then calls ask_and_analyze("marketing"),
@@ -1866,7 +1866,7 @@ async def test_generator_tool_repeated_calls_isolate_node_path_and_hitl_state():
           for p in (e.content.parts if e.content and e.content.parts else [])
       )
   )
-  interrupt_id2 = get_request_input_interrupt_ids(req_event2)[0]
+  [interrupt_id2] = extract_event_interrupt_ids(req_event2)
 
   # Step 3: Resume second call ("EMEA") and complete.
   events3 = await runner.run_async(

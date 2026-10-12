@@ -20,6 +20,7 @@ from typing import Any
 
 from google.adk.agents.context import Context
 from google.adk.apps.app import ResumabilityConfig
+from google.adk.events._interrupts import extract_event_interrupt_ids
 from google.adk.events.event import Event
 from google.adk.events.request_input import RequestInput
 from google.adk.platform import uuid as platform_uuid
@@ -28,14 +29,13 @@ from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.bash_tool import ExecuteBashTool
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.tool_confirmation import ToolConfirmation
+from google.adk.utils._function_call_names import REQUEST_INPUT_FUNCTION_CALL_NAME
 from google.adk.workflow import node
 from google.adk.workflow import START
 from google.adk.workflow._errors import WorkflowDataError
 from google.adk.workflow._tool_node import _ToolNode as ToolNode
 from google.adk.workflow._workflow import Workflow
 from google.adk.workflow.utils._workflow_hitl_utils import create_request_input_response
-from google.adk.workflow.utils._workflow_hitl_utils import get_request_input_interrupt_ids
-from google.adk.workflow.utils._workflow_hitl_utils import REQUEST_INPUT_FUNCTION_CALL_NAME
 from google.genai import types
 from pydantic import BaseModel
 import pytest
@@ -668,7 +668,7 @@ class _ConfirmationWorkflow:
 
   async def answer(self, request: Event, response: dict[str, Any]) -> None:
     """Resumes the workflow with the user's answer to the request."""
-    interrupt_id = get_request_input_interrupt_ids(request)[0]
+    [interrupt_id] = extract_event_interrupt_ids(request)
     await self.runner.run_async(
         new_message=testing_utils.UserContent(
             create_request_input_response(interrupt_id, response)
@@ -889,7 +889,7 @@ async def _answer(
 
   Returns the next input request the workflow paused on, if any.
   """
-  interrupt_id = get_request_input_interrupt_ids(request)[0]
+  [interrupt_id] = extract_event_interrupt_ids(request)
   events = await runner.run_async(
       new_message=testing_utils.UserContent(
           create_request_input_response(interrupt_id, response)
@@ -1438,7 +1438,7 @@ async def test_tool_node_non_function_tool_no_output_fast_forwards_on_resume(
   assert request is not None
 
   # Turn 2: resume pause_node. Tool should fast-forward and NOT re-execute.
-  interrupt_id = get_request_input_interrupt_ids(request)[0]
+  [interrupt_id] = extract_event_interrupt_ids(request)
   await runner.run_async(
       new_message=testing_utils.UserContent(
           create_request_input_response(interrupt_id, {"status": "ok"})
